@@ -109,7 +109,12 @@ window.__ModuleLoader__.load({
 				});
 			}
 			var request = args === void 0 ? {} : args;
-			return connection.rpc.call(CHANNEL, STATUS_ENDPOINT, { args: request }).then(
+			// Wire shape: the gateway expects payload = { args: { <wire>: value } }.
+			// The descriptor declares one parameter (host `status(args)`) with
+			// wire "args", so the status argument object rides under
+			// payload.args.args — a bare { sessionId } would fail the gateway's
+			// assertExactArguments with "unexpected sessionId".
+			return connection.rpc.call(CHANNEL, STATUS_ENDPOINT, { args: { args: request } }).then(
 				function (result) {
 					return result && typeof result === "object" && result.ok === false ? result : result;
 				},
