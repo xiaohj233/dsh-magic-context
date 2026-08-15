@@ -40,33 +40,46 @@ Use cases:
 
 ## Installation
 
-In your DSH profile's `package.json`:
+In your DSH profile's `package.json` (the profile directory is
+`$DSH_HOME/profiles/<name>/`; `dsh plugin --profile <name> install` runs
+there automatically):
 
 ```json
 {
-  "dependencies": { "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
-  "dsh": { "profile": { "bundles": ["...", "dsh-magic-context"] } }
+  "dependencies": {
+    "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": ["dsh-magic-context"]
+    }
+  }
 }
 ```
 
-Then run `pnpm install` (or `dsh plugin --profile <name> install`) and restart dsh.
+> ⚠️ Keep your profile's existing `dsh.profile.bundles` entries (e.g.
+> `@deepseek-ai/dsh-base`, `@deepseek-ai/dsh-web-app`, `@deepseek-ai/dsh-headless`)
+> and only **append** `"dsh-magic-context"`.
+
+Then install dependencies and restart dsh:
+
+```sh
+dsh plugin --profile <name> install
+# or: cd $DSH_HOME/profiles/<name> && pnpm install
+```
+
+After restarting, initialize:
+
+```sh
+dsh-magic-context setup    # generates the magic-standard thin preset
+dsh-magic-context doctor   # verifies the install
+```
+
+Select the `magic-standard` preset for new sessions (Web UI: Settings → Agent
+preset, or `settings.yaml: agent-presets.default: magic-standard`).
 
 > The adapter package (`dsh-magic-context-adapter`) is resolved
 > automatically by the main package's `github:` dependency — no separate install needed.
-
-### Quick start
-
-```sh
-# 1. Generate the thin preset and verify
-dsh-magic-context setup
-dsh-magic-context doctor
-
-# 2. Select the magic-standard preset for new sessions
-#    Web UI: Settings → Agent preset → magic-standard
-#    or settings.yaml: agent-presets.default: magic-standard
-
-# 3. Restart dsh
-```
 
 The first session automatically creates the shared SQLite
 (`~/.local/share/cortexkit/magic-context/context.db`).

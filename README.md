@@ -39,32 +39,44 @@ OpenCode/Pi 行为保持不变。
 
 ## 安装
 
-在 DSH profile 的 `package.json` 中：
+在 DSH profile 的 `package.json` 中（profile 目录即 `$DSH_HOME/profiles/<name>/`，
+`dsh plugin --profile <name> install` 会自动在该目录执行）：
 
 ```json
 {
-  "dependencies": { "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
-  "dsh": { "profile": { "bundles": ["...", "dsh-magic-context"] } }
+  "dependencies": {
+    "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": ["dsh-magic-context"]
+    }
+  }
 }
 ```
 
-然后 `pnpm install`（或 `dsh plugin --profile <name> install`）并重启 dsh。
+> ⚠️ `dsh.profile.bundles` 请**保留你 profile 现有的条目**（如
+> `@deepseek-ai/dsh-base`、`@deepseek-ai/dsh-web-app`、`@deepseek-ai/dsh-headless`
+> 等），只**追加** `"dsh-magic-context"`。
 
-> 依赖包（`dsh-magic-context-adapter`）由主包的 `github:` 依赖自动解析，无需单独安装。
-
-### 快速开始
+然后安装依赖并重启 dsh：
 
 ```sh
-# 1. 生成薄 preset + 验证
-dsh-magic-context setup
-dsh-magic-context doctor
-
-# 2. 让新会话使用 magic-standard preset
-#    Web UI: Settings → Agent preset → magic-standard
-#    或 settings.yaml: agent-presets.default: magic-standard
-
-# 3. 重启 dsh
+dsh plugin --profile <name> install
+# 或：cd $DSH_HOME/profiles/<name> && pnpm install
 ```
+
+重启后初始化：
+
+```sh
+dsh-magic-context setup    # 生成 magic-standard 薄 preset
+dsh-magic-context doctor   # 验证安装
+```
+
+为新会话选择 `magic-standard` preset（Web UI: Settings → Agent preset，或
+`settings.yaml: agent-presets.default: magic-standard`）。
+
+> 依赖包（`dsh-magic-context-adapter`）由主包的 `github:` 依赖自动解析，无需单独安装。
 
 首次会话自动创建共享 SQLite（`~/.local/share/cortexkit/magic-context/context.db`）。
 
