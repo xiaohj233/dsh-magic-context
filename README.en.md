@@ -78,6 +78,14 @@ dsh-magic-context doctor   # verifies the install
 Select the `magic-standard` preset for new sessions (Web UI: Settings → Agent
 preset, or `settings.yaml: agent-presets.default: magic-standard`).
 
+> ⚠️ **Prerequisite**: Magic's agent-side capabilities (knowledge injection,
+> ctx_* tools, /ctx-* commands, historian, Dreamer, the Magic compaction
+> policy) are loaded **only in sessions that select the `magic-standard`
+> preset**. Sessions without it run with pure official semantics — only the
+> host side stays resident (shared-DB initialization + status/diagnostics
+> endpoints), with no Magic intervention. To make the plugin effective by
+> default, set `settings.yaml`'s `agent-presets.default` to `magic-standard`.
+
 > The adapter package (`dsh-magic-context-adapter`) is resolved
 > automatically by the main package's `github:` dependency — no separate install needed.
 

@@ -76,6 +76,12 @@ dsh-magic-context doctor   # 验证安装
 为新会话选择 `magic-standard` preset（Web UI: Settings → Agent preset，或
 `settings.yaml: agent-presets.default: magic-standard`）。
 
+> ⚠️ **使用前提**：Magic 的 agent 能力（知识注入、ctx_* 工具、/ctx-* 命令、
+> historian、Dreamer、Magic 压缩策略）**只在新会话选择 `magic-standard` 预设时
+> 加载**。未选择该预设的会话完全按官方语义运行——仅 host 半侧常驻
+> （共享库初始化 + 状态卡/诊断端点），不会有任何 Magic 干预。想让插件默认
+> 生效，把 `settings.yaml` 的 `agent-presets.default` 设为 `magic-standard`。
+
 > 依赖包（`dsh-magic-context-adapter`）由主包的 `github:` 依赖自动解析，无需单独安装。
 
 首次会话自动创建共享 SQLite（`~/.local/share/cortexkit/magic-context/context.db`）。
