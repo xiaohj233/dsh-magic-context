@@ -33,7 +33,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@xiao_hj909/magic-context-for-dsh-adapter": "github:xiao_hj909/magic-context-for-dsh#v0.1.0&path:/packages/adapter-api",
+    "@xiao_hj909/magic-context-for-dsh-adapter": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/adapter-api",
     "@deepseek-ai/cordis": "4.0.1",
     "@deepseek-ai/cordis-plugin-include": "1.0.6",
     "@deepseek-ai/dsh-agent": "0.1.0-rc.6",

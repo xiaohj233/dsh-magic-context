@@ -43,7 +43,7 @@ OpenCode/Pi 行为保持不变。
 
 ```json
 {
-  "dependencies": { "@xiao_hj909/magic-context-for-dsh": "github:xiao_hj909/magic-context-for-dsh#v0.1.0&path:/packages/dsh-plugin" },
+  "dependencies": { "@xiao_hj909/magic-context-for-dsh": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
   "dsh": { "profile": { "bundles": ["...", "@xiao_hj909/magic-context-for-dsh"] } }
 }
 ```
