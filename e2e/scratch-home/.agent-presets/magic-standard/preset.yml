@@ -1,0 +1,5 @@
+name: Magic Context standard
+description: >-
+  Stock `standard` preset with the Magic Context compaction engine enabled
+  (compaction-basic disabled) and the Magic agent rows mounted.
+order: 10

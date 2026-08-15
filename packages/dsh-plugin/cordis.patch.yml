@@ -1,0 +1,24 @@
+# @xiao_hj909/magic-context-for-dsh — host bundle patch.
+#
+# Mounts the HOST-plane rows of the Magic adapter. The AGENT-plane rows are
+# mounted per session by the generated thin preset
+# (`$DSH_HOME/.agent-presets/magic-standard/agent.cordis.yml`), which includes
+# the stock preset and inserts the Magic rows into it.
+#
+# Rows here (host plane, process-global):
+#   - magic-host:  boots the shared SQLite + provides ctx.magicContextHost
+#                  (bootstrap, canonical session keys, liveness marker)
+#   - magic-remote: the `magicContext/status` Typert endpoint for the Web
+#                  client (settings card / header action)
+#
+# Removing the package from the profile's bundles reverts everything (no
+# persistent side effects beyond the shared Magic DB, which is harness-shared
+# by design).
+- insert:
+    - id: magic-host
+      name: '@xiao_hj909/magic-context-for-dsh'
+      inject: []
+
+    - id: magic-remote
+      name: '@xiao_hj909/magic-context-for-dsh/remote'
+      inject: [magicContextHost, typert]

@@ -1,0 +1,12 @@
+# E2E overlay: mount the agent-presets roster (absent from the headless bundle),
+# make magic-standard the default, and run the local probe plugin that creates
+# an agent JOINING the Magic preset through the official compose() setup hook.
+- insert:
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: magic-standard
+        includeUserRoot: true
+
+    - id: magic-e2e-probe
+      name: './magic-e2e-probe.mjs'

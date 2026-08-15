@@ -1,0 +1,41 @@
+# Node
+node_modules/
+dist/
+!packages/dsh-plugin/dist/
+!packages/adapter-api/dist/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data (never commit user memory/databases)
+*.db
+*.db-wal
+*.db-shm
+
+# Internal development docs (plans, phase reports, design/research notes)
+# — not distributed with the public repository
+.dev-docs/
+
+# Editor
+.idea/
+.vscode/
+
+# Spike generated artifacts
+spikes/.generated/
+
+# E2E scratch runtime (volatile per-run artifacts; the scratch-home tree itself
+# and the probe/overlay sources are committed as reproducible harness state)
+e2e/.restore-tmp/
+e2e/.tgz/
+e2e/dsh-install/
+e2e/dsh-real-install/
+e2e/real-home/
+e2e/scratch-home/sessions/
+e2e/scratch-data/cortexkit/magic-context/rpc/
+

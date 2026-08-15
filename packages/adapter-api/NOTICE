@@ -1,0 +1,9 @@
+magic-context-for-dsh-adapter
+Copyright (c) 2026 xiao_hj909
+License: MIT
+
+Harness-compatibility contracts for the magic-context-for-dsh community port
+of Magic Context (https://github.com/cortexkit/magic-context) to DeepSeek
+Harness. Not affiliated with the Magic Context project (cortexkit) or
+DeepSeek. Upstream Magic Context: Copyright (c) 2025 ualtinok, MIT License
+(full text in the parent package's NOTICE).
