@@ -47,7 +47,7 @@ there automatically):
 ```json
 {
   "dependencies": {
-    "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin"
+    "dsh-magic-context": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin"
   },
   "dsh": {
     "profile": {

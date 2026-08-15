@@ -15,7 +15,7 @@ In your DSH profile's `package.json`:
 
 ```json
 {
-  "dependencies": { "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
+  "dependencies": { "dsh-magic-context": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
   "dsh": { "profile": { "bundles": ["...", "dsh-magic-context"] } }
 }
 ```

@@ -412,6 +412,15 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
   let pendingFirstSeq = -1;
   let pendingFirstTime: number | undefined = undefined;
 
+  // An assistant message carrying tool-call blocks is held back until its
+  // tool results arrive: folding the results into the next user message must
+  // ALSO fold the tool-call assistant node, otherwise the surface keeps an
+  // assistant `tool_calls` block with no following `role=tool` message and
+  // the LLM API rejects the sequence (insufficient tool messages).
+  let pendingAssistant:
+    | { nodeIndex: number; seq: number; parts: unknown[]; createdAt: number | null; id: string }
+    | null = null;
+
   const resetPending = (): void => {
     pendingParts = [];
     pendingSeqs = [];
@@ -419,18 +428,52 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
     pendingFirstId = null;
     pendingFirstSeq = -1;
     pendingFirstTime = undefined;
+    pendingAssistant = null;
+  };
+
+  /** Push one assistant message as-is (orphan tool-call / normal path). */
+  const pushAssistant = (item: {
+    nodeIndex: number;
+    seq: number;
+    parts: unknown[];
+    createdAt: number | null;
+    id: string;
+  }): void => {
+    const ordinal = messages.length + 1;
+    messages.push({
+      ordinal,
+      id: item.id,
+      role: "assistant",
+      parts: item.parts,
+      createdAt: item.createdAt,
+      version: item.seq >= 0 ? item.seq : null,
+    });
+    spans.push(
+      surfaceNodes !== null
+        ? { nodeStart: item.nodeIndex, nodeEnd: item.nodeIndex + 1, seqs: [item.seq] }
+        : null,
+    );
+    ordinalToSeq.set(ordinal, item.seq);
+    if (item.seq >= 0) seqToOrdinal.set(item.seq, ordinal);
   };
 
   const flushSynthetic = (): void => {
-    if (pendingParts.length === 0) return;
+    if (pendingParts.length === 0 && pendingAssistant === null) return;
     const ordinal = messages.length + 1;
-    const seqs = pendingSeqs;
-    const start = pendingStartIndex ?? 0;
+    const seqs = [
+      ...(pendingAssistant === null ? [] : [pendingAssistant.seq]),
+      ...pendingSeqs,
+    ];
+    const start = Math.min(
+      pendingStartIndex ?? Number.POSITIVE_INFINITY,
+      pendingAssistant?.nodeIndex ?? Number.POSITIVE_INFINITY,
+    );
+    if (!Number.isFinite(start)) throw new Error("fold flush without any covered node");
     messages.push({
       ordinal,
       id: `${SYNTH_USER_ID_PREFIX}${pendingFirstId ?? "tail"}`,
       role: "user",
-      parts: pendingParts,
+      parts: [...(pendingAssistant?.parts ?? []), ...pendingParts],
       createdAt: pendingFirstTime ?? null,
       version: pendingFirstSeq >= 0 ? pendingFirstSeq : null,
     });
@@ -454,44 +497,75 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
     if (!message) continue; // e.g. empty-content assistant/message
     const record = message as unknown as Record<string, unknown>;
     const seq = seqOf(event);
-    const seqs = [...pendingSeqs, seq];
 
     if (type === "assistant/message") {
       if (pendingParts.length > 0) flushSynthetic();
-      const ordinal = messages.length + 1;
-      messages.push({
-        ordinal,
-        id: String(message.id),
-        role: "assistant",
-        parts: assistantParts(record, surfaceNodes !== null, toolNameByCallId),
-        createdAt: timeOf(event) ?? null,
-        version: seq >= 0 ? seq : null,
-      });
-      spans.push(
-        surfaceNodes !== null ? { nodeStart: nodeIndex, nodeEnd: nodeIndex + 1, seqs } : null,
+      const parts = assistantParts(record, surfaceNodes !== null, toolNameByCallId);
+      const hasToolCalls = parts.some(
+        (part) => isRecord(part) && part.type === "tool" && typeof part.callID === "string",
       );
-      ordinalToSeq.set(ordinal, seq);
-      if (seq >= 0) seqToOrdinal.set(seq, ordinal);
+      if (hasToolCalls) {
+        // Hold the tool-call assistant until its results arrive; the fold
+        // (into the next user / synthetic tail) will include this node.
+        pendingAssistant = {
+          nodeIndex,
+          seq,
+          parts,
+          createdAt: timeOf(event) ?? null,
+          id: String(message.id),
+        };
+        continue;
+      }
+      // Orphan tool-call assistant (no results followed): keep as-is.
+      if (pendingAssistant !== null) {
+        pushAssistant(pendingAssistant);
+        pendingAssistant = null;
+      }
+      pushAssistant({ nodeIndex, seq, parts, createdAt: timeOf(event) ?? null, id: String(message.id) });
       continue;
     }
 
     if (type === "user/message") {
+      // An orphan tool-call assistant (no results) stays as its own message.
+      if (pendingAssistant !== null && pendingParts.length === 0) {
+        pushAssistant(pendingAssistant);
+        pendingAssistant = null;
+      }
       const ordinal = messages.length + 1;
-      const start = surfaceNodes !== null ? (pendingStartIndex ?? nodeIndex) : nodeIndex;
+      const start =
+        surfaceNodes !== null
+          ? Math.min(
+              pendingStartIndex ?? Number.POSITIVE_INFINITY,
+              pendingAssistant?.nodeIndex ?? Number.POSITIVE_INFINITY,
+              nodeIndex,
+            )
+          : nodeIndex;
       const knowledge = isKnowledgeMessage(record);
       messages.push({
         ordinal,
         id: String(message.id),
         role: "user",
-        parts: [...pendingParts, ...userTextParts(record.content)],
+        parts: [
+          ...(pendingAssistant?.parts ?? []),
+          ...pendingParts,
+          ...userTextParts(record.content),
+        ],
         createdAt: timeOf(event) ?? null,
         version: seq >= 0 ? seq : null,
       });
       spans.push(
-        surfaceNodes !== null ? { nodeStart: start, nodeEnd: nodeIndex + 1, seqs } : null,
+        surfaceNodes !== null
+          ? {
+              nodeStart: start,
+              nodeEnd: nodeIndex + 1,
+              seqs: [...(pendingAssistant === null ? [] : [pendingAssistant.seq]), ...pendingSeqs, seq],
+            }
+          : null,
       );
       ordinalToSeq.set(ordinal, seq);
-      for (const s of seqs) seqToOrdinal.set(s, ordinal);
+      for (const s of [...(pendingAssistant === null ? [] : [pendingAssistant.seq]), ...pendingSeqs, seq]) {
+        seqToOrdinal.set(s, ordinal);
+      }
       if (knowledge) knowledgeOrdinals.add(ordinal);
       resetPending();
       continue;
@@ -506,7 +580,12 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
     if (pendingFirstTime === undefined) pendingFirstTime = timeOf(event);
   }
 
-  if (pendingParts.length > 0) flushSynthetic();
+  if (pendingAssistant !== null && pendingParts.length === 0) {
+    // Tail orphan tool-call assistant (no results) — keep as-is.
+    pushAssistant(pendingAssistant);
+    pendingAssistant = null;
+  }
+  if (pendingParts.length > 0 || pendingAssistant !== null) flushSynthetic();
   return { messages, spans, knowledgeOrdinals, ordinalToSeq, seqToOrdinal };
 }
 

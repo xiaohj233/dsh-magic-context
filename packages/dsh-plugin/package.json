@@ -24,9 +24,7 @@
     "dist",
     "src",
     "cordis.patch.yml",
-    "README.md",
-    "README.zh.md",
-    "THIRD_PARTY_NOTICES.md"
+    "NOTICE"
   ],
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target node --format esm --splitting --external @deepseek-ai/dsh-session --external @deepseek-ai/dsh-compaction --external @deepseek-ai/dsh-compaction-basic --external @deepseek-ai/dsh-token-meter --external @deepseek-ai/dsh-llm --external @deepseek-ai/cordis && bun build src/doctor/cli.ts --outdir dist --target node --format esm --external @deepseek-ai/cordis && bun build src/entries/agent.ts src/entries/compaction.ts src/entries/commands.ts src/entries/tools.ts src/entries/remote.ts src/entries/preset-include.ts --outdir dist/entries --target node --format esm --splitting --external @deepseek-ai/cordis --external @deepseek-ai/dsh-session --external @deepseek-ai/dsh-llm --external @deepseek-ai/dsh-tools --external @deepseek-ai/dsh-subagent --external @deepseek-ai/dsh-compaction --external @deepseek-ai/dsh-compaction-basic --external @deepseek-ai/dsh-token-meter --external @deepseek-ai/cordis-plugin-include && tsc --emitDeclarationOnly",
@@ -35,7 +33,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "dsh-magic-context-adapter": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/adapter-api",
+    "dsh-magic-context-adapter": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/adapter-api",
     "@deepseek-ai/cordis": "4.0.1",
     "@deepseek-ai/cordis-plugin-include": "^1.0.6",
     "@deepseek-ai/dsh-agent": "0.1.0-rc.6",

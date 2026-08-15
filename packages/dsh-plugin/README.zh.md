@@ -14,7 +14,7 @@ historian/dreamer 调度、压缩策略与 Typert Remote 面。
 
 ```json
 {
-  "dependencies": { "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
+  "dependencies": { "dsh-magic-context": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
   "dsh": { "profile": { "bundles": ["...", "dsh-magic-context"] } }
 }
 ```

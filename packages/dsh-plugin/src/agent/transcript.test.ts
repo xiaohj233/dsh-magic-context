@@ -99,34 +99,42 @@ async function cleanupDir(dir: string, db?: Database): Promise<void> {
 }
 
 describe("transcript mapping (DSH events → RawMessage[])", () => {
-  it("folds tool results into the following user message and synthesizes the tail user", () => {
+  it("folds tool results AND their tool-call assistant into the following user message", () => {
     const session = buildSession();
     const messages = convertDshEventsToRawMessages(session.events);
-    // user1, assistant1, user2(+tool1), assistant2, synth-user(tool2)
-    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant", "user"]);
-    expect(messages.map((m) => m.ordinal)).toEqual([1, 2, 3, 4, 5]);
-    // user2 carries the folded tool part.
-    const user2 = messages[2]!;
+    // user1, user2(+assistant1 tool-call + tool1), assistant2, synth-user(tool2)
+    // The tool-call assistant is folded with its results so the surface never
+    // keeps an assistant `tool_calls` block without a following tool message
+    // (issue #1: "insufficient tool messages following tool_calls").
+    expect(messages.map((m) => m.role)).toEqual(["user", "user", "assistant", "user"]);
+    expect(messages.map((m) => m.ordinal)).toEqual([1, 2, 3, 4]);
+    // user2 carries the folded assistant text AND the folded tool part.
+    const user2 = messages[1]!;
     expect(user2.parts.some((p) => isToolPart(p, "call-1"))).toBe(true);
-    // Tail synthetic user carries tool2.
-    const tail = messages[4]!;
+    expect(user2.parts.some((p) => isRecord(p) && p.type === "text")).toBe(true);
+    // Tail synthetic user carries tool2 (and assistant2's tool-call).
+    const tail = messages[3]!;
     expect(tail.id.startsWith("synth-user-")).toBe(true);
     expect(tail.parts.some((p) => isToolPart(p, "call-2"))).toBe(true);
-    // Assistant parts hold text + a tool-invocation placeholder for indexing.
-    const assistant1 = messages[1]!;
-    expect(assistant1.parts.some((p) => isRecord(p) && p.type === "text")).toBe(true);
+    // No standalone assistant with a tool-call block remains.
+    const assistant = messages[2]!;
+    expect(assistant.parts.some((p) => isToolPart(p, "call-1"))).toBe(false);
+    expect(assistant.parts.some((p) => isRecord(p) && p.type === "text")).toBe(true);
   });
 
   it("builds a reversible seq ↔ ordinal map", () => {
     const session = buildSession();
     const events = session.events;
     const map = buildDshOrdinalMap(events);
-    // user1's seq → ordinal 1; tool1's seq → ordinal 3 (folded into user2).
+    // user1's seq → ordinal 1; tool1's seq and assistant1's seq → ordinal 2
+    // (both folded into user2).
     const seqs = events.map((e) => e.seq);
     expect(dshSeqForOrdinal(events, 1)).toBe(seqs[0]);
-    expect(dshSeqForOrdinal(events, 3)).toBe(seqs[4]); // user2's own seq
+    expect(dshSeqForOrdinal(events, 2)).toBe(seqs[4]); // user2's own seq
     const tool1Seq = seqs[2]!;
-    expect(map.seqToOrdinal.get(tool1Seq)).toBe(3);
+    expect(map.seqToOrdinal.get(tool1Seq)).toBe(2);
+    const assistant1Seq = seqs[1]!;
+    expect(map.seqToOrdinal.get(assistant1Seq)).toBe(2);
   });
 
   it("produces a stable read-only view with digest/watermark/generation", () => {
@@ -258,6 +266,45 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       const session = Session.create(SessionId("sess-empty"));
       const view = viewOf(session);
       expect(deriveMutationPlan(view, { db, protectedTags: 0 })).toBeNull();
+      db.close();
+    } finally {
+      await cleanupDir(dir);
+    }
+  });
+
+  it("fold write-back ops cover the tool-call assistant node (LLM-valid surface)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-transcript-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const session = buildSession();
+      const view = viewOf(session);
+      const plan = deriveMutationPlan(view, { db, protectedTags: 0 });
+      // The folding of tool results is tag-driven; with tags applied the
+      // fold message is dirty and the plan carries a replace op for the
+      // tool/result span. (If the shared tagger does not dirty it, the
+      // bug cannot reproduce through this path — assert non-null to know.)
+      expect(plan).not.toBeNull();
+      if (plan === null) return;
+      const assistantSeq = session.events[1]!.seq; // assistant1 (tool-call)
+      const tool1Seq = session.events[2]!.seq; // tool/result call-1
+      const assistantIndex = view.surfaceNodes.indexOf(assistantSeq);
+      const tool1Index = view.surfaceNodes.indexOf(tool1Seq);
+      expect(assistantIndex).toBeGreaterThanOrEqual(0);
+      expect(tool1Index).toBeGreaterThan(assistantIndex);
+      // The op that replaces the tool/result span must ALSO cover the
+      // preceding tool-call assistant node — otherwise the surface keeps an
+      // assistant `tool_calls` block with no following tool message
+      // (issue #1: "insufficient tool messages following tool_calls").
+      const foldOp = plan.ops.find(
+        (op) =>
+          op.kind !== "temporal" &&
+          op.start <= tool1Index &&
+          tool1Index < op.end &&
+          op.shadowedSeqs.includes(tool1Seq),
+      );
+      expect(foldOp).toBeDefined();
+      expect(foldOp!.start).toBeLessThanOrEqual(assistantIndex);
+      expect(foldOp!.shadowedSeqs).toContain(assistantSeq);
       db.close();
     } finally {
       await cleanupDir(dir);
