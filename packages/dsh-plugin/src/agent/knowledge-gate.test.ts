@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalSessionKey } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { canonicalSessionKey } from "dsh-magic-context-adapter";
 import type { SessionId } from "@deepseek-ai/dsh-session";
 import { createTestDb } from "../test-utils";
 import type { Database } from "@magic-context/core/shared/sqlite";

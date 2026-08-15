@@ -1,5 +1,5 @@
 /**
- * @xiao_hj909/magic-context-for-dsh-adapter — adapter-api.
+ * dsh-magic-context-adapter — adapter-api.
  *
  * Stable Host-neutral facade over the shared Magic Context core for harness
  * adapters. Initial surface (Phase 1): harness identity boundary, canonical

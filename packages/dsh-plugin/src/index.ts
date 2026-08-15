@@ -1,9 +1,9 @@
 /**
- * Host half of @xiao_hj909/magic-context-for-dsh (Phase 1 boundary).
+ * Host half of dsh-magic-context (Phase 1 boundary).
  *
  * The bundle patch (cordis.patch.yml) mounts this row on the HOST plane:
  *   - id: magic-host
- *     name: '@xiao_hj909/magic-context-for-dsh'
+ *     name: 'dsh-magic-context'
  *     inject: []
  *
  * It boots the shared Magic SQLite store (with the DSH liveness marker), then
@@ -16,7 +16,7 @@ import {
   bootstrapDshStorage,
   type DshStorageBootstrap,
 } from "./host/bootstrap";
-import { canonicalSessionKey, parseDshSessionKey } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { canonicalSessionKey, parseDshSessionKey } from "dsh-magic-context-adapter";
 
 /** Cordis plugin name (loader diagnostics). */
 export const name = "magic-context-dsh";
@@ -88,7 +88,7 @@ export function apply(ctx: Context, config: MagicHostConfig = {}): void {
   };
   ctx.provide("magicContextHost", host);
   // The `magicContext` Typert Remote is registered by the dedicated
-  // `/remote` bundle row (`@xiao_hj909/magic-context-for-dsh/remote`), NOT here —
+  // `/remote` bundle row (`dsh-magic-context/remote`), NOT here —
   // the loader mounts both rows, so registering in both double-provides
   // `magicContextRemote` and fails the tree.
 }

@@ -29,7 +29,7 @@ import {
 import { randomBytes } from "node:crypto";
 
 /** npm package identity of this adapter (checked against profile bundles). */
-export const MAGIC_CONTEXT_PACKAGE = "@xiao_hj909/magic-context-for-dsh";
+export const MAGIC_CONTEXT_PACKAGE = "dsh-magic-context";
 
 /** The exact DSH release this adapter's compat layer (compat/dsh-0.1) pins. */
 export const DSH_COMPAT_EXPECTED_VERSION = "0.1.0-rc.6";

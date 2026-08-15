@@ -1,5 +1,5 @@
 /*!
- * @xiao_hj909/magic-context-for-dsh — client bundle (Phase 2 slice C).
+ * dsh-magic-context — client bundle (Phase 2 slice C).
  *
  * A minimal browser half for the persistent bundle:
  *
@@ -30,7 +30,7 @@
  * with the factory-form CJS shape used by the framework's own client bundles.
  */
 window.__ModuleLoader__.load({
-	id: "@xiao_hj909/magic-context-for-dsh",
+	id: "dsh-magic-context",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
@@ -41,7 +41,7 @@ window.__ModuleLoader__.load({
 		var primitives = require("@deepseek-ai/dsh-client-ui-primitives");
 
 		/* ------------------------------------------------ styles */
-		var CSS_TAG_ID = "@xiao_hj909/magic-context-for-dsh/status.css";
+		var CSS_TAG_ID = "dsh-magic-context/status.css";
 		var css = [
 			".ckmc-root{position:relative}",
 			".ckmc-trigger{min-height:28px;color:var(--dsw-alias-label-tertiary);cursor:pointer;background:0 0;border:0;border-radius:6px;align-items:center;gap:5px;padding:3px 6px;font-size:12px;line-height:18px;display:inline-flex}",
@@ -65,7 +65,7 @@ window.__ModuleLoader__.load({
 		].join("");
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(CSS_TAG_ID) + "]") === null) {
 			var tag = document.createElement("style");
-			tag.dataset.plugin = "@xiao_hj909/magic-context-for-dsh";
+			tag.dataset.plugin = "dsh-magic-context";
 			tag.dataset.pluginCss = CSS_TAG_ID;
 			tag.textContent = css;
 			document.head.appendChild(tag);
@@ -172,7 +172,7 @@ window.__ModuleLoader__.load({
 				className: C.card,
 				children: [
 					jsxRuntime.jsx("h3", { className: C.title, children: "Magic Context 状态" }),
-					jsxRuntime.jsx("p", { className: C.desc, children: "@xiao_hj909/magic-context-for-dsh · DSH 适配器" }),
+					jsxRuntime.jsx("p", { className: C.desc, children: "dsh-magic-context · DSH 适配器" }),
 					snapshot.state === "loading"
 						? jsxRuntime.jsx("p", { className: C.loading, children: "读取状态…" })
 						: snapshot.state === "error"
@@ -339,7 +339,7 @@ window.__ModuleLoader__.load({
 			});
 		}
 
-		exports.name = "@xiao_hj909/magic-context-for-dsh";
+		exports.name = "dsh-magic-context";
 		exports.inject = ["slots", "connection"];
 		exports.apply = apply;
 		return module.exports;

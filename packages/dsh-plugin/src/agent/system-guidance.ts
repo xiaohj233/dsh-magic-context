@@ -22,7 +22,7 @@ import { buildMagicContextSection } from "@magic-context/core/agents/magic-conte
 import { createPromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
 import type { ConfigHarness } from "@magic-context/core/config/migrate-config-location";
-import { DSH_HARNESS } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { DSH_HARNESS } from "dsh-magic-context-adapter";
 
 /** Stable section identity (B.8: unique name, order asc, 300 = after tool guidance). */
 export const GUIDANCE_SECTION_NAME = "magic-context:guidance";

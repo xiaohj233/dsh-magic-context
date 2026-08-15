@@ -19,7 +19,7 @@ var MAGIC_CONTEXT_REMOTE_NAMESPACE = "magicContext";
 
 // src/doctor/env.ts
 import { dirname, join } from "node:path";
-var MAGIC_CONTEXT_PACKAGE = "@xiao_hj909/magic-context-for-dsh";
+var MAGIC_CONTEXT_PACKAGE = "dsh-magic-context";
 var STOCK_PRESET_REL = join("config", "agent-presets", "standard", "agent.cordis.yml");
 
 // src/host/remote.ts

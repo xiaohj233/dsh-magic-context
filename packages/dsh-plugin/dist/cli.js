@@ -7392,7 +7392,7 @@ function buildThinPresetEntries(opts) {
       insert: [
         {
           id: "magic-compaction",
-          name: opts.magicEngineEntry === undefined ? "@xiao_hj909/magic-context-for-dsh/compaction" : pathToFileURL2(opts.magicEngineEntry).href,
+          name: opts.magicEngineEntry === undefined ? "dsh-magic-context/compaction" : pathToFileURL2(opts.magicEngineEntry).href,
           config: { auto: true }
         }
       ]
@@ -7441,7 +7441,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { randomBytes } from "node:crypto";
-var MAGIC_CONTEXT_PACKAGE = "@xiao_hj909/magic-context-for-dsh";
+var MAGIC_CONTEXT_PACKAGE = "dsh-magic-context";
 var DSH_COMPAT_EXPECTED_VERSION = "0.1.0-rc.6";
 var DSH_PACKAGE = "@deepseek-ai/dsh";
 var STOCK_PRESET_REL = join2("config", "agent-presets", "standard", "agent.cordis.yml");

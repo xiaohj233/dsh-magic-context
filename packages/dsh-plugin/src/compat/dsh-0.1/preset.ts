@@ -103,7 +103,7 @@ export function buildThinPresetEntries(opts: MagicThinPresetOptions): Record<str
           id: "magic-compaction",
           name:
             opts.magicEngineEntry === undefined
-              ? "@xiao_hj909/magic-context-for-dsh/compaction"
+              ? "dsh-magic-context/compaction"
               : pathToFileURL(opts.magicEngineEntry).href,
           config: { auto: true },
         },

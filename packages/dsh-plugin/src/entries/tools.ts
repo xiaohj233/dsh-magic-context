@@ -1,5 +1,5 @@
 /**
- * Subpath entry: `@xiao_hj909/magic-context-for-dsh/tools` — tool-registration
+ * Subpath entry: `dsh-magic-context/tools` — tool-registration
  * plugin row (optional; the agent row can register tools directly).
  */
 import type { Context } from "@deepseek-ai/cordis";

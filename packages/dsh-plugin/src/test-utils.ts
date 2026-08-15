@@ -12,7 +12,7 @@ import {
   openDatabaseAsync,
 } from "@magic-context/core/features/magic-context/storage-db";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import { setDshHarness } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { setDshHarness } from "dsh-magic-context-adapter";
 
 export type { Database };
 

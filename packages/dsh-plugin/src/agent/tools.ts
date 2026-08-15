@@ -25,7 +25,7 @@ import {
   type ToolDefinition,
   type ToolRunContext,
 } from "@deepseek-ai/dsh-tools";
-import { canonicalSessionKey } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { canonicalSessionKey } from "dsh-magic-context-adapter";
 import { getLastCompartmentEndMessage } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
   archiveMemory,

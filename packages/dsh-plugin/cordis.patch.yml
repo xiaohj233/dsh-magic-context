@@ -1,4 +1,4 @@
-# @xiao_hj909/magic-context-for-dsh — host bundle patch.
+# dsh-magic-context — host bundle patch.
 #
 # Mounts the HOST-plane rows of the Magic adapter. The AGENT-plane rows are
 # mounted per session by the generated thin preset
@@ -16,9 +16,9 @@
 # by design).
 - insert:
     - id: magic-host
-      name: '@xiao_hj909/magic-context-for-dsh'
+      name: 'dsh-magic-context'
       inject: []
 
     - id: magic-remote
-      name: '@xiao_hj909/magic-context-for-dsh/remote'
+      name: 'dsh-magic-context/remote'
       inject: [magicContextHost, typert]

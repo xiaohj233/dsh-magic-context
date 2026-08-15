@@ -16,7 +16,7 @@ import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
-import { canonicalSessionKey } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { canonicalSessionKey } from "dsh-magic-context-adapter";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import { createTestDb, createTestStorageDir } from "../test-utils";

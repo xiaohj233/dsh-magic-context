@@ -43,14 +43,14 @@ OpenCode/Pi 行为保持不变。
 
 ```json
 {
-  "dependencies": { "@xiao_hj909/magic-context-for-dsh": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
-  "dsh": { "profile": { "bundles": ["...", "@xiao_hj909/magic-context-for-dsh"] } }
+  "dependencies": { "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
+  "dsh": { "profile": { "bundles": ["...", "dsh-magic-context"] } }
 }
 ```
 
 然后 `pnpm install`（或 `dsh plugin --profile <name> install`）并重启 dsh。
 
-> 依赖包（`@xiao_hj909/magic-context-for-dsh-adapter`）由主包的 `github:` 依赖自动解析，无需单独安装。
+> 依赖包（`dsh-magic-context-adapter`）由主包的 `github:` 依赖自动解析，无需单独安装。
 
 ### 快速开始
 

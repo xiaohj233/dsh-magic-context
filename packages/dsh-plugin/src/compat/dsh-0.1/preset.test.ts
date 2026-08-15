@@ -38,7 +38,7 @@ describe("magic-standard thin preset (guarded patch)", () => {
     const basic = children.find((row) => row.id === "compaction-basic");
     expect(basic?.disabled).toBe(true);
     const engine = children.find((row) => row.id === "magic-compaction");
-    expect(engine?.name).toBe("@xiao_hj909/magic-context-for-dsh/compaction");
+    expect(engine?.name).toBe("dsh-magic-context/compaction");
     expect((engine?.config as { auto?: boolean })?.auto).toBe(true);
     // Stock siblings untouched.
     expect(children.some((row) => row.id === "command-compact" && !row.disabled)).toBe(true);
@@ -87,7 +87,7 @@ describe("magic-standard thin preset (guarded patch)", () => {
   it("buildThinPresetEntries emits the include row with guarded patches", () => {
     const thin = buildThinPresetEntries({
       stockPresetPath: "/stock/standard/agent.cordis.yml",
-      magicRows: [{ id: "magic-agent", name: "@xiao_hj909/magic-context-for-dsh/agent" }],
+      magicRows: [{ id: "magic-agent", name: "dsh-magic-context/agent" }],
     });
     expect(thin.length).toBe(1);
     const include = thin[0];
@@ -106,7 +106,7 @@ describe("magic-standard thin preset (guarded patch)", () => {
     const thin = buildThinPresetEntries({
       stockPresetPath: "/stock/standard/agent.cordis.yml",
       includeEntry: "D:/pkg/dist/entries/preset-include.js",
-      magicRows: [{ id: "magic-agent", name: "@xiao_hj909/magic-context-for-dsh/agent" }],
+      magicRows: [{ id: "magic-agent", name: "dsh-magic-context/agent" }],
     });
     const include = thin[0];
     // The shipped stock file must be mounted through a write()-no-op tree:

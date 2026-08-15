@@ -1,15 +1,24 @@
-magic-context-for-dsh
-Copyright (c) 2026 xiao_hj909
-License: MIT
+# Third Party Notices
 
-This package is a community port of Magic Context to DeepSeek Harness. It is
-NOT affiliated with, endorsed by, or connected to the Magic Context project
+## dsh-magic-context / dsh-magic-context-adapter
+
+Copyright (c) 2026 xiao_hj909
+License: MIT (full text below)
+
+This is a community port of Magic Context to DeepSeek Harness. It is NOT
+affiliated with, endorsed by, or connected to the Magic Context project
 (cortexkit) or DeepSeek.
 
-It embeds (bundles) portions of Magic Context:
-  https://github.com/cortexkit/magic-context
-  Copyright (c) 2025 ualtinok
-  Licensed under the MIT License:
+The packages embed (bundle) portions of Magic Context:
+
+```
+https://github.com/cortexkit/magic-context
+Copyright (c) 2025 ualtinok
+Licensed under the MIT License
+```
+
+The packages depend on DeepSeek Harness packages (@deepseek-ai/*), which are
+MIT-licensed by their respective copyright holders.
 
 -------------------------------------------------------------------------
 MIT License

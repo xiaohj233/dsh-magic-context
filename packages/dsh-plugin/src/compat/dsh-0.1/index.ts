@@ -4,7 +4,7 @@
  * Every `@deepseek-ai/dsh-*` import in this adapter lives behind this layer.
  * DSH upgrades原则上 only touch this directory, its contract fixtures, and the
  * dependency lock. The adapter's feature code depends only on this layer and
- * on `@xiao_hj909/magic-context-for-dsh-adapter` (adapter-api).
+ * on `dsh-magic-context-adapter` (adapter-api).
  */
 export * from "./session";
 export * from "./compaction";

@@ -1,5 +1,5 @@
 /**
- * Subpath entry: `@xiao_hj909/magic-context-for-dsh/remote` — the Typert Remote row
+ * Subpath entry: `dsh-magic-context/remote` — the Typert Remote row
  * the bundle patch mounts on the HOST plane. Registers the `magicContext/status`
  * endpoint against the live host service; skipped fail-open when the Typert
  * registry is absent (headless profiles).

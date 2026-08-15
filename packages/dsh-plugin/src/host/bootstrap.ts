@@ -29,7 +29,7 @@ import type { Database } from "@magic-context/core/shared/sqlite";
 import {
   canonicalSessionKey,
   setDshHarness,
-} from "@xiao_hj909/magic-context-for-dsh-adapter";
+} from "dsh-magic-context-adapter";
 import {
   markerPath,
   removeDshLivenessMarker,

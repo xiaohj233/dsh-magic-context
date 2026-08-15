@@ -1,5 +1,5 @@
 /**
- * Agent plane entry — `/agent` subpath of @xiao_hj909/magic-context-for-dsh
+ * Agent plane entry — `/agent` subpath of dsh-magic-context
  * (Phase 2 slice A: knowledge mode).
  *
  * Mounted on the AGENT plane (host-side plugin scope that observes every
@@ -18,7 +18,7 @@
  * service is optional and read via ctx.get-style structural access.
  */
 import type { Context } from "@deepseek-ai/cordis";
-import { setDshHarness } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { setDshHarness } from "dsh-magic-context-adapter";
 import type { MagicContextHostService } from "../index";
 import { registerKnowledgeGate } from "./knowledge-gate";
 import type { KnowledgeConfig } from "./knowledge-gate";
@@ -45,7 +45,7 @@ import { dshDreamSeams, registerDshDreamer } from "./dreamer";
 import { createRecompSeams } from "./recomp";
 import { createSidekickSeam } from "./sidekick";
 import { createEmbedSeam } from "./embed";
-import { dshModelRefToCanonical } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { dshModelRefToCanonical } from "dsh-magic-context-adapter";
 import { modelSupportsVision } from "@magic-context/core/shared/models-dev-cache";
 import type { KnowledgeAgentView } from "./knowledge-gate";
 

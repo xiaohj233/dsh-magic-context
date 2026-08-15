@@ -2,14 +2,14 @@
   "name": "dsh-profile-magic-test",
   "private": true,
   "dependencies": {
-    "@xiao_hj909/magic-context-for-dsh": "link:D:/Code/magic-context-download/magic-context-master/packages/dsh-plugin"
+    "dsh-magic-context": "link:D:/Code/magic-context-download/magic-context-master/packages/dsh-plugin"
   },
   "dsh": {
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-headless",
-        "@xiao_hj909/magic-context-for-dsh"
+        "dsh-magic-context"
       ]
     }
   }

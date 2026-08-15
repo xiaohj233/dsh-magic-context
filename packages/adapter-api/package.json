@@ -1,5 +1,5 @@
 {
-  "name": "@xiao_hj909/magic-context-for-dsh-adapter",
+  "name": "dsh-magic-context-adapter",
   "version": "0.1.0",
   "type": "module",
   "description": "Magic Context adapter-api: stable Host-neutral facade over the shared Magic Context core for harness adapters (initial: type + contract surface only, per PLAN §2).",
@@ -8,11 +8,13 @@
   "license": "MIT",
   "files": [
     "dist",
-    "src"
+    "src",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/index.ts --outdir dist --target node --format esm",
+    "build": "tsc --noEmit",
     "test": "bun test"
   },
   "devDependencies": {

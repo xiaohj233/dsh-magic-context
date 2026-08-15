@@ -46,7 +46,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
 import { createUserMessage } from "../compat/dsh-0.1/session";
-import { DSH_HARNESS } from "@xiao_hj909/magic-context-for-dsh-adapter";
+import { DSH_HARNESS } from "dsh-magic-context-adapter";
 import {
   DreamerConfigSchema,
   type DreamerConfig,

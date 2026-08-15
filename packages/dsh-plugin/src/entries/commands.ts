@@ -1,5 +1,5 @@
 /**
- * Subpath entry: `@xiao_hj909/magic-context-for-dsh/commands` — command-registration
+ * Subpath entry: `dsh-magic-context/commands` — command-registration
  * plugin row (optional; the agent row can register commands directly).
  */
 import type { Context } from "@deepseek-ai/cordis";

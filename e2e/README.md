@@ -13,7 +13,7 @@ scratch home resolves every `@deepseek-ai/*` package against its OWN local copy
 | Path | Role |
 |---|---|
 | `scratch-home/` | Scratch `DSH_HOME` (`--anonymous-user-id`, profiles, sessions) |
-| `scratch-home/profiles/test/` | Headless profile: bundles = base + headless + `@xiao_hj909/magic-context-for-dsh` (link: into the plugin source tree) |
+| `scratch-home/profiles/test/` | Headless profile: bundles = base + headless + `dsh-magic-context` (link: into the plugin source tree) |
 | `scratch-home/profiles/node_modules/` | Profile dependency tree — **all 229 `@deepseek-ai/*` entries are junctions into `e2e/dsh-install/node_modules/`** (same physical copies the launcher loads — class identity is load-bearing) |
 | `scratch-home/.agent-presets/magic-standard/` | Generated thin preset (run `dsh-magic-context setup` to regenerate) |
 | `dsh-install/` | **Local, isolated DSH 0.1.0-rc.6 install** (copied from the npm-global install; gitignored). Launcher: `node e2e\dsh-install\lib\bin.js` |
@@ -156,7 +156,7 @@ of a source-tree link, against the REAL npm registry dependency tree:
   preset source; point setup at the full global install instead.
 - `e2e/real-home/` (gitignored) — a real `DSH_HOME` (copied `settings.yaml` +
   `.credentials.yaml` from the user's global home) with profile `install-test`:
-  dependencies = `@xiao_hj909/magic-context-for-dsh` from a **packed tgz**
+  dependencies = `dsh-magic-context` from a **packed tgz**
   (`e2e/.tgz/dsh-install-test*.tgz`; the `workspace:*` adapter dep was rewritten
   to a `file:` tgz reference — the pre-publish step), plus the user's
   `dsh-pi-ai-compat` (file: into the web profile install) and

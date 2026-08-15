@@ -44,14 +44,14 @@ In your DSH profile's `package.json`:
 
 ```json
 {
-  "dependencies": { "@xiao_hj909/magic-context-for-dsh": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
-  "dsh": { "profile": { "bundles": ["...", "@xiao_hj909/magic-context-for-dsh"] } }
+  "dependencies": { "dsh-magic-context": "github:xiao_hj909/dsh-magic-context#v0.1.0&path:/packages/dsh-plugin" },
+  "dsh": { "profile": { "bundles": ["...", "dsh-magic-context"] } }
 }
 ```
 
 Then run `pnpm install` (or `dsh plugin --profile <name> install`) and restart dsh.
 
-> The adapter package (`@xiao_hj909/magic-context-for-dsh-adapter`) is resolved
+> The adapter package (`dsh-magic-context-adapter`) is resolved
 > automatically by the main package's `github:` dependency — no separate install needed.
 
 ### Quick start
