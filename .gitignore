@@ -36,6 +36,7 @@ e2e/.tgz/
 e2e/dsh-install/
 e2e/dsh-real-install/
 e2e/real-home/
+e2e/verify-home/
 e2e/scratch-home/sessions/
 e2e/scratch-data/cortexkit/magic-context/rpc/
 
