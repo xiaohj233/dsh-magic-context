@@ -80,6 +80,14 @@ dsh-magic-context doctor
 
 完整对照见 [docs/FEATURES.md](./docs/FEATURES.md)。
 
+## 验证状态
+
+- **177/177 测试全绿**（dsh-plugin）+ adapter-api 14/14 + typecheck 0 错误
+- **已在隔离的非全局 DSH 验证安装**：npm 安装 → setup（薄 preset）→ doctor 6/6 →
+  薄 preset 挂载 → 知识注入（m0/§N§ tags）→ **真实模型链路**（本地中转
+  deepseek-v4-flash 响应 Magic 注入的上下文）→ 共享 SQLite `harness='dsh'` 行写入
+- OpenCode/Pi 零改动（共享 DB 兼容）
+
 ## 约束与边界
 
 - 不修改 DSH 源码；不拦截/改写 `llm/stream messages[]`；OpenCode/Pi 行为不变。

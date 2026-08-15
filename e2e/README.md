@@ -170,6 +170,15 @@ of a source-tree link, against the REAL npm registry dependency tree:
   `mc-op:*` knowledge baseline, `§N§` tags written, `session_meta`
   `harness='dsh'` + m0 bytes, and the LOCAL RELAY model (bendi,
   deepseek-v4-flash) answered with the Magic-injected context in its reply.
+- **Post-release rename verification (2026-08-15)**: after the package rename
+  to the bare `dsh-magic-context` / `dsh-magic-context-adapter` names, the
+  install was re-verified on a NON-GLOBAL dsh (`e2e/dsh-install` bin) with a
+  fresh `e2e/verify-home` DSH_HOME (gitignored): the release-mirror packages
+  copied into the profile's node_modules (equivalent to the v0.1.0 tag
+  contents; pnpm's `github:` fetch is blocked by the local relay proxy in this
+  environment) → setup → doctor 6/6 → probe: `joined magic-standard`,
+  `magicMessages=4`, real relay model answered `§3§`, shared SQLite
+  `harness='dsh'` rows + tags written.
 - **Findings that only this test could surface**:
   1. `settings.yaml` MUST actually live in `DSH_HOME` (a copy-step bug silently
      sent it to the user home dir; without it the model route falls back to

@@ -85,6 +85,15 @@ The first session automatically creates the shared SQLite
 
 Full parity table: [docs/FEATURES.md](./docs/FEATURES.md).
 
+## Verification status
+
+- **177/177 tests green** (dsh-plugin) + adapter-api 14/14 + typecheck 0 errors
+- **Install verified on an isolated non-global DSH**: npm install → setup (thin
+  preset) → doctor 6/6 → thin-preset mount → knowledge injection (m0/§N§ tags)
+  → **real model path** (local relay deepseek-v4-flash answered with the
+  Magic-injected context) → shared SQLite `harness='dsh'` rows written
+- OpenCode/Pi unchanged (shared DB compatible)
+
 ## Constraints & boundaries
 
 - No DSH source modifications; never rewrites `llm/stream messages[]`;

@@ -38,7 +38,7 @@ export function apply(ctx) {
         meta: { cwd: process.cwd() },
         agentOptions: { provider: selection.provider, model: selection.model },
         setup: async (agentCtx) => {
-          const joined = await presets.mount(agentCtx);
+          const joined = await presets.mount(agentCtx, "magic-standard");
           console.error(`PROBE: agent joined preset "${joined.id}"`);
         },
       });
