@@ -105,7 +105,7 @@ function findTool(registered: ToolDefinition[], name: string): ToolDefinition {
 const textOf = (value: unknown): string => (value as { text: string }).text;
 
 describe("registerCtxTools (DSH ctx_* tools)", () => {
-  it("registers all five tools and unregisters them via the disposer", async () => {
+  it("registers the six Pi-parity tools and unregisters them via the disposer", async () => {
     const { db, dir } = await openDb();
     try {
       const { ctx, registered } = makeFakeCtx();
@@ -117,6 +117,7 @@ describe("registerCtxTools (DSH ctx_* tools)", () => {
         "ctx_note",
         "ctx_reduce",
         "ctx_search",
+        "todowrite",
       ]);
       dispose();
       expect(registered.length).toBe(0);
@@ -336,6 +337,63 @@ describe("ctx_reduce drop path", () => {
 
       await expect(tool.execute({ drop: "99" }, toolExec(agent))).rejects.toThrow(
         "Unknown tag(s) §99§",
+      );
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+});
+
+describe("todowrite (Pi parity tool surface)", () => {
+  it("registers alongside the ctx_* tools by default", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      registerCtxTools(ctx, baseOpts(db));
+      expect(findTool(registered, "todowrite")).toBeDefined();
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+
+  it("is omitted when todowriteEnabled is false", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      registerCtxTools(ctx, { ...baseOpts(db), todowriteEnabled: false });
+      expect(registered.find((definition) => definition.name === "todowrite")).toBeUndefined();
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+
+  it("echoes the full todo list as pretty JSON and persists last_todo_state", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      registerCtxTools(ctx, baseOpts(db));
+      const tool = findTool(registered, "todowrite");
+      const agent = makeFakeAgent(SESSION_ID, "/tmp/dsh-proj");
+      const todos = [
+        { content: "first task", status: "in_progress" },
+        { content: "second task", status: "pending", priority: "high" },
+        { content: "done task", status: "completed" },
+      ];
+      const result = await tool!.execute({ todos }, toolExec(agent));
+      expect(JSON.parse(result.text)).toEqual(todos);
+      const meta = db
+        .prepare("SELECT last_todo_state FROM session_meta WHERE session_id = ?")
+        .get(CANONICAL) as { last_todo_state: string | null };
+      // normalizeTodoStateJson 契约：稳定字段序 {content,status,priority}，id 剥离、priority 默认 medium
+      expect(meta.last_todo_state).toBe(
+        JSON.stringify([
+          { content: "first task", status: "in_progress", priority: "medium" },
+          { content: "second task", status: "pending", priority: "high" },
+          { content: "done task", status: "completed", priority: "medium" },
+        ]),
       );
     } finally {
       db.close();

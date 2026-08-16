@@ -81,6 +81,12 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
+  normalizeTodoStateJson,
+  TITLE_DONE_STATUSES,
+  TODO_PRIORITIES,
+  TODO_STATUSES,
+} from "@magic-context/core/hooks/magic-context/todo-view";
+import {
   readSessionChunk,
   setRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
@@ -142,6 +148,8 @@ export interface CtxToolsOptions extends CtxRuntimeOptions {
   dreamerEnabled?: boolean;
   /** When true, ctx_memory exposes the dreamer-only `list` action. */
   allowDreamerActions?: boolean;
+  /** When false, omit the Pi-parity `todowrite` tool. */
+  todowriteEnabled?: boolean;
   /** Raw-message source for ctx_expand. Defaults to the agent-session adapter below. */
   readRawMessages?: (agent: Agent) => RawMessage[];
 }
@@ -1458,10 +1466,80 @@ export function createCtxReduceTool(ctx: Context, opts: CtxToolsOptions): ToolDe
  *   - `sessionScopedToolsDisabled` → no ctx_note / ctx_expand / ctx_reduce;
  *   - `compactionOff` → no ctx_reduce.
  */
+/**
+ * Pi-parity `todowrite` tool (closes the DSH tool-surface gap: Pi registers
+ * six tools incl. `todowrite`, DSH registered five).
+ *
+ * Mirrors pi-plugin/src/tools/todowrite.ts: same `{ todos }` shape (OpenCode
+ * wire parity), same pretty-printed JSON ack output, and the call is
+ * persisted into `session_meta.last_todo_state` via the shared
+ * `normalizeTodoStateJson` contract so the todo capture path (and any future
+ * synthetic-todowrite replay) has the same durable state as Pi.
+ */
+export interface TodowriteItem {
+  content: string;
+  status: (typeof TODO_STATUSES)[number];
+  priority?: (typeof TODO_PRIORITIES)[number];
+  id?: string;
+}
+
+export function createTodowriteTool(ctx: Context, opts: CtxToolsOptions): ToolDefinition {
+  return defineTool({
+    name: "todowrite",
+    description: "Manage the session task list.",
+    parameters: {
+      todos: {
+        type: "array",
+        description:
+          "Replace the current task list with this complete set of todos. Include every task you intend to track this turn — pending, in_progress, completed, or cancelled — because the list overwrites previous state.",
+        items: {
+          type: "object",
+          properties: {
+            content: { type: "string", description: "Brief description of the task" },
+            status: { type: "string", enum: [...TODO_STATUSES] },
+            priority: { type: "string", enum: [...TODO_PRIORITIES] },
+            id: { type: "string", description: "Optional stable id for the todo" },
+          },
+          additionalProperties: false,
+        },
+      },
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (!agent) throw toolError("'todowrite' requires an agent execution context.");
+      const params = (args ?? {}) as { todos?: unknown };
+      const todos: TodowriteItem[] = Array.isArray(params.todos)
+        ? (params.todos as TodowriteItem[])
+        : [];
+      const runtime = resolveAgentContext(ctx, opts, agent);
+      if (!runtime.sessionId) {
+        throw toolError("Could not resolve the canonical session id for this agent.");
+      }
+      // Persist the capture contract (Pi index.ts message_end capture path):
+      // only shapes matching the exact enum contract update last_todo_state.
+      try {
+        const db = await resolveDb(ctx, opts);
+        const normalized = normalizeTodoStateJson(todos);
+        if (normalized !== null) {
+          updateSessionMeta(db, runtime.sessionId, { lastTodoState: normalized });
+        }
+      } catch {
+        // Best-effort capture — the tool must not fail on persistence.
+      }
+      const active = todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
+      return { text: JSON.stringify(todos, null, 2) };
+    },
+  });
+}
+
 export function registerCtxTools(ctx: Context, opts: CtxToolsOptions = {}): () => void {
   const disposers: Array<() => void> = [];
   try {
     disposers.push(registerTool(ctx, createCtxSearchTool(ctx, opts)));
+    if (opts.todowriteEnabled !== false) {
+      disposers.push(registerTool(ctx, createTodowriteTool(ctx, opts)));
+    }
     if (opts.memoryToolEnabled !== false) {
       disposers.push(registerTool(ctx, createCtxMemoryTool(ctx, opts)));
     }

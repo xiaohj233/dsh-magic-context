@@ -36053,6 +36053,60 @@ function parseInteger(str) {
   return n;
 }
 
+// ../plugin/src/hooks/magic-context/todo-view.ts
+var TODO_STATUS_PENDING = "pending";
+var TODO_STATUS_IN_PROGRESS = "in_progress";
+var TODO_STATUS_COMPLETED = "completed";
+var TODO_STATUS_CANCELLED = "cancelled";
+var TODO_PRIORITY_HIGH = "high";
+var TODO_PRIORITY_MEDIUM = "medium";
+var TODO_PRIORITY_LOW = "low";
+var TODO_STATUSES = [
+  TODO_STATUS_PENDING,
+  TODO_STATUS_IN_PROGRESS,
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+];
+var TODO_PRIORITIES = [
+  TODO_PRIORITY_HIGH,
+  TODO_PRIORITY_MEDIUM,
+  TODO_PRIORITY_LOW
+];
+var TODO_STATUS_SET = new Set(TODO_STATUSES);
+var TODO_PRIORITY_SET = new Set(TODO_PRIORITIES);
+var TERMINAL_STATUSES = new Set([
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+]);
+var TITLE_DONE_STATUSES = new Set([TODO_STATUS_COMPLETED]);
+function normalizeTodoStateJson(todos) {
+  if (!Array.isArray(todos))
+    return null;
+  const normalized = [];
+  for (const todo of todos) {
+    if (!isTodoItem(todo))
+      return null;
+    normalized.push({
+      content: todo.content,
+      status: todo.status,
+      priority: todo.priority ?? TODO_PRIORITY_MEDIUM
+    });
+  }
+  return JSON.stringify(normalized);
+}
+function isTodoStatus(value) {
+  return typeof value === "string" && TODO_STATUS_SET.has(value);
+}
+function isTodoPriority(value) {
+  return typeof value === "string" && TODO_PRIORITY_SET.has(value);
+}
+function isTodoItem(value) {
+  if (value === null || typeof value !== "object")
+    return false;
+  const todo = value;
+  return typeof todo.content === "string" && isTodoStatus(todo.status) && (todo.priority === undefined || isTodoPriority(todo.priority));
+}
+
 // ../plugin/src/tools/ctx-expand/constants.ts
 var CTX_EXPAND_DESCRIPTION = `Recover the original conversation from your compacted history.
 
@@ -39409,10 +39463,56 @@ function createCtxReduceTool(ctx, opts) {
     }
   });
 }
+function createTodowriteTool(ctx, opts) {
+  return defineTool2({
+    name: "todowrite",
+    description: "Manage the session task list.",
+    parameters: {
+      todos: {
+        type: "array",
+        description: "Replace the current task list with this complete set of todos. Include every task you intend to track this turn — pending, in_progress, completed, or cancelled — because the list overwrites previous state.",
+        items: {
+          type: "object",
+          properties: {
+            content: { type: "string", description: "Brief description of the task" },
+            status: { type: "string", enum: [...TODO_STATUSES] },
+            priority: { type: "string", enum: [...TODO_PRIORITIES] },
+            id: { type: "string", description: "Optional stable id for the todo" }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args, exec) {
+      const agent = exec.agent;
+      if (!agent)
+        throw toolError("'todowrite' requires an agent execution context.");
+      const params = args ?? {};
+      const todos = Array.isArray(params.todos) ? params.todos : [];
+      const runtime = resolveAgentContext(ctx, opts, agent);
+      if (!runtime.sessionId) {
+        throw toolError("Could not resolve the canonical session id for this agent.");
+      }
+      try {
+        const db = await resolveDb(ctx, opts);
+        const normalized = normalizeTodoStateJson(todos);
+        if (normalized !== null) {
+          updateSessionMeta(db, runtime.sessionId, { lastTodoState: normalized });
+        }
+      } catch {}
+      const active = todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
+      return { text: JSON.stringify(todos, null, 2) };
+    }
+  });
+}
 function registerCtxTools(ctx, opts = {}) {
   const disposers = [];
   try {
     disposers.push(registerTool(ctx, createCtxSearchTool(ctx, opts)));
+    if (opts.todowriteEnabled !== false) {
+      disposers.push(registerTool(ctx, createTodowriteTool(ctx, opts)));
+    }
     if (opts.memoryToolEnabled !== false) {
       disposers.push(registerTool(ctx, createCtxMemoryTool(ctx, opts)));
     }
