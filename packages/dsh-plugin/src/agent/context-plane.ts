@@ -155,16 +155,29 @@ function maybeFireHistorian(
       typeof config.contextLimit === "number" && config.contextLimit > 0
         ? config.contextLimit
         : contextWindow;
-    const fires = checkDshCompartmentTrigger(
-      {
-        executeThresholdPercentage,
-        triggerBudget:
-          config.triggerBudgetTokens ??
-          deriveTriggerBudget(contextLimit, executeThresholdPercentage),
-        contextLimit,
-      },
-      { lastContextPercentage: percentage },
-    );
+    const forceFire = process.env.MAGIC_CONTEXT_FORCE_HISTORIAN === "1" && percentage >= 0;
+    const fires =
+      forceFire ||
+      checkDshCompartmentTrigger(
+        {
+          executeThresholdPercentage,
+          triggerBudget:
+            config.triggerBudgetTokens ??
+            deriveTriggerBudget(contextLimit, executeThresholdPercentage),
+          contextLimit,
+        },
+        { lastContextPercentage: percentage },
+      );
+    if (process.env.MAGIC_CONTEXT_DEBUG_HISTORIAN === "1") {
+      try {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[magic-context] historian trigger: pct=${percentage} threshold=${executeThresholdPercentage} budget=${config.triggerBudgetTokens ?? deriveTriggerBudget(contextLimit, executeThresholdPercentage)} window=${contextWindow} fires=${fires}`,
+        );
+      } catch {
+        // Diagnostics must never break the pre-step chain.
+      }
+    }
     if (fires) {
       historian.fire({
         db,

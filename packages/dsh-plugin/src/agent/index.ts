@@ -19,6 +19,8 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import { setDshHarness } from "dsh-magic-context-adapter";
+import { loadPluginConfig, type MagicContextPluginConfig } from "@magic-context/core/config";
+import { isCompactionEnabled, isDreamerRunnable, isHistorianRunnable } from "@magic-context/core/config/agent-disable";
 import type { MagicContextHostService } from "../index";
 import { registerKnowledgeGate } from "./knowledge-gate";
 import type { KnowledgeConfig } from "./knowledge-gate";
@@ -116,11 +118,101 @@ export interface MagicAgentConfig {
   commands?: CtxCommandsOptions;
   /** Injectable clock (tests). */
   now?: () => number;
+  /** Internal: raw `dreamer` section bridged from the shared config. */
+  _dreamerCore?: unknown;
 }
 
 /** Read the host service provided by the host entry (inject guarantees it). */
 export function readMagicContextHost(ctx: Context): MagicContextHostService | undefined {
   return (ctx as unknown as { magicContextHost?: MagicContextHostService }).magicContextHost;
+}
+
+/**
+ * Bridge the shared `magic-context.jsonc` (user + project) into the agent-plane
+ * options. Pi loads the config per session (loadPiConfig); DSH previously ran
+ * the agent plane on schema defaults only — the file was validated by doctor
+ * but never consumed at runtime. Every mapping is a fallback: explicit row
+ * config (preset/tests) still wins.
+ */
+export function bridgeMagicConfig(
+  config: MagicAgentConfig,
+  directory: string,
+): MagicAgentConfig {
+  let magic: MagicContextPluginConfig | undefined;
+  try {
+    magic = loadPluginConfig(directory);
+  } catch {
+    magic = undefined;
+  }
+  if (magic === undefined) return config;
+  const cfg = magic;
+  const thresholdRaw = cfg.execute_threshold_percentage;
+  const threshold: number | undefined =
+    typeof thresholdRaw === "number"
+      ? thresholdRaw
+      : typeof thresholdRaw === "object" && thresholdRaw !== null
+        ? (typeof (thresholdRaw as { default?: unknown }).default === "number"
+            ? (thresholdRaw as { default: number }).default
+            : undefined)
+        : undefined;
+  const memoryCfg = cfg.memory;
+  const dreamerCfg = cfg.dreamer;
+  const compactionCfg = cfg.compaction;
+  const muralCfg = cfg.mural;
+  const commitCluster = cfg.commit_cluster_trigger;
+  return {
+    ...config,
+    knowledge: {
+      ...config.knowledge,
+      injectDocs: config.knowledge?.injectDocs ?? dreamerCfg?.inject_docs ?? true,
+      memoryInjectionBudgetTokens:
+        config.knowledge?.memoryInjectionBudgetTokens ?? memoryCfg?.injection_budget_tokens,
+      muralEnabled: config.knowledge?.muralEnabled ?? muralCfg?.enabled ?? false,
+      cacheTtl: config.knowledge?.cacheTtl ?? (typeof cfg.cache_ttl === "string" ? cfg.cache_ttl : undefined),
+    },
+    context: {
+      ...config.context,
+      protectedTags: config.context?.protectedTags ?? cfg.protected_tags,
+    },
+    historian: {
+      ...config.historian,
+      executeThresholdPercentage: config.historian?.executeThresholdPercentage ?? threshold,
+    },
+    autoSearch: {
+      ...config.autoSearch,
+      enabled: config.autoSearch?.enabled ?? memoryCfg?.auto_search?.enabled ?? true,
+    },
+    tools: {
+      ...config.tools,
+      memoryToolEnabled: config.tools?.memoryToolEnabled ?? memoryCfg?.enabled !== false,
+      dreamerEnabled: config.tools?.dreamerEnabled ?? isDreamerRunnable(cfg),
+      compactionOff: config.tools?.compactionOff ?? !isCompactionEnabled(cfg),
+      protectedTags: config.tools?.protectedTags ?? cfg.protected_tags,
+    },
+    commands: {
+      ...config.commands,
+      executeThresholdPercentage: config.commands?.executeThresholdPercentage ?? threshold,
+      executeThresholdTokens: config.commands?.executeThresholdTokens ?? cfg.execute_threshold_tokens,
+      historyBudgetPercentage: config.commands?.historyBudgetPercentage ?? cfg.history_budget_percentage,
+      commitClusterTrigger:
+        config.commands?.commitClusterTrigger ??
+        (commitCluster !== undefined
+          ? { enabled: commitCluster.enabled ?? true, min_clusters: commitCluster.min_clusters ?? 3 }
+          : undefined),
+      compactionOff: config.commands?.compactionOff ?? compactionCfg?.enabled === false,
+    },
+    dreamer: {
+      ...config.dreamer,
+      // 核心语义：dreamer 段存在且未 disable 即可运行（schema 无 enabled 键）
+      enabled: config.dreamer?.enabled ?? isDreamerRunnable(cfg),
+    },
+    _dreamerCore: dreamerCfg,
+  };
+}
+
+/** Raw `dreamer` section of the shared config (bridged by bridgeMagicConfig). */
+export function dreamerCoreConfigOf(config: MagicAgentConfig): unknown {
+  return (config as unknown as { _dreamerCore?: unknown })._dreamerCore;
 }
 
 export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
@@ -130,6 +222,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
   // / compartments…). Lock "dsh" HERE too, before any DB write — the core's
   // setHarness is idempotent for the same value and throws only on a mismatch.
   setDshHarness();
+  config = bridgeMagicConfig(config, config.directory ?? process.cwd());
   const host = readMagicContextHost(ctx);
   if (!host) {
     throw new Error("magic-context-agent: magicContextHost service unavailable");
@@ -196,6 +289,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     host,
     directory,
     config: config.dreamer,
+    coreConfig: dreamerCoreConfigOf(config),
     log,
   });
 

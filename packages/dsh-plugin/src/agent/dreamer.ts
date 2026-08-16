@@ -103,6 +103,8 @@ export interface DreamerWiringDeps {
   /** DSH dreamer config. `enabled` gates both the timer and the /ctx-dream
    *  seam (`runnable`); `tickMs` defaults to 15 minutes. */
   readonly config?: { enabled?: boolean; tickMs?: number };
+  /** Parsed core DreamerConfig (from magic-context.jsonc `dreamer` section). */
+  readonly coreConfig?: unknown;
   readonly log?: (message: string) => void;
 }
 
@@ -382,8 +384,8 @@ const dreamerRuntime = new WeakMap<object, DreamerRuntimeState>();
 /** Synthesize the core DreamerConfig from the minimal DSH config: enabled →
  *  the core's default per-task schedules (v1-preserving); DSH has no
  *  per-task config surface in P1. */
-function synthesizeDreamerConfig(): DreamerConfig {
-  return DreamerConfigSchema.parse({});
+function synthesizeDreamerConfig(raw?: unknown): DreamerConfig {
+  return DreamerConfigSchema.parse(raw ?? {});
 }
 
 function defaultState(): DreamerRuntimeState {
@@ -490,7 +492,9 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
   const state: DreamerRuntimeState = {
     enabled,
     tickMs,
-    coreConfig: synthesizeDreamerConfig(),
+    // 桥接：优先用 magic-context.jsonc 的 dreamer 段（含 per-task cron），
+    // 缺失时回落核心默认调度（v1 保真）。
+    coreConfig: synthesizeDreamerConfig(deps.coreConfig),
     directory: deps.directory ?? process.cwd(),
     facade: null,
   };
