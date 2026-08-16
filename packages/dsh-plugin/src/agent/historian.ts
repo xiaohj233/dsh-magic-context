@@ -75,6 +75,7 @@ import {
   type SessionChunk,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { describeError } from "@magic-context/core/shared/error-message";
+import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type { SummarizationInput, SummarizeHook, SummaryResult } from "../compat/dsh-0.1/compaction";
 import {
@@ -649,6 +650,12 @@ export async function runDshHistorian(deps: HistorianDeps): Promise<boolean> {
       // Post-COMMIT only: the caller's hook may signal deferred history
       // refresh / materialization — never publish-visible state.
       deps.onPublished?.();
+      // Magic note-nudger: historian completion is a natural note boundary.
+      try {
+        onNoteTrigger(deps.db, deps.sessionId, "historian_complete");
+      } catch {
+        // Nudges never break the publish path (fail-open).
+      }
       log(
         `[magic-context] historian: published ${result.newCompartments!.length} compartment(s), ${facts.length} fact(s) covering messages ${result.chunk!.startIndex}-${result.lastNewEnd!}`,
       );

@@ -100,6 +100,8 @@ import { runImmediateTransaction } from "@magic-context/core/tools/ctx-memory/ve
 import { CTX_NOTE_DESCRIPTION } from "@magic-context/core/tools/ctx-note/constants";
 import { CTX_REDUCE_DESCRIPTION } from "@magic-context/core/tools/ctx-reduce/constants";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
+import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
+import { TERMINAL_STATUSES } from "@magic-context/core/hooks/magic-context/todo-view";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { registerTool } from "../compat/dsh-0.1/tools";
 import { textBlock } from "../compat/dsh-0.1/session";
@@ -1486,7 +1488,18 @@ export interface TodowriteItem {
 export function createTodowriteTool(ctx: Context, opts: CtxToolsOptions): ToolDefinition {
   return defineTool({
     name: "todowrite",
-    description: "Manage the session task list.",
+    description:
+      "Manage the session task list.\n\n" +
+      "Use todowrite for non-trivial work spanning 3+ steps, when the user gives you multiple tasks, " +
+      "or when you need to track progress across a verify/fix loop. Skip it for single-shot answers " +
+      "or trivial one-step work.\n" +
+      "Pass the COMPLETE updated todo list every time. This tool replaces the prior list rather than " +
+      "appending to it, so include pending, in_progress, completed, and cancelled tasks that should " +
+      "remain visible.\n" +
+      "When starting a task, mark exactly one todo in_progress before doing the work. Mark items " +
+      "completed immediately when done; use cancelled only for work that is no longer needed.\n" +
+      "Never mark a todo completed if verification is failing, implementation is partial, or an " +
+      "unresolved blocker remains. Keep it in_progress and add or update a todo for the blocker instead.",
     parameters: {
       todos: {
         type: "array",
@@ -1528,6 +1541,16 @@ export function createTodowriteTool(ctx: Context, opts: CtxToolsOptions): ToolDe
         // Best-effort capture — the tool must not fail on persistence.
       }
       const active = todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
+      // Magic note-nudger: when every todo reaches a terminal state, a
+      // natural note-review boundary fires (Pi todos_complete parity).
+      if (todos.length > 0 && todos.every((todo) => TERMINAL_STATUSES.has(todo.status))) {
+        try {
+          const todoDb = await resolveDb(ctx, opts);
+          onNoteTrigger(todoDb, runtime.sessionId, "todos_complete");
+        } catch {
+          // fail-open
+        }
+      }
       return { text: JSON.stringify(todos, null, 2) };
     },
   });

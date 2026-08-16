@@ -37,6 +37,7 @@ import { updateSessionMeta } from "@magic-context/core/features/magic-context/st
 import { checkDshCompartmentTrigger } from "./historian";
 import { maybeNudgeChannels } from "./nudge";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
+import { markNoteNudgeDelivered, onNoteTrigger, peekNoteNudgeText } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { transcriptRawMessageProvider } from "./historian-wiring";
 import { isMagicChildSession } from "./worker";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
@@ -212,11 +213,20 @@ function maybeFireHistorian(
         : contextWindow;
     const forceFire = process.env.MAGIC_CONTEXT_FORCE_HISTORIAN === "1" && percentage >= 0;
     const commitCfg = config.commitClusterTrigger;
+    const commitClusters = recentCommitClusterCount(agent);
     const commitClusterFires =
       commitCfg !== undefined &&
       commitCfg.enabled !== false &&
-      recentCommitClusterCount(agent) >= Math.max(1, commitCfg.min_clusters ?? 3) &&
+      commitClusters >= Math.max(1, commitCfg.min_clusters ?? 3) &&
       (config.triggerBudgetTokens ?? deriveTriggerBudget(contextLimit, executeThresholdPercentage)) > 0;
+    // Magic note-nudger: a commit burst is a natural note-review boundary.
+    if (commitCfg !== undefined && commitCfg.enabled !== false && commitClusters >= 1) {
+      try {
+        onNoteTrigger(db, sessionId, "commit_detected");
+      } catch {
+        // fail-open
+      }
+    }
     const fires =
       forceFire ||
       commitClusterFires ||
@@ -382,6 +392,41 @@ export async function runContextPlaneStep(
       protectedTags: deps.config?.protectedTags ?? 20,
       log: deps.log,
     });
+
+    // Magic note-nudger delivery: peek + inject (DSH inject semantics; no
+    // anchor message id, so delivery clears the trigger + cooldown).
+    try {
+      const firstUser = (payload.messages as Array<{ id?: unknown }>).find((m) => m?.id !== undefined);
+      const noteText = peekNoteNudgeText(
+        db,
+        canonicalSessionId,
+        typeof firstUser?.id === "string" ? firstUser.id : undefined,
+        deps.directory,
+        undefined,
+      );
+      if (noteText !== null) {
+        const noteMarker = `mc-nudge:note`;
+        const events = (agent.session as { events?: readonly unknown[] }).events ?? [];
+        const alreadyInjected = events.some((event) => {
+          if (event === null || typeof event !== "object") return false;
+          const e = event as { data?: { source?: { plugin?: unknown; messageId?: unknown } } };
+          const source = e.data?.source;
+          return source?.plugin === "magic-context" && source?.messageId === noteMarker;
+        });
+        if (!alreadyInjected) {
+          const { magicUserMessage } = await import("../compat/dsh-0.1/session");
+          const noteMessage = magicUserMessage(
+            noteText,
+            { kind: "plugin", plugin: "magic-context", messageId: noteMarker } as never,
+            [],
+          );
+          (agent as unknown as { inject?: (m: unknown) => void }).inject?.(noteMessage);
+          markNoteNudgeDelivered(db, canonicalSessionId, noteText, null);
+        }
+      }
+    } catch {
+      // Note nudge must never break the pre-step chain (fail-open).
+    }
 
     // Historian plane: evaluate the context-pressure trigger and fire the
     // background compartment pass (fire-and-forget; never blocks the step).

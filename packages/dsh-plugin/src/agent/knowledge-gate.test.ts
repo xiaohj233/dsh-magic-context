@@ -376,3 +376,68 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
     }
   });
 });
+
+describe("synthetic todowrite replay (Magic todo-view parity)", () => {
+  it("injects a mc-todo replay message on materialization when last_todo_state exists", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kg-todo-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const deps = fakeDeps(db, dir);
+      const state = createKnowledgeGateState();
+      const harness = makeFakeAgent(dir);
+      // 预置 todo 快照（含非终态任务）。
+      const todos = [
+        { content: "write report", status: "in_progress" },
+        { content: "fix bug", status: "pending" },
+      ];
+      const todoState = JSON.stringify(todos);
+      // 先建完整行（getOrCreateSessionMeta 语义），再写 last_todo_state。
+      const sid = canonicalSessionKey(HOME_HASH, harness.agent.id);
+      const { getOrCreateSessionMeta } = await import("@magic-context/core/features/magic-context/storage");
+      getOrCreateSessionMeta(db, sid);
+      db.prepare("UPDATE session_meta SET last_todo_state = ? WHERE session_id = ?").run(todoState, sid);
+
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("first message")] }, passThroughNext());
+
+      const todoMessages = harness.injected.filter((m) => {
+        const src = m.source as { messageId?: string };
+        return typeof src.messageId === "string" && src.messageId.startsWith("mc-todo:");
+      });
+      expect(todoMessages.length).toBe(1);
+      const text = todoMessages[0].content[0].type === "text" ? todoMessages[0].content[0].text : "";
+      expect(text).toContain("[tool: todowrite #mc_synthetic_todo_");
+      expect(text).toContain("write report");
+      expect(text).toContain("fix bug");
+    } finally {
+      db?.close();
+      await cleanupDir(dir, db);
+    }
+  });
+
+  it("skips the todo replay when the snapshot is all-terminal", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kg-todo-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const deps = fakeDeps(db, dir);
+      const state = createKnowledgeGateState();
+      const harness = makeFakeAgent(dir);
+      const todoState = JSON.stringify([{ content: "done", status: "completed" }]);
+      const sid2 = canonicalSessionKey(HOME_HASH, harness.agent.id);
+      const { getOrCreateSessionMeta } = await import("@magic-context/core/features/magic-context/storage");
+      getOrCreateSessionMeta(db, sid2);
+      db.prepare("UPDATE session_meta SET last_todo_state = ? WHERE session_id = ?").run(todoState, sid2);
+
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("first")] }, passThroughNext());
+      const todoMessages = harness.injected.filter((m) => {
+        const src = m.source as { messageId?: string };
+        return typeof src.messageId === "string" && src.messageId.startsWith("mc-todo:");
+      });
+      expect(todoMessages.length).toBe(0);
+    } finally {
+      db?.close();
+      await cleanupDir(dir, db);
+    }
+  });
+});

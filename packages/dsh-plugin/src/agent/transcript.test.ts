@@ -358,3 +358,53 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isToolPart(part: unknown, callId: string): boolean {
   return isRecord(part) && part.type === "tool" && part.callID === callId;
 }
+
+describe("temporal gap markers (Magic temporal-awareness parity)", () => {
+  it("inserts a <!-- +Xm --> marker before a user message after a 5+ minute gap", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-temporal-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const t0 = Date.now();
+      // 手工构造事件：两条用户消息间隔 6 分钟（阈值 5 分钟）。
+      const events = [
+        { type: "user/message", seq: 1, time: t0, data: { content: [{ type: "text", text: "first message" }], source: { kind: "user" }, role: "user", id: "u1" } },
+        { type: "assistant/message", seq: 2, time: t0 + 1000, data: { turn: 1, step: 1, message: { content: [{ type: "text", text: "ok" }], source: { kind: "model" }, role: "assistant", id: "a1" } } },
+        { type: "user/message", seq: 3, time: t0 + 7 * 60 * 1000, data: { content: [{ type: "text", text: "second message after a gap" }], source: { kind: "user" }, role: "user", id: "u2" } },
+      ];
+      const view = readDshTranscript({
+        session: { events, surface: { nodes: [1, 2, 3], replaceGeneration: 0 }, header: { cwd: "/tmp" } },
+        canonicalSessionId: "dsh:a1b2c3d4:sess-temporal",
+      });
+      const plan = deriveMutationPlan(view, { db, protectedTags: 20 });
+      expect(plan).not.toBeNull();
+      const temporal = plan!.ops.filter((op) => op.kind === "temporal");
+      expect(temporal.length).toBe(1);
+      expect(temporal[0]!.replacement).toMatch(/<!-- \+6m -->/);
+      db.close();
+    } finally {
+      await rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not insert a marker for sub-threshold gaps", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-temporal-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const t0 = Date.now();
+      const events = [
+        { type: "user/message", seq: 1, time: t0, data: { content: [{ type: "text", text: "first" }], source: { kind: "user" }, role: "user", id: "u1" } },
+        { type: "user/message", seq: 2, time: t0 + 60 * 1000, data: { content: [{ type: "text", text: "second" }], source: { kind: "user" }, role: "user", id: "u2" } },
+      ];
+      const view = readDshTranscript({
+        session: { events, surface: { nodes: [1, 2], replaceGeneration: 0 }, header: { cwd: "/tmp" } },
+        canonicalSessionId: "dsh:a1b2c3d4:sess-temporal2",
+      });
+      const plan = deriveMutationPlan(view, { db, protectedTags: 20 });
+      const temporal = (plan?.ops ?? []).filter((op) => op.kind === "temporal");
+      expect(temporal.length).toBe(0);
+      db.close();
+    } finally {
+      await rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

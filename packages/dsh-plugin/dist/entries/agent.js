@@ -1,4 +1,10 @@
 import {
+  createUserMessage,
+  deriveEventMessage,
+  magicUserMessage,
+  textBlock
+} from "./agent-vb9fxjdc.js";
+import {
   pushNotification
 } from "./agent-hw34xmzk.js";
 import {
@@ -16507,7 +16513,7 @@ function loadPluginConfigDetailed(directory) {
 }
 
 // src/agent/knowledge-gate.ts
-import { createHash as createHash14 } from "node:crypto";
+import { createHash as createHash15 } from "node:crypto";
 
 // ../plugin/src/hooks/magic-context/inject-compartments.ts
 import { Buffer as Buffer5 } from "node:buffer";
@@ -31610,6 +31616,18 @@ var AUTO_SEARCH_NO_HINT_REASONS = new Set([
   "stacked",
   "too-short"
 ]);
+function isPersistedNoteNudgeRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.note_nudge_trigger_pending === "number" && typeof r.note_nudge_trigger_message_id === "string" && typeof r.note_nudge_sticky_text === "string" && typeof r.note_nudge_sticky_message_id === "string";
+}
+function isValidNoteNudgeAnchor(value) {
+  if (value === null || typeof value !== "object")
+    return false;
+  const row = value;
+  return typeof row.messageId === "string" && row.messageId.length > 0 && typeof row.text === "string" && row.text.length > 0;
+}
 function isValidAutoSearchHintDecision(value) {
   if (value === null || typeof value !== "object")
     return false;
@@ -31641,6 +31659,14 @@ function isPersistedHistorianFailureRow(row) {
     return false;
   const r = row;
   return typeof r.historian_failure_count === "number" && (typeof r.historian_last_error === "string" || r.historian_last_error === null) && (typeof r.historian_last_failure_at === "number" || r.historian_last_failure_at === null);
+}
+function getDefaultPersistedNoteNudge() {
+  return {
+    triggerPending: false,
+    triggerMessageId: null,
+    stickyText: null,
+    stickyMessageId: null
+  };
 }
 function getDefaultHistorianFailureState() {
   return {
@@ -32034,10 +32060,28 @@ function setChannel2NudgeState(db, sessionId, state) {
     db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ?").run(state, claimedAt, sessionId);
   })();
 }
+function getPersistedNoteNudge(db, sessionId) {
+  const result = db.prepare("SELECT note_nudge_trigger_pending, note_nudge_trigger_message_id, note_nudge_sticky_text, note_nudge_sticky_message_id FROM session_meta WHERE session_id = ?").get(sessionId);
+  if (!isPersistedNoteNudgeRow(result)) {
+    return getDefaultPersistedNoteNudge();
+  }
+  return {
+    triggerPending: result.note_nudge_trigger_pending === 1,
+    triggerMessageId: result.note_nudge_trigger_message_id.length > 0 ? result.note_nudge_trigger_message_id : null,
+    stickyText: result.note_nudge_sticky_text.length > 0 ? result.note_nudge_sticky_text : null,
+    stickyMessageId: result.note_nudge_sticky_message_id.length > 0 ? result.note_nudge_sticky_message_id : null
+  };
+}
 function setPersistedNoteNudgeTrigger(db, sessionId, triggerMessageId = "") {
   db.transaction(() => {
     ensureSessionMetaRow(db, sessionId);
     db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 1, note_nudge_trigger_message_id = ? WHERE session_id = ?").run(triggerMessageId, sessionId);
+  })();
+}
+function setPersistedNoteNudgeTriggerMessageId(db, sessionId, triggerMessageId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET note_nudge_trigger_message_id = ? WHERE session_id = ?").run(triggerMessageId, sessionId);
   })();
 }
 function getAutoSearchHintDecisions(db, sessionId) {
@@ -32073,6 +32117,36 @@ function casUpdateJsonArrayColumn(db, sessionId, column, validator, mutate, opti
   sessionLog(sessionId, `${column} CAS: ${CAS_RETRY_LIMIT} retries exhausted`);
   return false;
 }
+function deliverNoteNudgeAtomic(db, sessionId, messageId, text) {
+  let plan = null;
+  const casOk = casUpdateJsonArrayColumn(db, sessionId, "note_nudge_anchors", isValidNoteNudgeAnchor, (current) => {
+    if (current.some((anchor) => anchor.messageId === messageId && anchor.text === text)) {
+      plan = { kind: "already-present" };
+      return null;
+    }
+    if (current.some((anchor) => anchor.messageId === messageId)) {
+      plan = { kind: "conflict" };
+      sessionLog(sessionId, "note-nudge: messageId conflict, refusing append");
+      return null;
+    }
+    plan = { kind: "appended" };
+    return [...current, { messageId, text }];
+  });
+  if (!casOk) {
+    sessionLog(sessionId, `note-nudge: CAS exhausted for ${messageId}; skipping wire append`);
+    return { ok: false, kind: "cas-exhausted" };
+  }
+  const committedPlan = plan;
+  if (!committedPlan) {
+    sessionLog(sessionId, "note-nudge: CAS reported success with no plan staged; treating as failure");
+    return { ok: false, kind: "cas-exhausted" };
+  }
+  if (committedPlan.kind === "conflict") {
+    return { ok: false, kind: "conflict" };
+  }
+  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
+  return { ok: true, kind: committedPlan.kind };
+}
 function appendAutoSearchHintDecision(db, sessionId, entry) {
   if (!entry.messageId)
     return { ok: false, kind: "cas-exhausted" };
@@ -32094,6 +32168,17 @@ function appendAutoSearchHintDecision(db, sessionId, entry) {
     return { ok: false, kind: "cas-exhausted" };
   }
   return { ok: true, kind: committed.kind, decision: committed.decision };
+}
+function getNoteLastReadAt(db, sessionId) {
+  try {
+    const result = db.prepare("SELECT note_last_read_at FROM session_meta WHERE session_id = ?").get(sessionId);
+    if (!result || typeof result !== "object")
+      return 0;
+    const value = result.note_last_read_at;
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
 }
 function setNoteLastReadAt(db, sessionId, at = Date.now()) {
   db.transaction(() => {
@@ -32458,6 +32543,9 @@ function addNote(db, type, options) {
   }
   return toNote(result);
 }
+function getSessionNotes(db, sessionId) {
+  return getNotes(db, { sessionId, type: "session", status: "active" });
+}
 function getSmartNotes(db, projectPath, status) {
   return getNotes(db, {
     projectPath,
@@ -32467,6 +32555,9 @@ function getSmartNotes(db, projectPath, status) {
 }
 function getPendingSmartNotes(db, projectPath) {
   return getSmartNotes(db, projectPath, "pending");
+}
+function getReadySmartNotes(db, projectPath) {
+  return getSmartNotes(db, projectPath, "ready");
 }
 function updateNote(db, noteId, updates, scope) {
   const existing = getNoteById(db, noteId);
@@ -35255,6 +35346,113 @@ function resolveTokensMatchWithKey(tokensConfig, modelKey) {
   return;
 }
 
+// ../plugin/src/hooks/magic-context/todo-view.ts
+import { createHash as createHash13 } from "node:crypto";
+var TODO_STATUS_PENDING = "pending";
+var TODO_STATUS_IN_PROGRESS = "in_progress";
+var TODO_STATUS_COMPLETED = "completed";
+var TODO_STATUS_CANCELLED = "cancelled";
+var TODO_PRIORITY_HIGH = "high";
+var TODO_PRIORITY_MEDIUM = "medium";
+var TODO_PRIORITY_LOW = "low";
+var TODO_STATUSES = [
+  TODO_STATUS_PENDING,
+  TODO_STATUS_IN_PROGRESS,
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+];
+var TODO_PRIORITIES = [
+  TODO_PRIORITY_HIGH,
+  TODO_PRIORITY_MEDIUM,
+  TODO_PRIORITY_LOW
+];
+var TODO_STATUS_SET = new Set(TODO_STATUSES);
+var TODO_PRIORITY_SET = new Set(TODO_PRIORITIES);
+var TERMINAL_STATUSES = new Set([
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+]);
+var TITLE_DONE_STATUSES = new Set([TODO_STATUS_COMPLETED]);
+var SYNTHETIC_CALL_ID_PREFIX = "mc_synthetic_todo_";
+function normalizeTodoStateJson(todos) {
+  if (!Array.isArray(todos))
+    return null;
+  const normalized = [];
+  for (const todo of todos) {
+    if (!isTodoItem(todo))
+      return null;
+    normalized.push({
+      content: todo.content,
+      status: todo.status,
+      priority: todo.priority ?? TODO_PRIORITY_MEDIUM
+    });
+  }
+  return JSON.stringify(normalized);
+}
+function buildSyntheticTodoPart(stateJson) {
+  const todos = parseTodoState(stateJson);
+  if (todos === null || todos.length === 0)
+    return null;
+  if (todos.every((t) => TERMINAL_STATUSES.has(t.status)))
+    return null;
+  const callID = computeSyntheticCallId(stateJson);
+  const activeCount = todos.filter((t) => !TITLE_DONE_STATUSES.has(t.status)).length;
+  const output = JSON.stringify(todos, null, 2);
+  const ts = 0;
+  return {
+    type: "tool",
+    callID,
+    tool: "todowrite",
+    state: {
+      status: "completed",
+      input: { todos },
+      output,
+      title: `${activeCount} todos`,
+      metadata: { todos, truncated: false },
+      time: { start: ts, end: ts }
+    },
+    syntheticTodoMarker: true
+  };
+}
+function computeSyntheticCallId(stateJson) {
+  const hash2 = createHash13("sha256").update(stateJson).digest("hex").slice(0, 16);
+  return `${SYNTHETIC_CALL_ID_PREFIX}${hash2}`;
+}
+function parseTodoState(stateJson) {
+  if (stateJson.length === 0)
+    return null;
+  try {
+    const parsed = JSON.parse(stateJson);
+    if (!Array.isArray(parsed))
+      return null;
+    const result = [];
+    for (const item of parsed) {
+      if (!isTodoItem(item))
+        return null;
+      result.push({
+        content: item.content,
+        status: item.status,
+        priority: item.priority ?? TODO_PRIORITY_MEDIUM
+      });
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+function isTodoStatus(value) {
+  return typeof value === "string" && TODO_STATUS_SET.has(value);
+}
+function isTodoPriority(value) {
+  return typeof value === "string" && TODO_PRIORITY_SET.has(value);
+}
+function isTodoItem(value) {
+  if (value === null || typeof value !== "object")
+    return false;
+  const todo = value;
+  return typeof todo.content === "string" && isTodoStatus(todo.status) && (todo.priority === undefined || isTodoPriority(todo.priority));
+}
+
 // ../plugin/src/features/magic-context/scheduler.ts
 var TTL_PATTERN = /^(\d+)([smh])$/;
 var NUMERIC_PATTERN = /^\d+$/;
@@ -35278,29 +35476,6 @@ function parseCacheTtl(ttl) {
   const value = Number(match[1]);
   const unit = match[2];
   return value * UNIT_TO_MS[unit];
-}
-
-// src/compat/dsh-0.1/session.ts
-import {
-  createAssistantMessage,
-  createToolResultMessage,
-  createUserMessage
-} from "@deepseek-ai/dsh-llm";
-import {
-  Session
-} from "@deepseek-ai/dsh-session";
-import {
-  deriveEventMessage,
-  foldSurface
-} from "@deepseek-ai/dsh-session/surface";
-function textBlock(text) {
-  return { type: "text", text };
-}
-function magicUserMessage(content, source, extraBlocks = []) {
-  return createUserMessage({
-    content: [textBlock(content), ...extraBlocks],
-    source
-  });
 }
 
 // src/compat/dsh-0.1/prestep.ts
@@ -35885,7 +36060,7 @@ function containsProbeVerbatim(text, probes) {
 }
 
 // ../plugin/src/features/magic-context/search-measurement.ts
-import { createHash as createHash13 } from "node:crypto";
+import { createHash as createHash14 } from "node:crypto";
 function resultId(result) {
   switch (result.source) {
     case "memory":
@@ -35972,7 +36147,7 @@ async function recordShadowMeasurement(args) {
   }
 }
 function sha2562(value) {
-  return createHash13("sha256").update(value).digest("hex");
+  return createHash14("sha256").update(value).digest("hex");
 }
 
 // ../plugin/src/features/magic-context/search.ts
@@ -37145,7 +37320,7 @@ function createKnowledgeGateState() {
 }
 var M1_EMPTY_PLACEHOLDER2 = "<session-history-since>(no new content since last materialization)</session-history-since>";
 function sha256Hex(input) {
-  return createHash14("sha256").update(input, "utf8").digest("hex");
+  return createHash15("sha256").update(input, "utf8").digest("hex");
 }
 function decodeUtf8(bytes) {
   if (bytes === null || bytes === undefined)
@@ -37301,8 +37476,37 @@ async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, proj
   const m1Message = magicUserMessage(blocks.m1Text, m1Source, []);
   agent.inject(m0Message);
   agent.inject(m1Message);
+  try {
+    const meta3 = getOrCreateSessionMeta(db, magicSessionId);
+    const todoState = meta3.lastTodoState ?? null;
+    if (typeof todoState === "string" && todoState.length > 0) {
+      const part = buildSyntheticTodoPart(todoState);
+      if (part !== null) {
+        const todoWatermark = `mc-todo:${sha256Hex(todoState).slice(0, 16)}`;
+        if (!isMagicWatermarkOnSurface(agent.session, todoWatermark)) {
+          const callId = part.callID;
+          const inputText = JSON.stringify(part.state.input);
+          const todoText = `[tool: todowrite #${callId}]
+input: ${inputText}
+
+` + `[tool result: todowrite #${callId}]
+output: ${part.state.output}`;
+          const todoSource = {
+            kind: "plugin",
+            plugin: "magic-context",
+            messageId: todoWatermark
+          };
+          const todoMessage = magicUserMessage(todoText, todoSource, []);
+          agent.inject(todoMessage);
+          state.lastInjectedMessages.push(todoMessage);
+        }
+      }
+    }
+  } catch {}
   state.injectedGenerations.set(magicSessionId, generation);
-  state.lastInjectedMessages = [m0Message, m1Message];
+  if (state.lastInjectedMessages.length === 0) {
+    state.lastInjectedMessages = [m0Message, m1Message];
+  }
   deps.log?.(`[magic-context] injected knowledge baseline ${blocks.watermark} for ${magicSessionId}@gen${generation}`);
 }
 function resolveKnowledgeProjectPath(directory) {
@@ -37602,60 +37806,6 @@ function parseInteger(str) {
   return n;
 }
 
-// ../plugin/src/hooks/magic-context/todo-view.ts
-var TODO_STATUS_PENDING = "pending";
-var TODO_STATUS_IN_PROGRESS = "in_progress";
-var TODO_STATUS_COMPLETED = "completed";
-var TODO_STATUS_CANCELLED = "cancelled";
-var TODO_PRIORITY_HIGH = "high";
-var TODO_PRIORITY_MEDIUM = "medium";
-var TODO_PRIORITY_LOW = "low";
-var TODO_STATUSES = [
-  TODO_STATUS_PENDING,
-  TODO_STATUS_IN_PROGRESS,
-  TODO_STATUS_COMPLETED,
-  TODO_STATUS_CANCELLED
-];
-var TODO_PRIORITIES = [
-  TODO_PRIORITY_HIGH,
-  TODO_PRIORITY_MEDIUM,
-  TODO_PRIORITY_LOW
-];
-var TODO_STATUS_SET = new Set(TODO_STATUSES);
-var TODO_PRIORITY_SET = new Set(TODO_PRIORITIES);
-var TERMINAL_STATUSES = new Set([
-  TODO_STATUS_COMPLETED,
-  TODO_STATUS_CANCELLED
-]);
-var TITLE_DONE_STATUSES = new Set([TODO_STATUS_COMPLETED]);
-function normalizeTodoStateJson(todos) {
-  if (!Array.isArray(todos))
-    return null;
-  const normalized = [];
-  for (const todo of todos) {
-    if (!isTodoItem(todo))
-      return null;
-    normalized.push({
-      content: todo.content,
-      status: todo.status,
-      priority: todo.priority ?? TODO_PRIORITY_MEDIUM
-    });
-  }
-  return JSON.stringify(normalized);
-}
-function isTodoStatus(value) {
-  return typeof value === "string" && TODO_STATUS_SET.has(value);
-}
-function isTodoPriority(value) {
-  return typeof value === "string" && TODO_PRIORITY_SET.has(value);
-}
-function isTodoItem(value) {
-  if (value === null || typeof value !== "object")
-    return false;
-  const todo = value;
-  return typeof todo.content === "string" && isTodoStatus(todo.status) && (todo.priority === undefined || isTodoPriority(todo.priority));
-}
-
 // ../plugin/src/tools/ctx-expand/constants.ts
 var CTX_EXPAND_DESCRIPTION = `Recover the original conversation from your compacted history.
 
@@ -37915,6 +38065,95 @@ Picking sources:
 - "did we decide something about this / leave a follow-up" → ["note"]
 - "what's our convention / rule for X" → ["memory"]`;
 
+// ../plugin/src/hooks/magic-context/note-nudger.ts
+var NOTE_NUDGE_COOLDOWN_MS = 15 * 60 * 1000;
+var lastDeliveredAt = new Map;
+function getPersistedNoteNudgeDeliveredAt(_db, sessionId) {
+  return lastDeliveredAt.get(sessionId) ?? 0;
+}
+function recordNoteNudgeDeliveryTime(sessionId) {
+  lastDeliveredAt.set(sessionId, Date.now());
+}
+function onNoteTrigger(db, sessionId, trigger) {
+  setPersistedNoteNudgeTrigger(db, sessionId);
+  sessionLog(sessionId, `note-nudge: trigger fired (${trigger}), triggerPending=true`);
+}
+function peekNoteNudgeText(db, sessionId, currentUserMessageId, projectIdentity, noteReadStillVisible) {
+  const state = getPersistedNoteNudge(db, sessionId);
+  if (!state.triggerPending)
+    return null;
+  if (!state.triggerMessageId && currentUserMessageId) {
+    setPersistedNoteNudgeTriggerMessageId(db, sessionId, currentUserMessageId);
+    state.triggerMessageId = currentUserMessageId;
+  }
+  if (state.triggerMessageId && currentUserMessageId && state.triggerMessageId === currentUserMessageId) {
+    sessionLog(sessionId, `note-nudge: deferring — current user message ${currentUserMessageId} is same as trigger-time message`);
+    return null;
+  }
+  const deliveredAt = getPersistedNoteNudgeDeliveredAt(db, sessionId);
+  if (deliveredAt > 0 && Date.now() - deliveredAt < NOTE_NUDGE_COOLDOWN_MS) {
+    sessionLog(sessionId, `note-nudge: suppressing — last delivered ${Math.round((Date.now() - deliveredAt) / 1000)}s ago (cooldown ${NOTE_NUDGE_COOLDOWN_MS / 60000}m)`);
+    clearNoteNudgeTriggerOnly(db, sessionId);
+    return null;
+  }
+  const notes = getSessionNotes(db, sessionId);
+  const readySmartNotes = projectIdentity ? getReadySmartNotes(db, projectIdentity) : [];
+  const totalCount = notes.length + readySmartNotes.length;
+  if (totalCount === 0) {
+    sessionLog(sessionId, "note-nudge: triggerPending but no notes found, skipping");
+    clearNoteNudgeTriggerOnly(db, sessionId);
+    return null;
+  }
+  const lastReadAt = getNoteLastReadAt(db, sessionId);
+  if (lastReadAt > 0 && noteReadStillVisible) {
+    const mostRecentNoteActivity = maxNoteActivityTime([...notes, ...readySmartNotes]);
+    if (mostRecentNoteActivity > 0 && lastReadAt > mostRecentNoteActivity) {
+      sessionLog(sessionId, `note-nudge: suppressing — agent ran ctx_note(read) at ${new Date(lastReadAt).toISOString()} and the read is still visible; no new notes since ${new Date(mostRecentNoteActivity).toISOString()}`);
+      clearNoteNudgeTriggerOnly(db, sessionId);
+      return null;
+    }
+  }
+  const parts = [];
+  if (notes.length > 0) {
+    parts.push(`${notes.length} deferred note${notes.length === 1 ? "" : "s"}`);
+  }
+  if (readySmartNotes.length > 0) {
+    parts.push(`${readySmartNotes.length} ready smart note${readySmartNotes.length === 1 ? "" : "s"}`);
+  }
+  sessionLog(sessionId, `note-nudge: delivering nudge for ${parts.join(" and ")}`);
+  return `You have ${parts.join(" and ")}. Review with ctx_note read — some may be actionable now.`;
+}
+function maxNoteActivityTime(notes) {
+  let max = 0;
+  for (const note of notes) {
+    if (note.updatedAt > max)
+      max = note.updatedAt;
+    if (note.readyAt !== null && note.readyAt > max)
+      max = note.readyAt;
+  }
+  return max;
+}
+function markNoteNudgeDelivered(db, sessionId, text, messageId) {
+  if (!messageId) {
+    clearNoteNudgeTriggerAndCooldown(db, sessionId);
+    sessionLog(sessionId, "note-nudge: marked delivered without anchor");
+    return { ok: true, kind: "already-present" };
+  }
+  const outcome = deliverNoteNudgeAtomic(db, sessionId, messageId, text);
+  if (outcome.ok) {
+    recordNoteNudgeDeliveryTime(sessionId);
+  }
+  sessionLog(sessionId, outcome.ok ? `note-nudge: marked delivered, sticky anchor=${messageId} (${outcome.kind})` : `note-nudge: delivery not persisted for anchor=${messageId} (${outcome.kind})`);
+  return outcome;
+}
+function clearNoteNudgeTriggerAndCooldown(db, sessionId) {
+  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
+  lastDeliveredAt.delete(sessionId);
+}
+function clearNoteNudgeTriggerOnly(db, sessionId) {
+  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
+}
+
 // ../plugin/src/tools/unwrap-imitated-reduced-args.ts
 var MAX_DECODED_STRING_LENGTH = 1024 * 1024;
 var MAX_DECODED_ARRAY_ITEMS = 100;
@@ -37982,7 +38221,7 @@ function registerTool(ctx, tool) {
 }
 
 // src/agent/transcript.ts
-import { createHash as createHash16, randomUUID as randomUUID3 } from "node:crypto";
+import { createHash as createHash17, randomUUID as randomUUID3 } from "node:crypto";
 
 // ../plugin/src/hooks/magic-context/apply-operations.ts
 var RECENT_TOOL_SKELETON_WINDOW = 20;
@@ -39433,7 +39672,7 @@ function createTagger() {
 }
 
 // ../plugin/src/shared/tag-transcript.ts
-import { createHash as createHash15 } from "node:crypto";
+import { createHash as createHash16 } from "node:crypto";
 
 // ../plugin/src/hooks/magic-context/image-token-estimate.ts
 var IMAGE_TOKEN_DIVISOR = 750;
@@ -39588,7 +39827,7 @@ function readUint32BE(b, offset) {
 // ../plugin/src/shared/tag-transcript.ts
 var TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
 function textIdentityDigest(value) {
-  return createHash15("sha256").update(value).digest("hex");
+  return createHash16("sha256").update(value).digest("hex");
 }
 function buildContentDerivedTextIds(messageId, parts) {
   const sources = parts.filter((part) => part.kind === "text").map((part) => stripTagPrefix(part.getText() ?? ""));
@@ -40227,7 +40466,7 @@ function dataOf(event) {
   return isRecord4(event.data) ? event.data : null;
 }
 function sha256Hex2(value) {
-  return createHash16("sha256").update(value, "utf8").digest("hex");
+  return createHash17("sha256").update(value, "utf8").digest("hex");
 }
 var SYNTH_USER_ID_PREFIX = "synth-user-";
 function isSyntheticUserMessage(message) {
@@ -42049,7 +42288,12 @@ function createCtxReduceTool(ctx, opts) {
 function createTodowriteTool(ctx, opts) {
   return defineTool2({
     name: "todowrite",
-    description: "Manage the session task list.",
+    description: `Manage the session task list.
+
+` + "Use todowrite for non-trivial work spanning 3+ steps, when the user gives you multiple tasks, " + "or when you need to track progress across a verify/fix loop. Skip it for single-shot answers " + `or trivial one-step work.
+` + "Pass the COMPLETE updated todo list every time. This tool replaces the prior list rather than " + "appending to it, so include pending, in_progress, completed, and cancelled tasks that should " + `remain visible.
+` + "When starting a task, mark exactly one todo in_progress before doing the work. Mark items " + `completed immediately when done; use cancelled only for work that is no longer needed.
+` + "Never mark a todo completed if verification is failing, implementation is partial, or an " + "unresolved blocker remains. Keep it in_progress and add or update a todo for the blocker instead.",
     parameters: {
       todos: {
         type: "array",
@@ -42085,6 +42329,12 @@ function createTodowriteTool(ctx, opts) {
         }
       } catch {}
       const active = todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
+      if (todos.length > 0 && todos.every((todo) => TERMINAL_STATUSES.has(todo.status))) {
+        try {
+          const todoDb = await resolveDb(ctx, opts);
+          onNoteTrigger(todoDb, runtime.sessionId, "todos_complete");
+        } catch {}
+      }
       return { text: JSON.stringify(todos, null, 2) };
     }
   });
@@ -45388,6 +45638,9 @@ async function runDshHistorian(deps) {
       telemetry.importanceAvg = imp.avg;
       telemetry.discardedLast = result.discardedLast === true;
       deps.onPublished?.();
+      try {
+        onNoteTrigger(deps.db, deps.sessionId, "historian_complete");
+      } catch {}
       log2(`[magic-context] historian: published ${result.newCompartments.length} compartment(s), ${facts.length} fact(s) covering messages ${result.chunk.startIndex}-${result.lastNewEnd}`);
     });
   } catch (error51) {
@@ -46754,7 +47007,13 @@ function maybeFireHistorian(historian, db, sessionId, agent, directory) {
     const contextLimit = typeof config2.contextLimit === "number" && config2.contextLimit > 0 ? config2.contextLimit : contextWindow;
     const forceFire = process.env.MAGIC_CONTEXT_FORCE_HISTORIAN === "1" && percentage >= 0;
     const commitCfg = config2.commitClusterTrigger;
-    const commitClusterFires = commitCfg !== undefined && commitCfg.enabled !== false && recentCommitClusterCount(agent) >= Math.max(1, commitCfg.min_clusters ?? 3) && (config2.triggerBudgetTokens ?? deriveTriggerBudget(contextLimit, executeThresholdPercentage)) > 0;
+    const commitClusters = recentCommitClusterCount(agent);
+    const commitClusterFires = commitCfg !== undefined && commitCfg.enabled !== false && commitClusters >= Math.max(1, commitCfg.min_clusters ?? 3) && (config2.triggerBudgetTokens ?? deriveTriggerBudget(contextLimit, executeThresholdPercentage)) > 0;
+    if (commitCfg !== undefined && commitCfg.enabled !== false && commitClusters >= 1) {
+      try {
+        onNoteTrigger(db, sessionId, "commit_detected");
+      } catch {}
+    }
     const fires = forceFire || commitClusterFires || checkDshCompartmentTrigger({
       executeThresholdPercentage,
       triggerBudget: config2.triggerBudgetTokens ?? deriveTriggerBudget(contextLimit, executeThresholdPercentage),
@@ -46778,6 +47037,41 @@ function maybeFireHistorian(historian, db, sessionId, agent, directory) {
     }
   } catch {}
 }
+function previewTagPayloadMessages(db, sessionId, messages, log2) {
+  try {
+    const tagger = createTagger();
+    tagger.initFromDb(sessionId, db);
+    const out = [];
+    for (const raw of messages) {
+      const msg = raw;
+      const sourceKind = msg.source?.kind;
+      if (sourceKind === "plugin" || sourceKind === "skill-catalog") {
+        out.push(raw);
+        continue;
+      }
+      const textPart = Array.isArray(msg.content) ? msg.content.find((part) => part !== null && typeof part === "object" && part.type === "text") : undefined;
+      if (typeof msg.id !== "string" || msg.id.length === 0 || textPart === undefined) {
+        out.push(raw);
+        continue;
+      }
+      if (tagger.getTag(sessionId, msg.id, "message") !== undefined) {
+        out.push(raw);
+        continue;
+      }
+      const text = typeof textPart.text === "string" ? textPart.text : "";
+      const tag = tagger.assignTag(sessionId, msg.id, "message", Buffer.byteLength(text), db);
+      if (tag === undefined || tag <= 0) {
+        out.push(raw);
+        continue;
+      }
+      const newPart = { ...textPart, text: `§${tag}§ ${text}` };
+      const newContent = (msg.content ?? []).map((part) => part === textPart ? newPart : part);
+      out.push({ ...msg, content: newContent });
+    }
+    messages.length = 0;
+    messages.push(...out);
+  } catch {}
+}
 async function runContextPlaneStep(state, deps, payload, next) {
   const agent = payload.agent;
   try {
@@ -46797,6 +47091,7 @@ async function runContextPlaneStep(state, deps, payload, next) {
       reconcileSessionOutbox(db, canonicalSessionId, sessionLogView(db, canonicalSessionId, agent, canonicalSessionId));
     }
     if (deps.config?.enabled !== false) {
+      previewTagPayloadMessages(db, canonicalSessionId, payload.messages, deps.log);
       const view = readDshTranscript({
         session: {
           events: agent.session.events,
@@ -46824,6 +47119,27 @@ async function runContextPlaneStep(state, deps, payload, next) {
       protectedTags: deps.config?.protectedTags ?? 20,
       log: deps.log
     });
+    try {
+      const firstUser = payload.messages.find((m) => m?.id !== undefined);
+      const noteText = peekNoteNudgeText(db, canonicalSessionId, typeof firstUser?.id === "string" ? firstUser.id : undefined, deps.directory, undefined);
+      if (noteText !== null) {
+        const noteMarker = `mc-nudge:note`;
+        const events = agent.session.events ?? [];
+        const alreadyInjected = events.some((event) => {
+          if (event === null || typeof event !== "object")
+            return false;
+          const e = event;
+          const source = e.data?.source;
+          return source?.plugin === "magic-context" && source?.messageId === noteMarker;
+        });
+        if (!alreadyInjected) {
+          const { magicUserMessage: magicUserMessage2 } = await import("./session-vgzy4tsn.js");
+          const noteMessage = magicUserMessage2(noteText, { kind: "plugin", plugin: "magic-context", messageId: noteMarker }, []);
+          agent.inject?.(noteMessage);
+          markNoteNudgeDelivered(db, canonicalSessionId, noteText, null);
+        }
+      }
+    } catch {}
     const historian = deps.historian;
     if (historian !== undefined && historian.config?.enabled !== false) {
       maybeFireHistorian(historian, db, canonicalSessionId, agent, deps.directory);
@@ -46878,7 +47194,7 @@ function summarizeDreamSchedule(dreamer) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/task-executor.ts
-import { createHash as createHash23 } from "node:crypto";
+import { createHash as createHash24 } from "node:crypto";
 import { existsSync as existsSync12 } from "node:fs";
 
 // ../plugin/src/agents/dreamer.ts
@@ -47202,7 +47518,7 @@ function hasLengthCappedOutput(value) {
 }
 
 // ../plugin/src/features/magic-context/mural/compress-cues.ts
-import { createHash as createHash18 } from "node:crypto";
+import { createHash as createHash19 } from "node:crypto";
 
 // ../plugin/src/shared/keep-subagents.ts
 var keepSubagents = false;
@@ -47315,7 +47631,7 @@ function getModuleMemoryIdentities(db, projectIdentity, contextIds) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/provider-output-failure.ts
-import { createHash as createHash17 } from "node:crypto";
+import { createHash as createHash18 } from "node:crypto";
 var MAX_NEAR_ZERO_OUTPUT_TOKENS = 32;
 
 class DreamerProviderOutputFailureError extends Error {
@@ -47372,7 +47688,7 @@ function providerOutputFailureFromInvalidManifest(messages, responseText) {
   const normalized = responseText.trim().replace(/\s+/g, " ").toLowerCase();
   if (!normalized)
     return null;
-  const fingerprint = createHash17("sha256").update(normalized).digest("hex").slice(0, 16);
+  const fingerprint = createHash18("sha256").update(normalized).digest("hex").slice(0, 16);
   return new DreamerProviderOutputFailureError(fingerprint, completion.outputTokens, completion.reasoningTokens, responseText);
 }
 
@@ -47766,7 +48082,7 @@ async function applyCuesThroughModule(args, chunk, manifestText, signal) {
       log(`[dreamer] compress-cues: skipped cue for memory ${entry.id} (${failure.reason}; rejection ${rejectionCount}/${CUE_REJECTION_LATCH_THRESHOLD})`);
     }
   }
-  const commandId = `mural-cues:${route.moduleCommandId}:${createHash18("sha256").update(chunk.map((candidate) => candidate.memory.id).join(",")).digest("hex").slice(0, 24)}`;
+  const commandId = `mural-cues:${route.moduleCommandId}:${createHash19("sha256").update(chunk.map((candidate) => candidate.memory.id).join(",")).digest("hex").slice(0, 24)}`;
   let response;
   try {
     response = await route.moduleClient.call({
@@ -48421,7 +48737,7 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
 }
 
 // ../plugin/src/features/magic-context/dreamer/classify.ts
-import { createHash as createHash19 } from "node:crypto";
+import { createHash as createHash20 } from "node:crypto";
 
 // ../plugin/src/plugin/rust-tool-backends.ts
 function isRustAuthorityDrainingError(error51) {
@@ -48932,7 +49248,7 @@ async function runClassifyThroughModule(args, chunk, anchors, signal) {
       v: 1,
       session_id: args.moduleSessionId,
       task: "classify",
-      command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash19("sha256").update(chunk.map((candidate) => candidate.id).join(",")).digest("hex").slice(0, 24)}`,
+      command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash20("sha256").update(chunk.map((candidate) => candidate.id).join(",")).digest("hex").slice(0, 24)}`,
       authority_generation: args.moduleAuthorityGeneration,
       payload: {
         prompt_body: prompt,
@@ -49570,7 +49886,7 @@ function throwIfAborted2(signal) {
 }
 
 // ../plugin/src/features/magic-context/smart-notes/compiler.ts
-import { createHash as createHash20 } from "node:crypto";
+import { createHash as createHash21 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/smart-notes/compiler-prompt.ts
 var SMART_NOTE_COMPILER_SYSTEM_PROMPT = `You are the Magic Context smart-note compiler for the magic-context system.
@@ -49608,7 +49924,7 @@ function getAsyncModule() {
   asyncModulePromise ??= (async () => {
     const [{ default: singlefileAsyncifyVariant }, { newQuickJSAsyncWASMModuleFromVariant }] = await Promise.all([
       import("./index-fyza8zv3.js").then((m)=>__toESM(m.default,1)),
-      import("./index-ygcng9t8.js")
+      import("./index-3pnd4qh9.js")
     ]);
     return newQuickJSAsyncWASMModuleFromVariant(singlefileAsyncifyVariant);
   })();
@@ -49994,7 +50310,7 @@ function manifestAdvisoryWarnings(code, manifest) {
   return warnings;
 }
 function hashCheck(surfaceCondition, compiledCheck, manifest, checkCron) {
-  return createHash20("sha256").update(surfaceCondition ?? "").update("\x00").update(compiledCheck).update("\x00").update(JSON.stringify(manifest)).update("\x00").update(checkCron).digest("hex");
+  return createHash21("sha256").update(surfaceCondition ?? "").update("\x00").update(compiledCheck).update("\x00").update(JSON.stringify(manifest)).update("\x00").update(checkCron).digest("hex");
 }
 function extractJsonObject(output) {
   const fenced = output.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -50676,7 +50992,7 @@ function enforceMaintainDocsProtectedRegions(args) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/map-memories.ts
-import { createHash as createHash21 } from "node:crypto";
+import { createHash as createHash22 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/dreamer/map-memories-prompt.ts
 import { existsSync as existsSync11, statSync as statSync5 } from "node:fs";
@@ -50937,7 +51253,7 @@ async function applyBatchMappings(args, batch, manifestText) {
             memory_project: args.projectIdentity,
             context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
             authority_generation: args.moduleRoute.moduleAuthorityGeneration,
-            command_id: `${args.moduleRoute.moduleCommandId}:${createHash21("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`,
+            command_id: `${args.moduleRoute.moduleCommandId}:${createHash22("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`,
             rows
           }
         }
@@ -51754,7 +52070,7 @@ function insertDreamRun(db, run) {
 }
 
 // ../plugin/src/features/magic-context/dreamer/verify.ts
-import { createHash as createHash22 } from "node:crypto";
+import { createHash as createHash23 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/dreamer/verify-gate.ts
 import path6 from "node:path";
@@ -52186,7 +52502,7 @@ async function applyVerifyManifest(args, batch, manifestText) {
             memory_project: args.projectIdentity,
             context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
             authority_generation: args.moduleRoute.moduleAuthorityGeneration,
-            command_id: `${args.moduleRoute.moduleCommandId}:${createHash22("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`,
+            command_id: `${args.moduleRoute.moduleCommandId}:${createHash23("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`,
             rows
           }
         }
@@ -52713,7 +53029,7 @@ function parseFrictionGateVerdict(verdict) {
 }
 function computeRetrospectiveWindowKey(flagged) {
   const anchors = flagged.map((message) => `${message.sessionId}:${message.ts}`).sort().join("|");
-  return createHash23("sha256").update(anchors).digest("hex").slice(0, 32);
+  return createHash24("sha256").update(anchors).digest("hex").slice(0, 32);
 }
 function renderFrictionWindow(messages, flaggedOrdinals, radius = 2) {
   const flagged = new Set(flaggedOrdinals);
@@ -54015,14 +54331,6 @@ function dumpHistorianResponse(sessionId, directory, label, text) {
 }
 function sanitizeDumpName(value) {
   return value.replace(/[^a-zA-Z0-9._-]/g, "-");
-}
-
-// ../plugin/src/hooks/magic-context/note-nudger.ts
-var NOTE_NUDGE_COOLDOWN_MS = 15 * 60 * 1000;
-var lastDeliveredAt = new Map;
-function onNoteTrigger(db, sessionId, trigger) {
-  setPersistedNoteNudgeTrigger(db, sessionId);
-  sessionLog(sessionId, `note-nudge: trigger fired (${trigger}), triggerPending=true`);
 }
 
 // ../plugin/src/hooks/magic-context/reference-seeds.generated.ts

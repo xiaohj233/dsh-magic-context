@@ -45,6 +45,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { resolveCacheTtl } from "@magic-context/core/hooks/magic-context/event-resolvers";
+import { buildSyntheticTodoPart } from "@magic-context/core/hooks/magic-context/todo-view";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -389,9 +390,46 @@ export async function maybeInjectKnowledge(
   const m1Message = magicUserMessage(blocks.m1Text, m1Source, []);
   agent.inject(m0Message);
   agent.inject(m1Message);
+  // Synthetic todowrite replay (Magic todo-view parity): this pass IS a
+  // cache-bust (HARD materialization) — resurface the last todo snapshot so
+  // the model regains its task list after the fold, exactly like OpenCode/Pi
+  // ride the synthetic pair on cache-busting passes. DSH delivery keeps the
+  // inject + watermark semantics; the part is rendered in the DSH folded
+  // tool-call text shape the model already sees.
+  try {
+    const meta = getOrCreateSessionMeta(db, magicSessionId) as unknown as {
+      lastTodoState?: string | null;
+    };
+    const todoState = meta.lastTodoState ?? null;
+    if (typeof todoState === "string" && todoState.length > 0) {
+      const part = buildSyntheticTodoPart(todoState);
+      if (part !== null) {
+        const todoWatermark = `mc-todo:${sha256Hex(todoState).slice(0, 16)}`;
+        if (!isMagicWatermarkOnSurface(agent.session, todoWatermark)) {
+          const callId = part.callID;
+          const inputText = JSON.stringify(part.state.input);
+          const todoText =
+            `[tool: todowrite #${callId}]\ninput: ${inputText}\n\n` +
+            `[tool result: todowrite #${callId}]\noutput: ${part.state.output}`;
+          const todoSource: MagicMessageSource = {
+            kind: "plugin",
+            plugin: "magic-context",
+            messageId: todoWatermark,
+          };
+          const todoMessage = magicUserMessage(todoText, todoSource, []);
+          agent.inject(todoMessage);
+          state.lastInjectedMessages.push(todoMessage);
+        }
+      }
+    }
+  } catch {
+    // Todo replay must never break injection (fail-open).
+  }
   state.injectedGenerations.set(magicSessionId, generation);
   // 首轮 pre-step 前置用：本次 LLM 调用即可见（Pi transform unshift 语义）。
-  state.lastInjectedMessages = [m0Message, m1Message];
+  if (state.lastInjectedMessages.length === 0) {
+    state.lastInjectedMessages = [m0Message, m1Message];
+  }
   deps.log?.(
     `[magic-context] injected knowledge baseline ${blocks.watermark} for ${magicSessionId}@gen${generation}`,
   );
