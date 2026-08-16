@@ -65,6 +65,8 @@ export interface ContextPlaneHistorianConfig {
   triggerBudgetTokens?: number;
   /** Model context window (<= 0 falls back to the shared 128k default). */
   contextLimit?: number;
+  /** Commit-cluster trigger (shared semantics: enabled + min_clusters). */
+  commitClusterTrigger?: { enabled: boolean; min_clusters: number };
 }
 
 /** Context-pressure read for the trigger (structural; injectable in tests). */
@@ -132,6 +134,52 @@ function sessionLogView(
   };
 }
 
+/**
+ * Lightweight commit-cluster signal (Pi/OpenCode parity in spirit): count
+ * contiguous bursts of commit-hash mentions in the most recent assistant
+ * texts. The shared trigger counts clusters in the chunk's TC scan; here the
+ * session log is the same source, scanned conservatively (>= min_clusters
+ * distinct bursts). Gated additionally by the eligible-token budget below.
+ */
+const COMMIT_MENTION_RE = /(?:^|[\s(`])[0-9a-f]{7,40}(?:$|[\s`)])/i;
+export function recentCommitClusterCount(agent: Agent): number {
+  try {
+    const events = (agent.session as { events?: readonly unknown[] }).events ?? [];
+    const texts: string[] = [];
+    for (const event of events) {
+      if (event === null || typeof event !== "object") continue;
+      const e = event as { type?: unknown; data?: { content?: unknown } };
+      if (e.type !== "assistant/message") continue;
+      const content = e.data?.content;
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part !== null && typeof part === "object" && (part as { type?: unknown }).type === "text") {
+            const text = (part as { text?: unknown }).text;
+            if (typeof text === "string") texts.push(text);
+          }
+        }
+      }
+    }
+    const recent = texts.slice(-10);
+    let clusters = 0;
+    let inCluster = false;
+    for (const text of recent) {
+      const hasCommit = COMMIT_MENTION_RE.test(text);
+      if (hasCommit) {
+        if (!inCluster) {
+          clusters += 1;
+          inCluster = true;
+        }
+      } else {
+        inCluster = false;
+      }
+    }
+    return clusters;
+  } catch {
+    return 0;
+  }
+}
+
 /** Fire the historian pass when the context-pressure trigger fires. */
 function maybeFireHistorian(
   historian: NonNullable<ContextPlaneDeps["historian"]>,
@@ -158,8 +206,15 @@ function maybeFireHistorian(
         ? config.contextLimit
         : contextWindow;
     const forceFire = process.env.MAGIC_CONTEXT_FORCE_HISTORIAN === "1" && percentage >= 0;
+    const commitCfg = config.commitClusterTrigger;
+    const commitClusterFires =
+      commitCfg !== undefined &&
+      commitCfg.enabled !== false &&
+      recentCommitClusterCount(agent) >= Math.max(1, commitCfg.min_clusters ?? 3) &&
+      (config.triggerBudgetTokens ?? deriveTriggerBudget(contextLimit, executeThresholdPercentage)) > 0;
     const fires =
       forceFire ||
+      commitClusterFires ||
       checkDshCompartmentTrigger(
         {
           executeThresholdPercentage,

@@ -177,6 +177,11 @@ export function bridgeMagicConfig(
     historian: {
       ...config.historian,
       executeThresholdPercentage: config.historian?.executeThresholdPercentage ?? threshold,
+      commitClusterTrigger:
+        config.historian?.commitClusterTrigger ??
+        (commitCluster !== undefined
+          ? { enabled: commitCluster.enabled ?? true, min_clusters: commitCluster.min_clusters ?? 3 }
+          : undefined),
     },
     autoSearch: {
       ...config.autoSearch,

@@ -45702,6 +45702,47 @@ function sessionLogView(db, sessionId, agent, canonicalSessionId) {
     generation: agent.session.surface.replaceGeneration
   };
 }
+var COMMIT_MENTION_RE = /(?:^|[\s(`])[0-9a-f]{7,40}(?:$|[\s`)])/i;
+function recentCommitClusterCount(agent) {
+  try {
+    const events = agent.session.events ?? [];
+    const texts = [];
+    for (const event of events) {
+      if (event === null || typeof event !== "object")
+        continue;
+      const e = event;
+      if (e.type !== "assistant/message")
+        continue;
+      const content = e.data?.content;
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part !== null && typeof part === "object" && part.type === "text") {
+            const text = part.text;
+            if (typeof text === "string")
+              texts.push(text);
+          }
+        }
+      }
+    }
+    const recent = texts.slice(-10);
+    let clusters = 0;
+    let inCluster = false;
+    for (const text of recent) {
+      const hasCommit = COMMIT_MENTION_RE.test(text);
+      if (hasCommit) {
+        if (!inCluster) {
+          clusters += 1;
+          inCluster = true;
+        }
+      } else {
+        inCluster = false;
+      }
+    }
+    return clusters;
+  } catch {
+    return 0;
+  }
+}
 function maybeFireHistorian(historian, db, sessionId, agent, directory) {
   try {
     const readPressure = historian.readPressure ?? (() => {
@@ -45718,7 +45759,9 @@ function maybeFireHistorian(historian, db, sessionId, agent, directory) {
     const executeThresholdPercentage = config2.executeThresholdPercentage ?? 65;
     const contextLimit = typeof config2.contextLimit === "number" && config2.contextLimit > 0 ? config2.contextLimit : contextWindow;
     const forceFire = process.env.MAGIC_CONTEXT_FORCE_HISTORIAN === "1" && percentage >= 0;
-    const fires = forceFire || checkDshCompartmentTrigger({
+    const commitCfg = config2.commitClusterTrigger;
+    const commitClusterFires = commitCfg !== undefined && commitCfg.enabled !== false && recentCommitClusterCount(agent) >= Math.max(1, commitCfg.min_clusters ?? 3) && (config2.triggerBudgetTokens ?? deriveTriggerBudget(contextLimit, executeThresholdPercentage)) > 0;
+    const fires = forceFire || commitClusterFires || checkDshCompartmentTrigger({
       executeThresholdPercentage,
       triggerBudget: config2.triggerBudgetTokens ?? deriveTriggerBudget(contextLimit, executeThresholdPercentage),
       contextLimit
@@ -57772,7 +57815,8 @@ function bridgeMagicConfig(config2, directory) {
     },
     historian: {
       ...config2.historian,
-      executeThresholdPercentage: config2.historian?.executeThresholdPercentage ?? threshold
+      executeThresholdPercentage: config2.historian?.executeThresholdPercentage ?? threshold,
+      commitClusterTrigger: config2.historian?.commitClusterTrigger ?? (commitCluster !== undefined ? { enabled: commitCluster.enabled ?? true, min_clusters: commitCluster.min_clusters ?? 3 } : undefined)
     },
     autoSearch: {
       ...config2.autoSearch,
