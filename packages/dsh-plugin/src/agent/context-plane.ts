@@ -33,6 +33,7 @@ import {
   readDshTranscript,
   type PlanContext,
 } from "./transcript";
+import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { checkDshCompartmentTrigger } from "./historian";
 import { transcriptRawMessageProvider } from "./historian-wiring";
 import { isMagicChildSession } from "./worker";
@@ -177,6 +178,13 @@ function maybeFireHistorian(
       } catch {
         // Diagnostics must never break the pre-step chain.
       }
+    }
+    // 压力持久化（对齐 Pi persistPiPressureFromMessageEnd）：把最近一次的
+    // 百分比写入 session_meta，供 /ctx-status 与共享状态读取。
+    try {
+      updateSessionMeta(db, sessionId, { lastContextPercentage: percentage });
+    } catch {
+      // 持久化失败不可破坏 pre-step 链（fail-open）。
     }
     if (fires) {
       historian.fire({
