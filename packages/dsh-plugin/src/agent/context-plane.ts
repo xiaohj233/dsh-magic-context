@@ -36,6 +36,7 @@ import {
 import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { checkDshCompartmentTrigger } from "./historian";
 import { maybeNudgeChannels } from "./nudge";
+import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { transcriptRawMessageProvider } from "./historian-wiring";
 import { isMagicChildSession } from "./worker";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
@@ -259,11 +260,68 @@ function maybeFireHistorian(
   }
 }
 
+/**
+ * First-call §N§ preview (Pi transform parity): the pre-step message list is
+ * deep-frozen and the surface CAS replace only lands on the NEXT pass, so the
+ * very first LLM call would otherwise see untagged messages. Assign tags via
+ * the shared tagger (idempotent — later passes reuse the same tag numbers by
+ * message id) and rebuild the frozen messages with the `§N§ ` prefix.
+ * Never throws (fail-open); Magic-sourced messages (mc-kb / hints) are skipped.
+ */
+function previewTagPayloadMessages(
+  db: Database,
+  sessionId: string,
+  messages: readonly unknown[],
+  log?: (message: string) => void,
+): void {
+  try {
+    const tagger = createTagger();
+    tagger.initFromDb(sessionId, db);
+    const out: unknown[] = [];
+    for (const raw of messages) {
+      const msg = raw as {
+        id?: unknown;
+        content?: Array<{ type?: unknown; text?: unknown }>;
+        source?: { kind?: unknown };
+      };
+      const sourceKind = msg.source?.kind;
+      if (sourceKind === "plugin" || sourceKind === "skill-catalog") {
+        out.push(raw);
+        continue;
+      }
+      const textPart = Array.isArray(msg.content)
+        ? msg.content.find((part) => part !== null && typeof part === "object" && part.type === "text")
+        : undefined;
+      if (typeof msg.id !== "string" || msg.id.length === 0 || textPart === undefined) {
+        out.push(raw);
+        continue;
+      }
+      if (tagger.getTag(sessionId, msg.id, "message") !== undefined) {
+        out.push(raw);
+        continue;
+      }
+      const text = typeof textPart.text === "string" ? textPart.text : "";
+      const tag = tagger.assignTag(sessionId, msg.id, "message", Buffer.byteLength(text), db);
+      if (tag === undefined || tag <= 0) {
+        out.push(raw);
+        continue;
+      }
+      const newPart = { ...textPart, text: `\u00a7${tag}\u00a7 ${text}` };
+      const newContent = (msg.content ?? []).map((part) => (part === textPart ? newPart : part));
+      out.push({ ...msg, content: newContent });
+    }
+    (messages as unknown[]).length = 0;
+    (messages as unknown[]).push(...out);
+  } catch {
+    // Preview must never break the pre-step chain (fail-open).
+  }
+}
+
 /** The full pre-step body: reconcile → derive → apply → next. */
 export async function runContextPlaneStep(
   state: ContextPlaneState,
   deps: ContextPlaneDeps,
-  payload: Pick<PreStepPayload, "agent">,
+  payload: Pick<PreStepPayload, "agent" | "messages">,
   next: () => Promise<PreStepDecision>,
 ): Promise<PreStepDecision> {
   const agent = payload.agent as unknown as Agent;
@@ -292,6 +350,8 @@ export async function runContextPlaneStep(
     // Plan derivation + application (gated by enabled; the historian trigger
     // below is independent of the plan gate).
     if (deps.config?.enabled !== false) {
+      // 首轮 §N§ 预览：本次调用即可见（Pi transform 语义）；幂等。
+      previewTagPayloadMessages(db, canonicalSessionId, payload.messages, deps.log);
       const view = readDshTranscript({
         session: {
           events: agent.session.events,
