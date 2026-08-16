@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { dump as yamlDump } from "js-yaml";
 import { entryListSchema } from "@deepseek-ai/cordis-plugin-include";
@@ -109,11 +110,11 @@ describe("dsh-magic-context setup (Phase 2 slice C)", () => {
       // The include row names THIS package's no-write entry (absolute file
       // path): the raw include would truncate the shipped stock composition
       // via the loader's write-back on the first agent teardown.
-      expect(include.name).toBe(`file:///${magicEntryPath("preset-include").replaceAll("\\", "/")}`);
+      expect(include.name).toBe(pathToFileURL(magicEntryPath("preset-include")).href);
       const config = include.config as { path: string; patches: unknown[] };
       // The include path is emitted as a file:// URL (Windows drive paths
       // would parse as a URL scheme).
-      expect(config.path).toBe(`file:///${stock.replaceAll("\\", "/")}`);
+      expect(config.path).toBe(pathToFileURL(stock).href);
       // compaction-basic disable + compaction insert + magicRows insert.
       expect(config.patches).toHaveLength(3);
       const magicRows = (config.patches[2] as { insert: Record<string, unknown>[] }).insert;
@@ -257,6 +258,8 @@ describe("dsh-magic-context setup (Phase 2 slice C)", () => {
       const report = await runDshSetup([], {
         dshHome: env.dshHome,
         dshInstallDir: join(env.root, "missing-install"),
+        // 遮蔽 PATH：避免实现回退到本机真实 dsh 安装（环境敏感）
+        env: { ...process.env, PATH: "/nonexistent-path" },
       });
       expect(report.exitCode).toBe(1);
       const installStep = report.steps.find((step) => step.title.includes("DSH install"));

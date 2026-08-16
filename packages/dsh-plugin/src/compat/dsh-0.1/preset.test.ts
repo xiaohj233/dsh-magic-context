@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import {
   applyMagicPatches,
@@ -112,7 +113,9 @@ describe("magic-standard thin preset (guarded patch)", () => {
     // The shipped stock file must be mounted through a write()-no-op tree:
     // the raw include inherits the loader's write-back, which truncates the
     // shipped composition to `[]` on the first agent teardown.
-    expect(include.name).toBe("file:///D:/pkg/dist/entries/preset-include.js");
+    // pathToFileURL 语义：POSIX 上 "D:/..." 是相对路径（相对 cwd 解析）；
+    // Windows 上是驱动器绝对路径。两侧都断言实现与 pathToFileURL 一致。
+    expect(include.name).toBe(pathToFileURL("D:/pkg/dist/entries/preset-include.js").href);
     const config = include.config as { path: string; patches: unknown[] };
     expect(config.path).toBe("file:///stock/standard/agent.cordis.yml");
     expect(config.patches).toHaveLength(3);
@@ -131,7 +134,28 @@ describe("magic-standard thin preset (guarded patch)", () => {
     });
     const config = thin[0].config as { patches: { insert: Record<string, unknown>[] }[] };
     const magicAgent = (config.patches[2] as { insert: Record<string, unknown>[] }).insert[0];
-    expect(magicAgent.name).toBe("file:///D:/pkg/dist/entries/agent.js");
+    // 绝对路径才转 file:// URL；夹具按平台取绝对路径（Windows 驱动器盘符 /
+    // POSIX 根路径），期望与 pathToFileURL 一致。
+    const absoluteEntry = process.platform === "win32"
+      ? "D:\\pkg\\dist\\entries\\agent.js"
+      : "/pkg/dist/entries/agent.js";
+    const magicRows = [
+      { id: "magic-agent", name: absoluteEntry },
+    ];
+    const thin2 = buildThinPresetEntries({
+      stockPresetPath: "/stock/standard/agent.cordis.yml",
+      includeEntry: "D:/pkg/dist/entries/preset-include.js",
+      magicRows,
+    });
+    const config2 = thin2[0].config as { patches: { insert: Record<string, unknown>[] }[] };
+    const agent2 = (config2.patches[2] as { insert: Record<string, unknown>[] }).insert[0];
+    expect(agent2.name).toBe(
+      pathToFileURL(process.platform === "win32" ? "D:/pkg/dist/entries/agent.js" : "/pkg/dist/entries/agent.js").href,
+    );
+    // 原夹具（Windows 专属路径）在 POSIX 上按相对路径原样透传。
+    expect(magicAgent.name).toBe(
+      process.platform === "win32" ? "file:///D:/pkg/dist/entries/agent.js" : "D:\\pkg\\dist\\entries\\agent.js",
+    );
   });
 
   it("thin preset round-trips through the loader YAML dialect", async () => {

@@ -17,7 +17,6 @@
         "declarationMap": true,
         "emitDeclarationOnly": true,
         "outDir": "dist",
-        "baseUrl": ".",
         "paths": {
             "@magic-context/core/*": ["../plugin/src/*"],
             "@cortexkit/retina-local-fs/*": ["../retina-local-fs/dist/types/*", "../retina-local-fs/src/*"],
