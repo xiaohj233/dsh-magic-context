@@ -31975,6 +31975,52 @@ function rollbackProtectedTailDrainReservation(db, reservation) {
              WHERE session_id = ?`).run(reservation.tokens, reservation.sessionId);
   })();
 }
+function isLastNudgeUndroppedRow(row) {
+  return typeof row === "object" && row !== null && typeof row.last_nudge_undropped === "number";
+}
+function isLastNudgeLevelRow(row) {
+  return typeof row === "object" && row !== null && typeof row.last_nudge_level === "string";
+}
+function normalizeLastNudgeLevel(value) {
+  return value === "gentle" || value === "firm" || value === "urgent" ? value : "";
+}
+function getLastNudgeUndropped(db, sessionId) {
+  const result = db.prepare("SELECT last_nudge_undropped FROM session_meta WHERE session_id = ?").get(sessionId);
+  return isLastNudgeUndroppedRow(result) ? result.last_nudge_undropped : 0;
+}
+function setLastNudgeUndropped(db, sessionId, value) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET last_nudge_undropped = ? WHERE session_id = ?").run(Math.max(0, Math.round(value)), sessionId);
+  })();
+}
+function getLastNudgeLevel(db, sessionId) {
+  const result = db.prepare("SELECT last_nudge_level FROM session_meta WHERE session_id = ?").get(sessionId);
+  return isLastNudgeLevelRow(result) ? normalizeLastNudgeLevel(result.last_nudge_level) : "";
+}
+function setLastNudgeLevel(db, sessionId, value) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(normalizeLastNudgeLevel(value), sessionId);
+  })();
+}
+function isChannel2StateRow(row) {
+  return typeof row === "object" && row !== null && typeof row.channel2_nudge_state === "string";
+}
+function getChannel2NudgeState(db, sessionId) {
+  const result = db.prepare("SELECT channel2_nudge_state FROM session_meta WHERE session_id = ?").get(sessionId);
+  if (!isChannel2StateRow(result))
+    return "";
+  const raw = result.channel2_nudge_state;
+  return raw === "pending" || raw === "claimed" || raw === "delivered" ? raw : "";
+}
+function setChannel2NudgeState(db, sessionId, state) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    const claimedAt = state === "claimed" ? Date.now() : 0;
+    db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ?").run(state, claimedAt, sessionId);
+  })();
+}
 function setPersistedNoteNudgeTrigger(db, sessionId, triggerMessageId = "") {
   db.transaction(() => {
     ensureSessionMetaRow(db, sessionId);
@@ -32919,6 +32965,29 @@ function ownerMessageIdForTagRow(row) {
     return row.tool_owner_message_id ?? row.message_id;
   }
   return row.message_id.replace(CONTENT_ID_SUFFIX, "");
+}
+function getActiveTagTokenAggregate(db, sessionId, protectedTags = 0) {
+  const toolOutputExpr = protectedTags > 0 ? `COALESCE(SUM(CASE WHEN type = 'tool' AND tag_number < (
+                    SELECT tag_number FROM tags
+                    WHERE session_id = ? AND status = 'active'
+                    ORDER BY tag_number DESC LIMIT 1 OFFSET ?
+                ) THEN COALESCE(token_count, 0) ELSE 0 END), 0)` : `COALESCE(SUM(CASE WHEN type = 'tool' THEN COALESCE(token_count, 0) ELSE 0 END), 0)`;
+  const sql = `SELECT
+                COALESCE(SUM(CASE WHEN type != 'tool' THEN COALESCE(token_count, 0) ELSE 0 END), 0)
+                    + COALESCE(SUM(COALESCE(reasoning_token_count, 0)), 0) AS conversation,
+                COALESCE(SUM(CASE WHEN type = 'tool' THEN COALESCE(token_count, 0) + COALESCE(input_token_count, 0) ELSE 0 END), 0) AS tool_call,
+                ${toolOutputExpr} AS tool_output,
+                COALESCE(SUM(CASE WHEN token_count IS NULL THEN 1 ELSE 0 END), 0) AS null_count
+             FROM tags
+             WHERE session_id = ? AND status = 'active'`;
+  const params = protectedTags > 0 ? [sessionId, protectedTags - 1, sessionId] : [sessionId];
+  const row = db.prepare(sql).get(...params);
+  return {
+    conversation: row?.conversation ?? 0,
+    toolCall: row?.tool_call ?? 0,
+    toolOutput: row?.tool_output ?? 0,
+    nullCount: row?.null_count ?? 0
+  };
 }
 var RECLAIM_HINT_EXCLUDED_TOOLS = ["todowrite"];
 var RECLAIM_HINT_EXCLUDED_LIST = RECLAIM_HINT_EXCLUDED_TOOLS.map((name) => `'${name.replace(/'/g, "''")}'`).join(", ");
@@ -44357,6 +44426,210 @@ function createMagicSummarizeHook(deps) {
   };
 }
 
+// ../plugin/src/hooks/magic-context/ctx-reduce-nudge.ts
+var CHANNEL1_FLOOR_TOKENS = 1e4;
+var CHANNEL1_REFIRE_FLOOR_TOKENS = 1e4;
+function channel1RefireTokens(workingWindowTokens) {
+  const scaled = Math.round(0.05 * Math.max(0, workingWindowTokens));
+  return Math.max(CHANNEL1_REFIRE_FLOOR_TOKENS, scaled);
+}
+var S_GENTLE = 0.2;
+var S_FIRM = 0.4;
+var S_URGENT = 0.65;
+var CHANNEL1_PRESSURE_FLOOR = 0.8;
+var LEVEL_RANK = { gentle: 1, firm: 2, urgent: 3 };
+function decideChannel1(input) {
+  const { undroppedTokens, workingWindowTokens, hasRecentReduce } = input;
+  const pressure = Math.min(1, Math.max(0, input.pressure));
+  const resetCycle = hasRecentReduce || undroppedTokens < input.lastNudgeUndropped;
+  const lastNudge = resetCycle ? 0 : input.lastNudgeUndropped;
+  const lastLevel = resetCycle ? "" : input.lastNudgeLevel;
+  const quiet = () => ({
+    fire: false,
+    level: "gentle",
+    undroppedTokens,
+    nextLastNudge: lastNudge,
+    nextLastNudgeLevel: lastLevel
+  });
+  if (hasRecentReduce)
+    return quiet();
+  if (undroppedTokens < CHANNEL1_FLOOR_TOKENS)
+    return quiet();
+  if (pressure < CHANNEL1_PRESSURE_FLOOR)
+    return quiet();
+  const denom = Math.max(input.estimatedInputTokens, 1);
+  const severity = Math.min(1, undroppedTokens / denom);
+  if (severity < S_GENTLE)
+    return quiet();
+  let level;
+  if (severity >= S_URGENT)
+    level = "urgent";
+  else if (severity >= S_FIRM)
+    level = "firm";
+  else
+    level = "gentle";
+  if (lastLevel === "") {
+    if (undroppedTokens < lastNudge + channel1RefireTokens(workingWindowTokens)) {
+      return quiet();
+    }
+  } else if (LEVEL_RANK[level] <= LEVEL_RANK[lastLevel]) {
+    return quiet();
+  }
+  return {
+    fire: true,
+    level,
+    undroppedTokens,
+    nextLastNudge: undroppedTokens,
+    nextLastNudgeLevel: level
+  };
+}
+function approxThousands(tokens) {
+  return `${Math.round(tokens / 1000)}k`;
+}
+function formatOldestReclaimableHint(hint) {
+  if (!hint || hint.length === 0)
+    return "";
+  const rendered = hint.slice(0, 4).map((tag) => `§${tag.tagNumber}§ ${tag.toolName ?? "tool"}`).join(" · ");
+  return rendered.length > 0 ? `
+oldest reclaimable: ${rendered}.` : "";
+}
+var CHANNEL2_USABLE_FRACTION = 1 / 3;
+var CHANNEL2_MIN_RECLAIMABLE = 1e4;
+function shouldTriggerChannel2(input) {
+  if (input.reclaimableTokens < CHANNEL2_MIN_RECLAIMABLE)
+    return false;
+  if (input.usableTokens <= 0)
+    return true;
+  return input.reclaimableTokens >= input.usableTokens * CHANNEL2_USABLE_FRACTION;
+}
+function buildChannel2Reminder(undroppedTokens, hint) {
+  const amount = approxThousands(undroppedTokens);
+  const hintText = formatOldestReclaimableHint(hint);
+  return `<system-reminder>
+` + `Routine context housekeeping is near: a large span of this session will be comparted soon, ` + `and ~${amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce ` + `first so the archived span is the part that matters.${hintText}
+` + `</system-reminder>`;
+}
+function buildChannel1Reminder(level, undroppedTokens, hint) {
+  const amount = approxThousands(undroppedTokens);
+  const hintText = formatOldestReclaimableHint(hint);
+  let body;
+  switch (level) {
+    case "gentle":
+      body = `You have ~${amount} tokens of tool output you have not reduced. ` + `When you are done with earlier outputs, dropping them with ctx_reduce keeps context lean.`;
+      break;
+    case "firm":
+      body = `~${amount} tokens of unreduced tool output has built up. ` + `At your next natural stopping point, consider dropping what you have already processed with ctx_reduce.`;
+      break;
+    case "urgent":
+      body = `~${amount} tokens of unreduced tool output remain, and a large span of this session will be comparted before long. ` + `Consider dropping spent outputs with ctx_reduce so the archived span is the part that matters.`;
+      break;
+  }
+  return `
+
+<system-reminder>
+${body}${hintText}
+</system-reminder>`;
+}
+
+// src/agent/nudge.ts
+function scanSessionMetrics(agent) {
+  let lastInputTokens = 0;
+  let contextWindow;
+  const events = agent.session.events ?? [];
+  for (const event of events) {
+    if (event === null || typeof event !== "object")
+      continue;
+    const e = event;
+    if (e.type === "request/context") {
+      const cw = e.data?.contextWindow;
+      if (typeof cw === "number" && cw > 0)
+        contextWindow = cw;
+      continue;
+    }
+    if (e.type === "assistant/message") {
+      const usage = e.data?.usage;
+      if (usage !== undefined && typeof usage === "object") {
+        const input = usage.inputTokens;
+        if (typeof input === "number" && Number.isFinite(input) && input >= 0) {
+          lastInputTokens = input;
+        }
+      }
+    }
+  }
+  return { lastInputTokens, contextWindow };
+}
+function oldestReclaimableToolTags(tags, protectedTags) {
+  const active = [...tags].filter((t) => t.type === "tool" && t.status === "active").sort((a, b) => a.tagNumber - b.tagNumber);
+  const protectedSet = protectedTags > 0 ? new Set([...tags].filter((t) => t.type === "tool" && t.status === "active").map((t) => t.tagNumber).sort((a, b) => b - a).slice(0, protectedTags)) : new Set;
+  return active.filter((t) => !protectedSet.has(t.tagNumber)).slice(0, 4).map((t) => ({ tagNumber: t.tagNumber, toolName: t.toolName }));
+}
+function injectNudge(agent, sessionId, kind, text) {
+  const marker = `mc-nudge:${kind}`;
+  const events = agent.session.events ?? [];
+  if (events.some((event) => {
+    if (event === null || typeof event !== "object")
+      return false;
+    const e = event;
+    const source2 = e.data?.source;
+    return source2?.plugin === "magic-context" && source2?.messageId === marker;
+  })) {
+    return;
+  }
+  const source = {
+    kind: "plugin",
+    plugin: "magic-context",
+    messageId: marker
+  };
+  const message = magicUserMessage(text, source, []);
+  agent.inject?.(message);
+}
+function maybeNudgeChannels(db, sessionId, agent, opts = {}) {
+  try {
+    const threshold = Math.max(0, opts.threshold ?? 65);
+    const protectedTags = Math.max(0, opts.protectedTags ?? 20);
+    const { lastInputTokens, contextWindow: scanWindow } = scanSessionMetrics(agent);
+    const contextWindow = opts.contextWindow ?? scanWindow ?? 1e6;
+    if (typeof contextWindow !== "number" || contextWindow <= 0)
+      return;
+    const agg = getActiveTagTokenAggregate(db, sessionId, protectedTags);
+    const reclaimable = agg.toolOutput ?? 0;
+    if (reclaimable >= CHANNEL1_FLOOR_TOKENS) {
+      const workingWindowTokens = Math.round(contextWindow * threshold / 100);
+      const pressure = lastInputTokens > 0 ? lastInputTokens / contextWindow : 0;
+      const decision = decideChannel1({
+        undroppedTokens: reclaimable,
+        pressure,
+        estimatedInputTokens: lastInputTokens + reclaimable,
+        workingWindowTokens,
+        lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
+        lastNudgeLevel: getLastNudgeLevel(db, sessionId),
+        hasRecentReduce: false
+      });
+      setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
+      setLastNudgeLevel(db, sessionId, decision.nextLastNudgeLevel);
+      if (decision.fire) {
+        const tags = getTagsBySession(db, sessionId);
+        const hint = oldestReclaimableToolTags(tags, protectedTags);
+        const reminder = buildChannel1Reminder(decision.level, decision.undroppedTokens, hint);
+        injectNudge(agent, sessionId, "channel1", reminder);
+        opts.log?.(`[magic-context] channel1 nudge fired: level=${decision.level} reclaimable~${Math.round(reclaimable / 1000)}k`);
+      }
+    }
+    const usable = Math.max(0, Math.round(contextWindow * threshold / 100) - lastInputTokens + agg.conversation + agg.toolCall);
+    if (shouldTriggerChannel2({ reclaimableTokens: reclaimable, usableTokens: usable })) {
+      const state = getChannel2NudgeState(db, sessionId);
+      if (state === "") {
+        const tags = getTagsBySession(db, sessionId);
+        const hint = oldestReclaimableToolTags(tags, protectedTags);
+        const reminder = buildChannel2Reminder(reclaimable, hint);
+        setChannel2NudgeState(db, sessionId, "delivered");
+        injectNudge(agent, sessionId, "channel2", reminder);
+        opts.log?.(`[magic-context] channel2 nudge delivered: reclaimable~${Math.round(reclaimable / 1000)}k`);
+      }
+    }
+  } catch {}
+}
+
 // ../plugin/src/hooks/magic-context/historian-prompt.generated.ts
 var COMPARTMENT_AGENT_SYSTEM_PROMPT = `# Historian
 
@@ -45508,6 +45781,11 @@ async function runContextPlaneStep(state, deps, payload, next) {
         await enqueuePlan(state.coordinator, hostView, agent.session, plan);
       }
     }
+    maybeNudgeChannels(db, canonicalSessionId, agent, {
+      threshold: deps.historian?.config?.executeThresholdPercentage ?? 65,
+      protectedTags: deps.config?.protectedTags ?? 20,
+      log: deps.log
+    });
     const historian = deps.historian;
     if (historian !== undefined && historian.config?.enabled !== false) {
       maybeFireHistorian(historian, db, canonicalSessionId, agent, deps.directory);

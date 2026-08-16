@@ -35,6 +35,7 @@ import {
 } from "./transcript";
 import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { checkDshCompartmentTrigger } from "./historian";
+import { maybeNudgeChannels } from "./nudge";
 import { transcriptRawMessageProvider } from "./historian-wiring";
 import { isMagicChildSession } from "./worker";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
@@ -253,6 +254,14 @@ export async function runContextPlaneStep(
         await enqueuePlan(state.coordinator, hostView, agent.session, plan);
       }
     }
+
+    // ctx_reduce 双通道 nudge（Pi parity）：inject `<system-reminder>`，
+    // 决策/正文/状态持久化复用共享核心；fail-open。
+    maybeNudgeChannels(db, canonicalSessionId, agent, {
+      threshold: deps.historian?.config?.executeThresholdPercentage ?? 65,
+      protectedTags: deps.config?.protectedTags ?? 20,
+      log: deps.log,
+    });
 
     // Historian plane: evaluate the context-pressure trigger and fire the
     // background compartment pass (fire-and-forget; never blocks the step).
