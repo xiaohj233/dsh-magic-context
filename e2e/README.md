@@ -84,6 +84,18 @@ foreach ($d in Get-ChildItem $pkg -Directory) {
 }
 ```
 
+## WSL / Linux note (2026-08-16)
+
+The committed `scratch-home` was adapted for Windows (junction mesh → the
+global npm-global install) and is NOT directly reusable from WSL: the profile
+`node_modules` symlinks point at `D:\Dev\DevEnv\...` and the
+`dsh-magic-context` link entry is absent. The current WSL test campaign runs
+the equivalent topology under `/var/tmp/mc-iso` (native ext4 — the 9p/drvfs
+mount stalls DSH boot in `p9_client_rpc`; koffi + node-pty need their Linux
+native modules; the headless profile bundles must include `dsh-pi-ai-compat`
+for the sandbox/shell services). See `docs/TEST_PLAN.md` and
+`docs/VERIFICATION_REPORT.md` for the full environment record.
+
 ## Run the E2E probe
 
 ```powershell
