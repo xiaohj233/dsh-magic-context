@@ -75,6 +75,12 @@ import {
   type SessionChunk,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { describeError } from "@magic-context/core/shared/error-message";
+import {
+  deriveHistorianChunkTokens,
+  resolveHistorianContextLimit,
+} from "@magic-context/core/hooks/magic-context/derive-budgets";
+/** Mirror of the shared derive-budgets fallback (128k, not exported). */
+const HISTORIAN_WINDOW_FALLBACK = 128_000;
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type { SummarizationInput, SummarizeHook, SummaryResult } from "../compat/dsh-0.1/compaction";
@@ -255,6 +261,8 @@ interface HistPassArgs {
   readonly provider: RawMessageProvider;
   readonly summarize: DshSummarizeCall;
   readonly directory?: string;
+  /** Historian model id (used to derive the chunk budget from its window). */
+  readonly model?: string;
   readonly chunkTokens?: number;
   readonly boundarySnapshot?: ProtectedTailBoundarySnapshot;
   readonly refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
@@ -361,7 +369,25 @@ async function runHistorianPassCore(args: HistPassArgs): Promise<HistPassResult>
     return { ok: false, status: "noop", reason: `nothing to compact (eligibleEnd=${eligibleEndOrdinal} <= offset=${offset})` };
   }
 
-  const chunkTokens = args.chunkTokens ?? DEFAULT_HISTORIAN_CHUNK_TOKENS;
+  // Pi parity: the chunk budget follows the historian model's context window
+  // (deriveHistorianChunkTokens), so low-window models don't overflow the
+  // summarize call. When the session window is known (low-context runs), keep
+  // a 35% share so the compartment prompt + references fit inside the window;
+  // otherwise fall back to the model-derived budget, then the fixed default.
+  // 优先用 historian 模型的窗口（Pi parity：chunk 预算跟随 historian 模型）；
+  // 未解析时回退到会话窗口的安全比例，再回退固定默认。
+  const historianWindow = resolveHistorianContextLimit(args.model);
+  const resolvedWindow =
+    historianWindow > 0
+      ? historianWindow
+      : typeof args.currentContextLimit === "number" && args.currentContextLimit > 0
+        ? args.currentContextLimit
+        : HISTORIAN_WINDOW_FALLBACK;
+  const derived = deriveHistorianChunkTokens(resolvedWindow);
+  const chunkTokens =
+    args.chunkTokens ??
+    derived ??
+    DEFAULT_HISTORIAN_CHUNK_TOKENS;
   const chunk = readSessionChunk(sessionId, chunkTokens, offset, eligibleEndOrdinal);
   if (!chunk.text || chunk.messageCount === 0) {
     return { ok: false, status: "noop", reason: "chunk empty after filtering" };
@@ -585,6 +611,7 @@ export async function runDshHistorian(deps: HistorianDeps): Promise<boolean> {
         summarize: deps.summarize,
         directory: deps.directory,
         chunkTokens: deps.chunkTokens,
+        model: deps.model,
         boundarySnapshot: deps.boundarySnapshot,
         refreshBoundarySnapshot: deps.refreshBoundarySnapshot,
         currentContextLimit: deps.currentContextLimit,

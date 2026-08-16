@@ -71,6 +71,8 @@ export interface ContextPlaneHistorianConfig {
   contextLimit?: number;
   /** Commit-cluster trigger (shared semantics: enabled + min_clusters). */
   commitClusterTrigger?: { enabled: boolean; min_clusters: number };
+  /** Historian model override ("provider/model"); defaults to the session route. */
+  model?: string;
 }
 
 /** Context-pressure read for the trigger (structural; injectable in tests). */
@@ -95,6 +97,8 @@ export interface ContextPlaneDeps {
       readonly sessionId: string;
       readonly directory?: string;
       readonly provider: RawMessageProvider;
+      /** Resolved model context window (drives the historian chunk budget). */
+      readonly contextWindow?: number;
     }) => void;
   };
   /** Workspace directory for the historian fire (project memory scope). */
@@ -263,6 +267,7 @@ function maybeFireHistorian(
         sessionId,
         directory,
         provider: transcriptRawMessageProvider(agent as unknown as Agent, sessionId),
+        contextWindow,
       });
     }
   } catch {

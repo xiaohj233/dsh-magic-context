@@ -46,6 +46,7 @@ import {
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { resolveCacheTtl } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { buildSyntheticTodoPart } from "@magic-context/core/hooks/magic-context/todo-view";
+import { consumeDshDeferredSignals } from "./historian";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -205,6 +206,7 @@ export function materializeKnowledgeBlocks(
   projectPath: string | undefined,
   directory: string | undefined,
   agent: KnowledgeAgentView,
+  forceMaterialize = false,
 ): KnowledgeBlocks | null {
   const meta = getOrCreateSessionMeta(db, magicSessionId);
   const state = meta as unknown as M0M1State;
@@ -218,7 +220,9 @@ export function materializeKnowledgeBlocks(
     // the canonical project identity (memory lookup). Keep them distinct.
     projectDirectory: directory ?? "",
     injectDocs: deps.config.injectDocs ?? true,
-    compactionOff: deps.config.compactionOff ?? true,
+    // Pi parity: compartments render into <session-history> by default;
+    // only compaction.enabled=false (compaction-off mode) empties them.
+    compactionOff: deps.config.compactionOff ?? false,
     memoryInjectionBudgetTokens: deps.config.memoryInjectionBudgetTokens,
     historyBudgetTokens: deps.config.historyBudgetTokens,
     userProfileBudgetTokens: deps.config.userProfileBudgetTokens,
@@ -226,17 +230,19 @@ export function materializeKnowledgeBlocks(
     hardSignals,
   };
 
-  const decision = mustMaterialize({
-    db,
-    sessionId: magicSessionId,
-    state,
-    projectPath,
-    hardSignals,
-    injectDocs: renderOptions.injectDocs,
-    muralEnabled: renderOptions.muralEnabled,
-    memoryInjectionBudgetTokens: renderOptions.memoryInjectionBudgetTokens,
-    historyBudgetTokens: renderOptions.historyBudgetTokens,
-  });
+  const decision = forceMaterialize
+    ? { value: true, reason: "deferred_materialization" }
+    : mustMaterialize({
+        db,
+        sessionId: magicSessionId,
+        state,
+        projectPath,
+        hardSignals,
+        injectDocs: renderOptions.injectDocs,
+        muralEnabled: renderOptions.muralEnabled,
+        memoryInjectionBudgetTokens: renderOptions.memoryInjectionBudgetTokens,
+        historyBudgetTokens: renderOptions.historyBudgetTokens,
+      });
 
   let m0Text: string;
   let m1Text: string;
@@ -326,6 +332,7 @@ export async function maybeInjectKnowledge(
   magicSessionId: string,
   projectPath: string | undefined,
   directory: string | undefined,
+  forceMaterialize = false,
 ): Promise<void> {
   if (deps.config.enabled === false) return;
   const generation = agent.session.surface.replaceGeneration;
@@ -338,6 +345,7 @@ export async function maybeInjectKnowledge(
     projectPath,
     directory,
     agent,
+    forceMaterialize,
   );
   if (blocks === null) return;
 
@@ -469,8 +477,11 @@ export async function runKnowledgeGateStep(
       // Session → project attribution (once per session).
       trackSessionProjectOnce(state.trackedSessions, db, magicSessionId, projectPath);
 
-      // Knowledge baseline (once per surface generation).
-      await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory);
+      // Historian 发布后的 deferred-materialization 信号（Pi parity）：下一轮
+      // pre-step 强制 HARD 物化 → m0 折叠 m1 并渲染 <session-history>。
+      const deferred = consumeDshDeferredSignals(magicSessionId);
+      // Knowledge baseline (once per surface generation; forced after publish).
+      await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, deferred.materialization);
       // Pi transform 语义：首轮注入的消息前置到本次调用的消息列表（立即可见）。
       // agent.inject 排队到下一批 pre-step；前置只影响本次调用，不写 surface，
       // 因此不会与下一批 surface 中的基线重复（watermark/状态去重）。

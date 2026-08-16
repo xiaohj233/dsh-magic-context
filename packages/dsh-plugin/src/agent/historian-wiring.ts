@@ -120,13 +120,21 @@ function currentRoute(ctx: Context): { provider: string; model: string } {
  * shared compartment-agent system prompt and the chunk text as the user turn.
  * Returns the raw historian XML the runner validates and publishes.
  */
-export function createLlmSummarizeCall(ctx: Context): DshSummarizeCall {
+export function createLlmSummarizeCall(
+  ctx: Context,
+  modelOverride?: string,
+): DshSummarizeCall {
   const llm = readLlm(ctx);
   if (llm === undefined) {
     throw new Error("magic-context: llm service unavailable (historian wiring)");
   }
   return async (chunk, _priorCompartments, signal) => {
-    const { provider, model } = currentRoute(ctx);
+    // Pi parity: historian.model routes the compartment call to a dedicated
+    // model — required when the main session runs a low-context window (the
+    // compartment prompt alone is ~60KB, far beyond small windows).
+    const { provider, model } = modelOverride !== undefined && modelOverride.includes("/")
+      ? { provider: modelOverride.split("/")[0], model: modelOverride.split("/").slice(1).join("/") }
+      : currentRoute(ctx);
     const prompt = buildCompartmentAgentPrompt({
       seedExamples: "",
       sessionReferences: "",

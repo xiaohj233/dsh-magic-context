@@ -165,6 +165,8 @@ export function bridgeMagicConfig(
     knowledge: {
       ...config.knowledge,
       injectDocs: config.knowledge?.injectDocs ?? dreamerCfg?.inject_docs ?? true,
+      compactionOff:
+        config.knowledge?.compactionOff ?? compactionCfg?.enabled === false,
       memoryInjectionBudgetTokens:
         config.knowledge?.memoryInjectionBudgetTokens ?? memoryCfg?.injection_budget_tokens,
       muralEnabled: config.knowledge?.muralEnabled ?? muralCfg?.enabled ?? false,
@@ -193,6 +195,11 @@ export function bridgeMagicConfig(
     historian: {
       ...config.historian,
       executeThresholdPercentage: config.historian?.executeThresholdPercentage ?? threshold,
+      model:
+        config.historian?.model ??
+        (typeof (cfg.historian as { model?: unknown } | undefined)?.model === "string"
+          ? (cfg.historian as { model: string }).model
+          : undefined),
       commitClusterTrigger:
         config.historian?.commitClusterTrigger ??
         (commitCluster !== undefined
@@ -287,7 +294,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     historian: {
       config: config.historian,
       readPressure: readContextPressure(ctx),
-      fire: ({ db, sessionId, directory: fireDirectory, provider }) => {
+      fire: ({ db, sessionId, directory: fireDirectory, provider, contextWindow }) => {
         // Fire-and-forget: the pass publishes atomically and only signals
         // deferred work; it must never block the pre-step chain.
         void runDshHistorian({
@@ -295,8 +302,9 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
           sessionId,
           directory: fireDirectory,
           provider,
-          summarize: createLlmSummarizeCall(ctx),
+          summarize: createLlmSummarizeCall(ctx, config.historian?.model),
           model: currentModel(ctx),
+          currentContextLimit: contextWindow,
           onPublished: () => {
             signalDshDeferredHistoryRefresh(sessionId);
             signalDshDeferredMaterialization(sessionId);

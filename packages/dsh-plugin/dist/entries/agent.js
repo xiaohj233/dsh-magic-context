@@ -65,7 +65,7 @@ function dshModelRefToCanonical(ref) {
   return remapProviderPrefix(ref, DSH_TO_CANONICAL_PROVIDER);
 }
 // ../plugin/src/config/index.ts
-import { existsSync as existsSync3, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync as existsSync3, readFileSync as readFileSync5 } from "node:fs";
 
 // ../plugin/src/shared/jsonc-parser.ts
 import { existsSync, readFileSync } from "node:fs";
@@ -206,8 +206,8 @@ function detectConfigFile(basePath) {
 }
 
 // ../plugin/src/shared/models-dev-cache.ts
-import { mkdirSync, readFileSync as readFileSync2, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync as readFileSync3, renameSync, writeFileSync } from "node:fs";
+import { join as join2 } from "node:path";
 
 // ../plugin/src/shared/harness-provider-map.ts
 var PI_TO_CANONICAL_PROVIDER = {
@@ -236,6 +236,20 @@ function shouldEnforcePrivateStoragePermissions() {
 }
 
 // ../plugin/src/shared/window-geometry.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+import { join } from "node:path";
+var WINDOW_OVERLAY_SCHEMA = "fusiform-window-overlay/v1";
+var PROMPT_WALL_MARGIN = 4096;
+var PI_OUTPUT_FLOOR = 4096;
+var OPENCODE_OUTPUT_CAP = 32000;
+var MIN_PLAUSIBLE_CONTEXT_LIMIT = 1024;
+var OUTPUT_RESERVE_CAP_RATIO = 0.25;
+var PROVIDER_GEOMETRY = {
+  anthropic: "shared_truncating",
+  xai: "shared_truncating",
+  google: "separate",
+  "google-antigravity": "separate"
+};
 var GRADES = new Set([
   "provider_asserted_runtime",
   "measured",
@@ -263,10 +277,335 @@ var configuredOverlayPath;
 var loadedOverlayPath;
 var loadedOverlay;
 var geometryClampLogSeen = new Set;
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isFinitePositive(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+function modelKeyLookupOrder(providerID, modelID) {
+  const full = `${providerID}/${modelID}`;
+  const canonicalFull = piModelRefToCanonical(full);
+  const candidates = [full, canonicalFull, modelID];
+  const colon = modelID.lastIndexOf(":");
+  if (colon > 0) {
+    const bareModel = modelID.slice(0, colon);
+    const providerBare = `${providerID}/${bareModel}`;
+    candidates.push(providerBare, piModelRefToCanonical(providerBare), bareModel);
+  }
+  return [...new Set(candidates)];
+}
+function configuredOutputReserve(config, providerID, modelID) {
+  if (typeof config === "number") {
+    return Number.isFinite(config) && config >= 0 ? config : undefined;
+  }
+  if (!config)
+    return;
+  for (const candidate of modelKeyLookupOrder(providerID, modelID)) {
+    const value = config[candidate];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0)
+      return value;
+  }
+  return Number.isFinite(config.default) && config.default >= 0 ? config.default : undefined;
+}
+function scalarizeFact(value) {
+  if (value.kind === "stated")
+    return isFinitePositive(value.value) ? value.value : undefined;
+  if (value.kind === "bracket") {
+    return isFinitePositive(value.at_least) ? value.at_least : undefined;
+  }
+  return;
+}
+function parseFactValue(value) {
+  if (!isRecord(value) || typeof value.kind !== "string")
+    return;
+  if (value.kind === "stated") {
+    if ((typeof value.value !== "number" || !Number.isFinite(value.value)) && typeof value.value !== "string") {
+      return;
+    }
+    return { kind: "stated", value: value.value };
+  }
+  if (value.kind === "bracket") {
+    const atLeast = value.at_least;
+    const below = value.below;
+    if (atLeast === undefined && below === undefined)
+      return { kind: "bracket" };
+    if (atLeast !== undefined && !isFinitePositive(atLeast))
+      return;
+    if (below !== undefined && !isFinitePositive(below))
+      return;
+    if (isFinitePositive(atLeast) && isFinitePositive(below) && below <= atLeast) {
+      return;
+    }
+    return {
+      kind: "bracket",
+      ...isFinitePositive(atLeast) ? { at_least: atLeast } : {},
+      ...isFinitePositive(below) ? { below } : {}
+    };
+  }
+  if (value.kind === "unknown" && UNKNOWN_REASONS.has(value.why)) {
+    return { kind: "unknown", why: value.why };
+  }
+  return;
+}
+function parseFact(key, value) {
+  if (!isRecord(value))
+    return;
+  const parsedValue = parseFactValue(value.value);
+  if (!parsedValue || !GRADES.has(value.grade) || !UNITS.has(value.units) || !BOUNDARIES.has(value.boundary) || typeof value.source_ref !== "string" || value.source_ref.length === 0 || typeof value.observed_at !== "string" || value.observed_at.length === 0) {
+    return;
+  }
+  if (NUMERIC_FACT_KEYS.has(key) && parsedValue.kind === "stated" && !isFinitePositive(parsedValue.value)) {
+    return;
+  }
+  if (key === "geometry" && parsedValue.kind === "stated" && !["shared_upfront", "shared_truncating", "separate"].includes(String(parsedValue.value))) {
+    return;
+  }
+  return {
+    ...value,
+    value: parsedValue,
+    grade: value.grade,
+    units: value.units,
+    boundary: value.boundary,
+    source_ref: value.source_ref,
+    observed_at: value.observed_at
+  };
+}
+function parseWindowOverlay(value) {
+  if (!isRecord(value)) {
+    return { badCells: 0, refusal: "overlay root is not an object" };
+  }
+  if (value.schema !== WINDOW_OVERLAY_SCHEMA) {
+    return {
+      badCells: 0,
+      refusal: `unrecognized schema ${JSON.stringify(value.schema)}`
+    };
+  }
+  if (typeof value.generated_at !== "string" || !Array.isArray(value.minted_provider_ids) || !value.minted_provider_ids.every((id) => typeof id === "string" && id.length > 0) || !Array.isArray(value.cells)) {
+    return { badCells: 0, refusal: "invalid v1 envelope" };
+  }
+  const cells = [];
+  let badCells = 0;
+  for (const rawCell of value.cells) {
+    if (!isRecord(rawCell) || typeof rawCell.provider_id !== "string" || rawCell.provider_id.length === 0 || typeof rawCell.model_id !== "string" || rawCell.model_id.length === 0 || !isRecord(rawCell.facts)) {
+      badCells++;
+      continue;
+    }
+    const facts = {};
+    let valid = true;
+    for (const [key, rawFact] of Object.entries(rawCell.facts)) {
+      const fact = parseFact(key, rawFact);
+      if (!fact) {
+        valid = false;
+        break;
+      }
+      facts[key] = fact;
+    }
+    if (!valid) {
+      badCells++;
+      continue;
+    }
+    cells.push({
+      provider_id: rawCell.provider_id,
+      model_id: rawCell.model_id,
+      facts
+    });
+  }
+  return {
+    overlay: {
+      schema: WINDOW_OVERLAY_SCHEMA,
+      generated_at: value.generated_at,
+      minted_provider_ids: [...value.minted_provider_ids],
+      cells
+    },
+    badCells
+  };
+}
+function defaultWindowOverlayPath() {
+  return join(getDataDir(), "fusiform", "window-overlay.json");
+}
+function readWindowOverlayFile(path, log2 = (message) => sessionLog("global", message)) {
+  let raw;
+  try {
+    raw = readFileSync2(path, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    log2(`window-overlay: unable to read ${path}; overlay ignored`);
+    return;
+  }
+  let decoded;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    log2(`window-overlay: invalid JSON in ${path}; overlay ignored`);
+    return;
+  }
+  const parsed = parseWindowOverlay(decoded);
+  if (parsed.refusal) {
+    log2(`window-overlay: ${parsed.refusal} in ${path}; entire overlay ignored`);
+    return;
+  }
+  if (parsed.badCells > 0) {
+    log2(`window-overlay: skipped ${parsed.badCells} invalid cell(s) from ${path}`);
+  }
+  return parsed.overlay;
+}
 function setWindowOverlayPath(path) {
   configuredOverlayPath = path;
   loadedOverlayPath = undefined;
   loadedOverlay = undefined;
+}
+function getWindowOverlay() {
+  const path = configuredOverlayPath ?? defaultWindowOverlayPath();
+  if (loadedOverlayPath === path && loadedOverlay !== undefined) {
+    return loadedOverlay ?? undefined;
+  }
+  loadedOverlayPath = path;
+  loadedOverlay = readWindowOverlayFile(path) ?? null;
+  return loadedOverlay ?? undefined;
+}
+function resolveWindowOverlayFacts(providerID, modelID, overlay = getWindowOverlay()) {
+  if (!overlay)
+    return;
+  const canonical = piModelRefToCanonical(`${providerID}/${modelID}`);
+  const slash = canonical.indexOf("/");
+  const providerCandidates = new Set([
+    providerID,
+    slash > 0 ? canonical.slice(0, slash) : providerID
+  ]);
+  const modelCandidates = new Set([modelID, slash > 0 ? canonical.slice(slash + 1) : modelID]);
+  const colon = modelID.lastIndexOf(":");
+  if (colon > 0)
+    modelCandidates.add(modelID.slice(0, colon));
+  const wildcardFacts = {};
+  const specificFacts = {};
+  for (const cell of overlay.cells) {
+    if (!providerCandidates.has(cell.provider_id))
+      continue;
+    if (cell.model_id === "*")
+      Object.assign(wildcardFacts, cell.facts);
+    else if (modelCandidates.has(cell.model_id))
+      Object.assign(specificFacts, cell.facts);
+  }
+  const facts = { ...wildcardFacts, ...specificFacts };
+  return Object.keys(facts).length > 0 ? { facts } : undefined;
+}
+function numericOverlayFact(overlay, key) {
+  const fact = overlay?.facts[key];
+  return fact ? scalarizeFact(fact.value) : undefined;
+}
+function overlayGeometry(overlay) {
+  const fact = overlay?.facts.geometry;
+  if (fact === undefined)
+    return;
+  if (fact.value.kind === "unknown")
+    return { kind: "unknown" };
+  if (fact.value.kind !== "stated")
+    return;
+  const value = fact.value.value;
+  return value === "shared_upfront" || value === "shared_truncating" || value === "separate" ? { kind: "stated", value } : undefined;
+}
+function placeholderFilteredOutput(output, context) {
+  if (!isFinitePositive(output))
+    return;
+  if (isFinitePositive(context) && output >= context)
+    return;
+  return output;
+}
+function mergePositive(overlayValue, providerValue) {
+  return isFinitePositive(providerValue) ? providerValue : overlayValue;
+}
+function logGeometryClampOnce(key, message, log2) {
+  if (geometryClampLogSeen.has(key))
+    return;
+  geometryClampLogSeen.add(key);
+  (log2 ?? ((entry) => sessionLog("global", `window-geometry: ${entry}`)))(message);
+}
+function deriveWindowGeometry(providerID, modelID, catalogLimit, options = {}) {
+  if (!catalogLimit && !options.providerLimit)
+    return;
+  const providerLimit = options.providerLimit;
+  const catalogContext = isFinitePositive(catalogLimit?.context) ? catalogLimit.context : undefined;
+  const advertised = numericOverlayFact(options.overlay, "window.advertised");
+  const enforced = numericOverlayFact(options.overlay, "window.enforced");
+  let softContext = mergePositive(enforced ?? advertised ?? catalogContext, providerLimit?.context);
+  let hardContext = mergePositive(enforced ?? softContext, providerLimit?.context);
+  if (isFinitePositive(options.contextCap)) {
+    softContext = isFinitePositive(softContext) ? Math.min(softContext, options.contextCap) : options.contextCap;
+    hardContext = isFinitePositive(hardContext) ? Math.min(hardContext, options.contextCap) : options.contextCap;
+  }
+  const input = mergePositive(isFinitePositive(catalogLimit?.input) ? catalogLimit.input : undefined, providerLimit?.input);
+  if (!isFinitePositive(softContext) && !isFinitePositive(input))
+    return;
+  const catalogOutput = options.overlay === undefined && options.providerLimit === undefined ? isFinitePositive(catalogLimit?.output) ? catalogLimit.output : undefined : placeholderFilteredOutput(catalogLimit?.output, softContext);
+  const overlayOutput = placeholderFilteredOutput(numericOverlayFact(options.overlay, "output.enforced") ?? numericOverlayFact(options.overlay, "output.default") ?? numericOverlayFact(options.overlay, "output.advertised"), softContext);
+  const providerOutput = placeholderFilteredOutput(providerLimit?.output, softContext);
+  const output = providerOutput ?? overlayOutput ?? catalogOutput;
+  const geometryFact = overlayGeometry(options.overlay);
+  const geometry = geometryFact?.kind === "stated" ? geometryFact.value : geometryFact?.kind === "unknown" ? "shared_upfront" : PROVIDER_GEOMETRY[providerID] ?? "shared_upfront";
+  const geometryOverride = geometryFact?.kind === "stated" ? geometryFact.value : undefined;
+  let usableSoft;
+  let softReserve = 0;
+  let reserveSource = "none";
+  if (isFinitePositive(input) && (!isFinitePositive(softContext) || input < softContext)) {
+    usableSoft = input;
+    if (isFinitePositive(softContext)) {
+      softReserve = Math.max(0, softContext - input);
+      reserveSource = "output_catalog";
+    }
+  } else if (isFinitePositive(softContext)) {
+    const configuredReserve = configuredOutputReserve(options.reserveConfig, providerID, modelID);
+    if (configuredReserve !== undefined) {
+      softReserve = configuredReserve;
+      reserveSource = "output_config";
+    } else if (geometry === "separate" && (options.overlay === undefined || options.harness === "pi" || geometryOverride !== undefined)) {
+      softReserve = 0;
+      reserveSource = "none";
+    } else {
+      softReserve = output ?? 0;
+      reserveSource = output === undefined ? "none" : "output_catalog";
+      const cap = softContext * OUTPUT_RESERVE_CAP_RATIO;
+      softReserve = Math.min(softReserve, options.harness === "pi" || options.overlay === undefined ? cap : Math.min(cap, OPENCODE_OUTPUT_CAP));
+    }
+    const floor = Math.max(MIN_PLAUSIBLE_CONTEXT_LIMIT, softContext * 0.5);
+    softReserve = Math.min(softReserve, Math.max(0, softContext - floor));
+    usableSoft = Math.floor(softContext - softReserve);
+  } else {
+    usableSoft = input;
+  }
+  const hardWindow = hardContext ?? softContext ?? input;
+  if (!isFinitePositive(hardWindow))
+    return;
+  let usableHard;
+  if (geometry === "separate") {
+    usableHard = hardWindow;
+  } else if (geometry === "shared_truncating") {
+    usableHard = hardWindow - PROMPT_WALL_MARGIN;
+  } else if (options.harness === "pi" && providerID !== "openai-codex") {
+    usableHard = hardWindow - PI_OUTPUT_FLOOR;
+  } else if (options.harness === "pi") {
+    usableHard = hardWindow - (output ?? OPENCODE_OUTPUT_CAP);
+  } else {
+    const requestedOutput = Math.min(output ?? OPENCODE_OUTPUT_CAP, OPENCODE_OUTPUT_CAP);
+    usableHard = hardWindow - requestedOutput;
+  }
+  usableHard = Math.max(MIN_PLAUSIBLE_CONTEXT_LIMIT, Math.floor(usableHard));
+  if (usableHard < usableSoft) {
+    logGeometryClampOnce(`${providerID}/${modelID}|${usableSoft}|${usableHard}`, `usable hard limit clamped for ${providerID}/${modelID}: ${usableHard} → ${usableSoft} (overlay/provider inversion)`, options.log);
+    usableHard = usableSoft;
+  }
+  return {
+    usableSoft,
+    usableHard,
+    geometry,
+    derivation: {
+      window: Math.floor(softContext ?? usableSoft),
+      reserve: Math.floor(Math.max(0, (softContext ?? usableSoft) - usableSoft)),
+      reserveSource,
+      geometry
+    }
+  };
 }
 function formatWindowDerivationLine(inputTokens, result) {
   const percentage = result.usableSoft > 0 ? inputTokens / result.usableSoft * 100 : 0;
@@ -290,19 +629,21 @@ function isSaneLimit(limit) {
   return typeof limit === "number" && limit >= MIN_SANE_LIMIT && limit <= MAX_SANE_LIMIT;
 }
 var SEPARATE_OUTPUT_QUOTA_PROVIDERS = new Set(["google", "google-antigravity"]);
+var MIN_PLAUSIBLE_CONTEXT_LIMIT2 = 1024;
+var OUTPUT_RESERVE_CAP_RATIO2 = 0.25;
 var outputReserveConfig;
 var reserveClampLogSeen = new Set;
 var apiCache = null;
 var persistSeedLoaded = false;
 function persistFilePath() {
-  return join(getMagicContextStorageDir(), `model-context-limits-${getHarness()}.json`);
+  return join2(getMagicContextStorageDir(), `model-context-limits-${getHarness()}.json`);
 }
 function loadPersistedApiCacheOnce() {
   if (persistSeedLoaded || apiCache !== null)
     return;
   persistSeedLoaded = true;
   try {
-    const raw = readFileSync2(persistFilePath(), "utf-8");
+    const raw = readFileSync3(persistFilePath(), "utf-8");
     const obj = JSON.parse(raw);
     const map = new Map;
     for (const [key, persisted] of Object.entries(obj)) {
@@ -316,7 +657,7 @@ function loadPersistedApiCacheOnce() {
           limit: isSaneLimit(limit) ? limit : undefined,
           contextLimit: isSaneLimit(contextLimit) ? contextLimit : undefined,
           inputLimit: isSaneLimit(inputLimit) ? inputLimit : undefined,
-          outputLimit: isFinitePositive(outputLimit) ? outputLimit : undefined,
+          outputLimit: isFinitePositive2(outputLimit) ? outputLimit : undefined,
           vision
         });
       }
@@ -327,11 +668,119 @@ function loadPersistedApiCacheOnce() {
     }
   } catch {}
 }
-function isFinitePositive(value) {
+function isFinitePositive2(value) {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+function modelKeyLookupOrder2(providerID, modelID) {
+  const full = `${providerID}/${modelID}`;
+  const canonicalFull = piModelRefToCanonical(full);
+  const candidates = [full, canonicalFull, modelID];
+  const colon = modelID.lastIndexOf(":");
+  if (colon > 0) {
+    const bareModel = modelID.slice(0, colon);
+    const providerBare = `${providerID}/${bareModel}`;
+    candidates.push(providerBare, piModelRefToCanonical(providerBare), bareModel);
+  }
+  return [...new Set(candidates)];
+}
+function configuredOutputReserve2(config, providerID, modelID) {
+  if (typeof config === "number")
+    return Number.isFinite(config) && config >= 0 ? config : undefined;
+  if (!config)
+    return;
+  for (const candidate of modelKeyLookupOrder2(providerID, modelID)) {
+    const value = config[candidate];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0)
+      return value;
+  }
+  return Number.isFinite(config.default) && config.default >= 0 ? config.default : undefined;
+}
+function logReserveClampOnce(key, message) {
+  if (reserveClampLogSeen.has(key))
+    return;
+  reserveClampLogSeen.add(key);
+  sessionLog("global", `models-dev-cache: ${message}`);
 }
 function setOutputReserveConfig(config) {
   outputReserveConfig = config;
+}
+function resolveLimit(limit, providerID, modelID, reserveConfig = outputReserveConfig) {
+  if (!limit)
+    return;
+  const context = isFinitePositive2(limit.context) ? limit.context : undefined;
+  const input = isFinitePositive2(limit.input) ? limit.input : undefined;
+  if (input !== undefined && (context === undefined || input < context))
+    return input;
+  if (context === undefined)
+    return;
+  const configuredReserve = configuredOutputReserve2(reserveConfig, providerID, modelID);
+  let reserve;
+  if (configuredReserve !== undefined) {
+    reserve = configuredReserve;
+  } else if (SEPARATE_OUTPUT_QUOTA_PROVIDERS.has(providerID)) {
+    reserve = 0;
+  } else {
+    const output = isFinitePositive2(limit.output) ? limit.output : 0;
+    const cap = context * OUTPUT_RESERVE_CAP_RATIO2;
+    reserve = Math.min(output, cap);
+    if (output > cap) {
+      logReserveClampOnce(`cap|${providerID}/${modelID}|${context}|${output}`, `output reserve capped at 25% for ${providerID}/${modelID}: ${output} → ${cap}`);
+    }
+  }
+  const floor = Math.max(MIN_PLAUSIBLE_CONTEXT_LIMIT2, context * 0.5);
+  const maxReserve = Math.max(0, context - floor);
+  if (reserve > maxReserve) {
+    logReserveClampOnce(`floor|${providerID}/${modelID}|${context}|${reserve}`, `output reserve clamped for ${providerID}/${modelID}: ${reserve} → ${maxReserve} (usable floor ${floor})`);
+    reserve = maxReserve;
+  }
+  return Math.floor(context - reserve);
+}
+function getSdkWindowGeometry(providerID, modelID, detectedContextLimit, options) {
+  loadPersistedApiCacheOnce();
+  const metadata = lookupMetadataWithTagFallback(apiCache, providerID, modelID);
+  if (!metadata)
+    return;
+  const rawContext = metadata.contextLimit ?? metadata.limit;
+  const promptOnlyDetected = options?.detectedLimitProvenance === "prompt_only" && isFinitePositive2(detectedContextLimit) ? detectedContextLimit : undefined;
+  const result = deriveWindowGeometry(providerID, modelID, {
+    context: rawContext,
+    input: metadata.inputLimit,
+    output: metadata.outputLimit
+  }, {
+    overlay: resolveWindowOverlayFacts(providerID, modelID, getWindowOverlay()),
+    reserveConfig: outputReserveConfig,
+    harness: options?.harness ?? "opencode",
+    contextCap: promptOnlyDetected === undefined && isFinitePositive2(detectedContextLimit) ? detectedContextLimit : undefined
+  });
+  if (!result || promptOnlyDetected === undefined)
+    return result;
+  const usableSoft = promptOnlyDetected;
+  return {
+    ...result,
+    usableSoft,
+    usableHard: Math.max(usableSoft, Math.min(result.usableHard, promptOnlyDetected))
+  };
+}
+function getSdkContextLimit(providerID, modelID, detectedContextLimit, options) {
+  if (options?.reservation !== "none") {
+    return getSdkWindowGeometry(providerID, modelID, detectedContextLimit, {
+      detectedLimitProvenance: options?.detectedLimitProvenance
+    })?.usableSoft;
+  }
+  loadPersistedApiCacheOnce();
+  const metadata = lookupMetadataWithTagFallback(apiCache, providerID, modelID);
+  if (!metadata)
+    return;
+  const rawContext = metadata.contextLimit ?? metadata.limit;
+  const promptOnlyDetected = options?.detectedLimitProvenance === "prompt_only" && isFinitePositive2(detectedContextLimit) ? detectedContextLimit : undefined;
+  const context = promptOnlyDetected === undefined && isFinitePositive2(detectedContextLimit) && isFinitePositive2(rawContext) ? Math.min(rawContext, detectedContextLimit) : promptOnlyDetected === undefined && isFinitePositive2(detectedContextLimit) ? detectedContextLimit : rawContext;
+  const inputCandidates = [metadata.inputLimit, promptOnlyDetected].filter(isFinitePositive2);
+  const input = inputCandidates.length > 0 ? Math.min(...inputCandidates) : undefined;
+  return resolveLimit({
+    context,
+    input,
+    output: metadata.outputLimit
+  }, providerID, modelID, options?.reservation === "none" ? 0 : undefined);
 }
 function modelSupportsVision(providerID, modelID) {
   loadPersistedApiCacheOnce();
@@ -342,6 +791,18 @@ function modelSupportsVision(providerID, modelID) {
     return true;
   const colon = modelID.lastIndexOf(":");
   return colon > 0 ? apiCache.get(`${providerID}/${modelID.slice(0, colon)}`)?.vision === true : false;
+}
+function lookupMetadataWithTagFallback(cache, providerID, modelID) {
+  if (!cache)
+    return;
+  const exact = cache.get(`${providerID}/${modelID}`);
+  if (exact)
+    return exact;
+  const colonIdx = modelID.lastIndexOf(":");
+  if (colonIdx > 0) {
+    return cache.get(`${providerID}/${modelID.slice(0, colonIdx)}`);
+  }
+  return;
 }
 
 // ../plugin/src/config/agent-disable.ts
@@ -399,7 +860,7 @@ function migrateLegacyAgentEnabledInMemory(rawConfig, warnings) {
 
 // ../plugin/src/config/migrate-config-location.ts
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join as join2 } from "node:path";
+import { basename, dirname, isAbsolute, join as join3 } from "node:path";
 var CONFIG_FILE_BASENAME = "magic-context";
 function homeDir() {
   if (process.platform === "win32") {
@@ -411,13 +872,13 @@ function configHome() {
   const xdg = process.env.XDG_CONFIG_HOME;
   if (xdg && isAbsolute(xdg))
     return xdg;
-  return join2(homeDir(), ".config");
+  return join3(homeDir(), ".config");
 }
 function cortexKitUserConfigBasePath() {
-  return join2(configHome(), "cortexkit", CONFIG_FILE_BASENAME);
+  return join3(configHome(), "cortexkit", CONFIG_FILE_BASENAME);
 }
 function cortexKitProjectConfigBasePath(directory) {
-  return join2(directory, ".cortexkit", CONFIG_FILE_BASENAME);
+  return join3(directory, ".cortexkit", CONFIG_FILE_BASENAME);
 }
 function legacySourcesForBase(basePath, label) {
   return [
@@ -429,38 +890,38 @@ function userScopeConfigPaths() {
   return new Set([
     `${cortexKitUserConfigBasePath()}.jsonc`,
     `${cortexKitUserConfigBasePath()}.json`,
-    join2(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.jsonc`),
-    join2(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.json`),
-    join2(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.jsonc`),
-    join2(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.json`)
+    join3(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.jsonc`),
+    join3(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.json`),
+    join3(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.jsonc`),
+    join3(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.json`)
   ]);
 }
 function resolveLegacyConfigSources(directory) {
   const userPaths = userScopeConfigPaths();
   return {
     user: [
-      ...legacySourcesForBase(join2(configHome(), "opencode", CONFIG_FILE_BASENAME), "OpenCode user"),
-      ...legacySourcesForBase(join2(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME), "Pi user")
+      ...legacySourcesForBase(join3(configHome(), "opencode", CONFIG_FILE_BASENAME), "OpenCode user"),
+      ...legacySourcesForBase(join3(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME), "Pi user")
     ],
     project: [
-      ...legacySourcesForBase(join2(directory, CONFIG_FILE_BASENAME), "project root"),
-      ...legacySourcesForBase(join2(directory, ".opencode", CONFIG_FILE_BASENAME), "OpenCode project"),
-      ...legacySourcesForBase(join2(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project")
+      ...legacySourcesForBase(join3(directory, CONFIG_FILE_BASENAME), "project root"),
+      ...legacySourcesForBase(join3(directory, ".opencode", CONFIG_FILE_BASENAME), "OpenCode project"),
+      ...legacySourcesForBase(join3(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project")
     ].filter((source) => !userPaths.has(source.path))
   };
 }
 function resolveLegacyConfigSourcesForHarness(directory, harness) {
   if (harness === "pi") {
     return {
-      user: legacySourcesForBase(join2(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME), "Pi user"),
-      project: legacySourcesForBase(join2(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project")
+      user: legacySourcesForBase(join3(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME), "Pi user"),
+      project: legacySourcesForBase(join3(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project")
     };
   }
   return {
-    user: legacySourcesForBase(join2(configHome(), "opencode", CONFIG_FILE_BASENAME), "OpenCode user"),
+    user: legacySourcesForBase(join3(configHome(), "opencode", CONFIG_FILE_BASENAME), "OpenCode user"),
     project: [
-      ...legacySourcesForBase(join2(directory, CONFIG_FILE_BASENAME), "project root"),
-      ...legacySourcesForBase(join2(directory, ".opencode", CONFIG_FILE_BASENAME), "OpenCode project")
+      ...legacySourcesForBase(join3(directory, CONFIG_FILE_BASENAME), "project root"),
+      ...legacySourcesForBase(join3(directory, ".opencode", CONFIG_FILE_BASENAME), "OpenCode project")
     ]
   };
 }
@@ -15302,7 +15763,7 @@ function isValidPromptSurfaceModelKey(key) {
     return true;
   return modelID.length > 0 && !modelID.startsWith("/") && !modelID.endsWith("/") && !modelID.includes("//");
 }
-function modelKeyLookupOrder(modelKey) {
+function modelKeyLookupOrder3(modelKey) {
   if (!modelKey)
     return [];
   const slash = modelKey.indexOf("/");
@@ -15331,7 +15792,7 @@ function modelKeyLookupOrder(modelKey) {
 function resolveModelConfigValue(values, modelKey) {
   if (!values)
     return;
-  for (const candidate of modelKeyLookupOrder(modelKey)) {
+  for (const candidate of modelKeyLookupOrder3(modelKey)) {
     const value = values[candidate.key];
     if (value !== undefined) {
       return { value, source: candidate.source };
@@ -16080,7 +16541,7 @@ function resolveTransformMode(args) {
 }
 
 // ../plugin/src/config/variable.ts
-import { existsSync as existsSync2, readFileSync as readFileSync3 } from "node:fs";
+import { existsSync as existsSync2, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { dirname as dirname2, isAbsolute as isAbsolute2, resolve } from "node:path";
 var ENV_PATTERN = /\{env:([^}]+)\}/g;
@@ -16163,7 +16624,7 @@ function substituteConfigVariables(input) {
     }
     let contents;
     try {
-      contents = readFileSync3(filePath, "utf-8").trim();
+      contents = readFileSync4(filePath, "utf-8").trim();
     } catch (error51) {
       const message = error51 instanceof Error ? error51.message : String(error51);
       warnings.push(`Failed to read file for ${token} (${filePath}): ${message}; using empty string`);
@@ -16191,7 +16652,7 @@ function loadConfigFileDetailed(configPath, source) {
   }
   let rawText;
   try {
-    rawText = readFileSync4(configPath, "utf-8");
+    rawText = readFileSync5(configPath, "utf-8");
   } catch (error51) {
     return {
       config: {},
@@ -22398,7 +22859,7 @@ function getEmbeddingProviderIdentity(config2) {
 // ../plugin/src/features/magic-context/memory/embedding-local.ts
 import { chmodSync, mkdirSync as mkdirSync2 } from "node:fs";
 import { open, stat, unlink, writeFile } from "node:fs/promises";
-import { dirname as dirname3, join as join3 } from "node:path";
+import { dirname as dirname3, join as join4 } from "node:path";
 import { pathToFileURL } from "node:url";
 var LOCK_POLL_MS = 150;
 var STALE_LOCK_MS = 3 * 60000;
@@ -22599,7 +23060,7 @@ class LocalEmbeddingProvider {
         if (LogLevel && "ERROR" in LogLevel) {
           env.logLevel = LogLevel.ERROR;
         }
-        const modelCacheDir = join3(getMagicContextStorageDir(), "models");
+        const modelCacheDir = join4(getMagicContextStorageDir(), "models");
         try {
           if (shouldEnforcePrivateStoragePermissions()) {
             mkdirSync2(modelCacheDir, { recursive: true, mode: 448 });
@@ -22616,7 +23077,7 @@ class LocalEmbeddingProvider {
           log("[magic-context] could not create model cache dir, using library default");
         }
         const createPipeline = transformersModule.pipeline;
-        const lockPath = join3(modelCacheDir, ".load.lock");
+        const lockPath = join4(modelCacheDir, ".load.lock");
         const releaseLock = await acquireModelLoadLock(lockPath);
         const stopHeartbeat = startLockHeartbeat(lockPath);
         try {
@@ -25157,7 +25618,7 @@ var MAX_AUTHORITY_SEED_FRAME_BYTES = 900 * 1024;
 var mirrorFlights = new WeakMap;
 // ../plugin/src/hooks/magic-context/read-session-db.ts
 import { existsSync as existsSync6 } from "node:fs";
-import { join as join4 } from "node:path";
+import { join as join5 } from "node:path";
 
 // ../plugin/src/shared/sqlite-helpers.ts
 function closeQuietly(db) {
@@ -25170,7 +25631,7 @@ function closeQuietly(db) {
 
 // ../plugin/src/hooks/magic-context/read-session-db.ts
 function getOpenCodeDbPath() {
-  return join4(getDataDir(), "opencode", "opencode.db");
+  return join5(getDataDir(), "opencode", "opencode.db");
 }
 function openCodeDbExists() {
   return existsSync6(getOpenCodeDbPath());
@@ -25449,7 +25910,7 @@ function readRawSessionMessageOrdinalByIdFromDb(db, sessionId, messageId) {
 }
 
 // ../plugin/src/shared/record-type-guard.ts
-function isRecord(value) {
+function isRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -25531,7 +25992,7 @@ function textFromToolResultContent(content) {
     for (const entry of content) {
       if (typeof entry === "string") {
         pieces.push(entry);
-      } else if (isRecord(entry)) {
+      } else if (isRecord2(entry)) {
         const text = firstStringField(entry, ["text", "content", "value"]);
         pieces.push(text ?? stableStringify(entry));
       } else if (entry !== null && entry !== undefined) {
@@ -25550,7 +26011,7 @@ function looksImageLike(part) {
   return type.includes("image") || mime.startsWith("image/") || mediaType.startsWith("image/") || part.image_url !== undefined || part.imageUrl !== undefined || part.image !== undefined;
 }
 function defaultImageTokenHeuristic(part) {
-  if (isRecord(part)) {
+  if (isRecord2(part)) {
     const width = part.width;
     const height = part.height;
     if (typeof width === "number" && typeof height === "number" && width > 0 && height > 0) {
@@ -25576,7 +26037,7 @@ function recursiveByteLength(value) {
   if (Array.isArray(value)) {
     return value.reduce((sum, item) => sum + recursiveByteLength(item), value.length);
   }
-  if (isRecord(value)) {
+  if (isRecord2(value)) {
     let total = Object.keys(value).length;
     for (const [key, child] of Object.entries(value)) {
       total += key.length + recursiveByteLength(child);
@@ -25609,14 +26070,14 @@ function callIdFromPart(part) {
   const direct = firstStringField(part, ["callID", "callId", "toolCallId", "tool_call_id", "id"]);
   if (direct)
     return direct;
-  const state = isRecord(part.state) ? part.state : null;
+  const state = isRecord2(part.state) ? part.state : null;
   return state ? firstStringField(state, ["callID", "callId", "toolCallId", "tool_call_id", "id"]) ?? "" : "";
 }
 function toolSignalFromPart(part) {
-  if (!isRecord(part))
+  if (!isRecord2(part))
     return null;
   const type = partType(part);
-  const state = isRecord(part.state) ? part.state : null;
+  const state = isRecord2(part.state) ? part.state : null;
   const callId = callIdFromPart(part);
   if (!callId && type !== "tool")
     return null;
@@ -25668,7 +26129,7 @@ function toolSignalFromPart(part) {
   return null;
 }
 function partCheapFingerprint(part) {
-  if (!isRecord(part))
+  if (!isRecord2(part))
     return `${typeof part}:${recursiveByteLength(part)}`;
   const version2 = rawPartVersion(part);
   const type = typeof part.type === "string" ? part.type : "";
@@ -25707,7 +26168,7 @@ function cloneBreakdown(value) {
   return { ...value };
 }
 function estimateNonToolPart(part, options, breakdown) {
-  if (!isRecord(part)) {
+  if (!isRecord2(part)) {
     if (part !== null && part !== undefined)
       addBreakdown(breakdown, "other", estimateStructured(part));
     return true;
@@ -25952,7 +26413,7 @@ function buildTrueRawTokenIndex(sessionId, messages, options) {
   };
 }
 function partContentFingerprint(part) {
-  if (!isRecord(part))
+  if (!isRecord2(part))
     return `${typeof part}:${recursiveByteLength(part)}`;
   const tool = toolSignalFromPart(part);
   if (tool) {
@@ -26057,7 +26518,7 @@ function isToolCallId(value) {
   return typeof value === "string" && value.length > 0;
 }
 function hasMeaningfulPart(part) {
-  if (!isRecord(part))
+  if (!isRecord2(part))
     return false;
   const type = part.type;
   if (type === "text") {
@@ -26072,7 +26533,7 @@ function hasMeaningfulPart(part) {
   return true;
 }
 function extractToolCallObservation(part) {
-  if (!isRecord(part))
+  if (!isRecord2(part))
     return null;
   if (part.type === "tool" && isToolCallId(part.callID)) {
     return { callId: part.callID, kind: "result" };
@@ -29208,7 +29669,7 @@ function runMigrations(db) {
 }
 // ../plugin/src/features/magic-context/project-docs-hash.ts
 import { createHash as createHash11 } from "node:crypto";
-import { lstatSync, readFileSync as readFileSync5, statSync as statSync3 } from "node:fs";
+import { lstatSync, readFileSync as readFileSync6, statSync as statSync3 } from "node:fs";
 import path3 from "node:path";
 var PROJECT_DOC_FILES = ["ARCHITECTURE.md", "STRUCTURE.md"];
 var PROJECT_DOCS_DELIMITER = `
@@ -29282,7 +29743,7 @@ function readCanonicalPieces(projectDirectory, files) {
     if (!safeToRead) {
       continue;
     }
-    const canonicalContent = canonicalizeDocContent(readFileSync5(filePath, "utf8"));
+    const canonicalContent = canonicalizeDocContent(readFileSync6(filePath, "utf8"));
     hashPieces.push(`file:${filename}
 ${canonicalContent}`);
     renderedSections.push(`<file name="${escapeXmlAttr(filename)}">
@@ -29340,11 +29801,11 @@ import {
   existsSync as existsSync8,
   mkdirSync as mkdirSync3,
   readdirSync,
-  readFileSync as readFileSync7,
+  readFileSync as readFileSync8,
   statSync as statSync4,
   unlinkSync
 } from "node:fs";
-import { basename as basename2, dirname as dirname4, join as join6 } from "node:path";
+import { basename as basename2, dirname as dirname4, join as join7 } from "node:path";
 
 // ../plugin/src/plugin/boot-quiet.ts
 var bootQuietUntilMs = 0;
@@ -29435,7 +29896,7 @@ function safeString(value) {
 
 // ../plugin/src/shared/rpc-utils.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
-import { readFileSync as readFileSync6 } from "node:fs";
+import { readFileSync as readFileSync7 } from "node:fs";
 function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0)
     return "dead";
@@ -29450,7 +29911,7 @@ var RPC_IDENTITY_SKEW_TOLERANCE_MS = 120000;
 var LINUX_CLOCK_TICKS_PER_SECOND = 100;
 var PS_PROBE_TIMEOUT_MS = 1000;
 var OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
-var rpcIdentityReadFileSync = readFileSync6;
+var rpcIdentityReadFileSync = readFileSync7;
 var rpcIdentityExecFileSync = execFileSync2;
 var rpcIdentityProcessKill = process.kill;
 var rpcProcessListExecFileSync = execFileSync2;
@@ -29631,11 +30092,11 @@ function loadToolDefinitionMeasurements(db) {
 
 // ../plugin/src/features/magic-context/tool-owner-backfill.ts
 import { existsSync as existsSync7 } from "node:fs";
-import { join as join5 } from "node:path";
+import { join as join6 } from "node:path";
 var LEASE_DURATION_MS = 5 * 60 * 1000;
 var LEASE_RENEWAL_MS = 60 * 1000;
 function resolveOpencodeDbPath() {
-  return join5(getDataDir(), "opencode", "opencode.db");
+  return join6(getDataDir(), "opencode", "opencode.db");
 }
 function ensureBackfillStateTable(db) {
   db.exec(`
@@ -29931,13 +30392,13 @@ function resolveDatabasePath(dbPathOverride) {
     return { dbDir: dirname4(dbPathOverride), dbPath: dbPathOverride };
   }
   const dbDir = getMagicContextStorageDir();
-  return { dbDir, dbPath: join6(dbDir, "context.db") };
+  return { dbDir, dbPath: join7(dbDir, "context.db") };
 }
 function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
   if (existsSync8(targetDbPath))
     return;
   const legacyDir = getLegacyOpenCodeMagicContextStorageDir();
-  const legacyDbPath = join6(legacyDir, "context.db");
+  const legacyDbPath = join7(legacyDir, "context.db");
   if (!existsSync8(legacyDbPath))
     return;
   log(`[magic-context] migrating legacy plugin storage: ${legacyDir} -> ${targetDbDir} (legacy left in place as backup)`);
@@ -29954,7 +30415,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
   }
   for (const suffix of ["", "-wal", "-shm"]) {
     const src = `${legacyDbPath}${suffix}`;
-    const dst = join6(targetDbDir, `context.db${suffix}`);
+    const dst = join7(targetDbDir, `context.db${suffix}`);
     if (existsSync8(src)) {
       try {
         copyFileSync(src, dst);
@@ -29963,8 +30424,8 @@ function migrateLegacyStorageIfNeeded(targetDbPath, targetDbDir) {
       }
     }
   }
-  const legacyModelsDir = join6(legacyDir, "models");
-  const targetModelsDir = join6(targetDbDir, "models");
+  const legacyModelsDir = join7(legacyDir, "models");
+  const targetModelsDir = join7(targetDbDir, "models");
   if (existsSync8(legacyModelsDir) && !existsSync8(targetModelsDir)) {
     try {
       cpSync(legacyModelsDir, targetModelsDir, { recursive: true });
@@ -30019,7 +30480,7 @@ function unreadableDiscovery(path4, arm) {
 var RPC_DISCOVERY_PARSE_GRACE_MS = 10 * 60 * 1000;
 var defaultRpcDiscoveryFs = {
   readdirSync: (path4, options) => options?.withFileTypes ? readdirSync(path4, { withFileTypes: true }) : readdirSync(path4),
-  readFileSync: (path4, encoding) => String(readFileSync7(path4, encoding)),
+  readFileSync: (path4, encoding) => String(readFileSync8(path4, encoding)),
   statSync: (path4) => ({ mtimeMs: statSync4(path4).mtimeMs }),
   unlinkSync: (path4) => unlinkSync(path4)
 };
@@ -30057,7 +30518,7 @@ function classifyJunkDiscovery(portFile, raw, staleFiles) {
   return null;
 }
 function inspectRpcServerDiscovery(storageDir) {
-  const rpcRoot = join6(storageDir, "rpc");
+  const rpcRoot = join7(storageDir, "rpc");
   let projectEntries;
   try {
     projectEntries = rpcDiscoveryFs.readdirSync(rpcRoot, { withFileTypes: true });
@@ -30071,7 +30532,7 @@ function inspectRpcServerDiscovery(storageDir) {
   for (const projectEntry of projectEntries) {
     if (!projectEntry.isDirectory())
       continue;
-    const projectDir = join6(rpcRoot, projectEntry.name);
+    const projectDir = join7(rpcRoot, projectEntry.name);
     let entries;
     try {
       entries = rpcDiscoveryFs.readdirSync(projectDir);
@@ -30082,7 +30543,7 @@ function inspectRpcServerDiscovery(storageDir) {
     }
     for (const entry of entries) {
       if (entry === "port" || entry.startsWith("port-") && entry.endsWith(".json")) {
-        portFiles.push(join6(projectDir, entry));
+        portFiles.push(join7(projectDir, entry));
       }
     }
   }
@@ -33517,7 +33978,7 @@ class BoundedSessionMap {
 // ../plugin/src/features/magic-context/compaction-marker.ts
 import { createHash as createHash12 } from "node:crypto";
 import { existsSync as existsSync9 } from "node:fs";
-import { join as join7 } from "node:path";
+import { join as join8 } from "node:path";
 var BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 var ID_PREFIX_HEX_LENGTH = 12;
 var ID_SUFFIX_LENGTH = 14;
@@ -33543,7 +34004,7 @@ function generatePartId(timestampMs, counter = 0n, identity = "") {
   return generateId("prt", timestampMs, counter, identity);
 }
 function getOpenCodeDbPath2() {
-  return join7(getDataDir(), "opencode", "opencode.db");
+  return join8(getDataDir(), "opencode", "opencode.db");
 }
 var cachedWriteDb = null;
 var REQUIRED_MESSAGE_COLUMNS = ["id", "session_id", "time_created", "time_updated", "data"];
@@ -35225,10 +35686,10 @@ function resolveCacheTtl(cacheTtl, modelKey) {
   return resolveModelConfigOrDefault(cacheTtl, modelKey, cacheTtl.default ?? "5m");
 }
 var clampWarnSeen = new Set;
-function isFinitePositive2(v) {
+function isFinitePositive3(v) {
   return typeof v === "number" && Number.isFinite(v) && v > 0;
 }
-function* modelKeyLookupOrder2(modelKey) {
+function* modelKeyLookupOrder4(modelKey) {
   const slash = modelKey.indexOf("/");
   const provider2 = slash >= 0 ? modelKey.slice(0, slash) : "";
   let modelId = slash >= 0 ? modelKey.slice(slash + 1) : modelKey;
@@ -35243,10 +35704,10 @@ function* modelKeyLookupOrder2(modelKey) {
   }
 }
 function resolveExecuteThresholdDetail(config2, modelKey, fallback, options) {
-  if (options?.tokensConfig && isFinitePositive2(options.contextLimit)) {
+  if (options?.tokensConfig && isFinitePositive3(options.contextLimit)) {
     const contextLimit = options.contextLimit;
     const tokenMatch = resolveTokensMatchWithKey(options.tokensConfig, modelKey);
-    if (tokenMatch && isFinitePositive2(tokenMatch.value)) {
+    if (tokenMatch && isFinitePositive3(tokenMatch.value)) {
       const cap = contextLimit * (MAX_EXECUTE_THRESHOLD / 100);
       const effectiveTokens = Math.min(tokenMatch.value, cap);
       if (effectiveTokens < tokenMatch.value) {
@@ -35281,7 +35742,7 @@ function resolveExecuteThresholdDetail(config2, modelKey, fallback, options) {
     resolved = config2;
   } else if (modelKey) {
     let matched;
-    for (const candidate of modelKeyLookupOrder2(modelKey)) {
+    for (const candidate of modelKeyLookupOrder4(modelKey)) {
       if (typeof config2[candidate] === "number") {
         matched = config2[candidate];
         matchedKey = candidate;
@@ -35333,7 +35794,7 @@ function resolveTokensMatchWithKey(tokensConfig, modelKey) {
     return;
   }
   if (modelKey) {
-    for (const candidate of modelKeyLookupOrder2(modelKey)) {
+    for (const candidate of modelKeyLookupOrder4(modelKey)) {
       const value = tokensConfig[candidate];
       if (typeof value === "number") {
         return { value, matchedKey: candidate };
@@ -35451,6 +35912,1687 @@ function isTodoItem(value) {
     return false;
   const todo = value;
   return typeof todo.content === "string" && isTodoStatus(todo.status) && (todo.priority === undefined || isTodoPriority(todo.priority));
+}
+
+// ../plugin/src/features/magic-context/compartment-events.ts
+function insertCompartmentEvents(db, sessionId, events, compartmentIds) {
+  if (events.length === 0)
+    return;
+  const now = Date.now();
+  const harness = getHarness();
+  const stmt = db.prepare("INSERT INTO compartment_events (session_id, compartment_id, kind, at_compartment, fields_json, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?)");
+  for (const ev of events) {
+    const idx = ev.atCompartment != null && ev.atCompartment >= 1 ? ev.atCompartment - 1 : -1;
+    const compartmentId = idx >= 0 && idx < compartmentIds.length ? compartmentIds[idx] : null;
+    stmt.run(sessionId, compartmentId, ev.kind, ev.atCompartment, JSON.stringify(ev.fields ?? {}), now, harness);
+  }
+}
+function getCompartmentEvents(db, sessionId) {
+  const rows = db.prepare("SELECT id, session_id, compartment_id, kind, at_compartment, fields_json, created_at FROM compartment_events WHERE session_id = ? ORDER BY id DESC").all(sessionId);
+  return rows.map((r) => ({
+    id: r.id,
+    sessionId: r.session_id,
+    compartmentId: r.compartment_id,
+    kind: r.kind,
+    atCompartment: r.at_compartment,
+    fields: parseFields(r.fields_json),
+    createdAt: r.created_at
+  }));
+}
+function parseFields(json2) {
+  try {
+    const parsed = JSON.parse(json2);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const out = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === "string")
+          out[k] = v;
+      }
+      return out;
+    }
+  } catch {}
+  return {};
+}
+
+// ../plugin/src/features/magic-context/storage-historian-runs.ts
+function recordHistorianRun(db, input) {
+  try {
+    const result = db.prepare(`INSERT INTO historian_runs (
+                    session_id, harness, subagent_invocation_id, run_kind, status,
+                    failure_reason, chunk_start_ordinal, chunk_end_ordinal, unprocessed_from,
+                    compartments_produced, compartment_id_min, compartment_id_max,
+                    facts_emitted, facts_by_category_json, events_emitted,
+                    importance_min, importance_max, importance_avg,
+                    discarded_last, legacy, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.sessionId, input.harness, input.subagentInvocationId ?? null, input.runKind, input.status, input.failureReason ?? null, input.chunkStartOrdinal ?? null, input.chunkEndOrdinal ?? null, input.unprocessedFrom ?? null, input.compartmentsProduced ?? 0, input.compartmentIdMin ?? null, input.compartmentIdMax ?? null, input.factsEmitted ?? 0, input.factsByCategory ? JSON.stringify(input.factsByCategory) : null, input.eventsEmitted ?? 0, input.importanceMin ?? null, input.importanceMax ?? null, input.importanceAvg ?? null, input.discardedLast ? 1 : 0, input.legacy ? 1 : 0, Date.now());
+    return Number(result.lastInsertRowid);
+  } catch {
+    return null;
+  }
+}
+function summarizeImportance(values) {
+  const nums = values.filter((v) => typeof v === "number" && Number.isFinite(v));
+  if (nums.length === 0)
+    return { min: null, max: null, avg: null };
+  let min = nums[0];
+  let max = nums[0];
+  let sum = 0;
+  for (const v of nums) {
+    if (v < min)
+      min = v;
+    if (v > max)
+      max = v;
+    sum += v;
+  }
+  return { min, max, avg: sum / nums.length };
+}
+function tallyFactsByCategory(facts) {
+  const out = {};
+  for (const f of facts) {
+    const cat = (f.category ?? "UNKNOWN").trim() || "UNKNOWN";
+    out[cat] = (out[cat] ?? 0) + 1;
+  }
+  return out;
+}
+
+// ../plugin/src/hooks/magic-context/derive-budgets.ts
+var TRIGGER_BUDGET_PERCENTAGE = 0.05;
+var TRIGGER_BUDGET_MIN = 5000;
+var TRIGGER_BUDGET_MAX = 50000;
+var HISTORIAN_CHUNK_PERCENTAGE = 0.25;
+var HISTORIAN_CHUNK_MIN = 8000;
+var HISTORIAN_CHUNK_MAX = 50000;
+var DEFAULT_HISTORIAN_CONTEXT_FALLBACK = 128000;
+function deriveTriggerBudget(mainContextLimit, executeThresholdPercentage) {
+  if (!Number.isFinite(mainContextLimit) || mainContextLimit <= 0) {
+    return TRIGGER_BUDGET_MIN;
+  }
+  const thresholdFraction = Math.max(0, executeThresholdPercentage) / 100;
+  const usable = mainContextLimit * thresholdFraction;
+  const derived = Math.round(usable * TRIGGER_BUDGET_PERCENTAGE);
+  return Math.max(TRIGGER_BUDGET_MIN, Math.min(TRIGGER_BUDGET_MAX, derived));
+}
+function deriveHistorianChunkTokens(historianContextLimit) {
+  if (!Number.isFinite(historianContextLimit) || historianContextLimit <= 0) {
+    return HISTORIAN_CHUNK_MIN;
+  }
+  const derived = Math.round(historianContextLimit * HISTORIAN_CHUNK_PERCENTAGE);
+  return Math.max(HISTORIAN_CHUNK_MIN, Math.min(HISTORIAN_CHUNK_MAX, derived));
+}
+function resolveHistorianContextLimit(historianModelOverride) {
+  if (typeof historianModelOverride === "string" && historianModelOverride.includes("/")) {
+    const [providerID, ...rest] = historianModelOverride.split("/");
+    const modelID = rest.join("/");
+    if (providerID && modelID) {
+      const limit = getSdkContextLimit(providerID, modelID);
+      if (typeof limit === "number" && limit > 0)
+        return limit;
+    }
+    return DEFAULT_HISTORIAN_CONTEXT_FALLBACK;
+  }
+  if (typeof historianModelOverride === "string" && historianModelOverride.trim() !== "") {
+    console.warn(`[magic-context] historian.model "${historianModelOverride}" lacks provider prefix ("provider/model-id"); using the default context limit for chunk-budget derivation.`);
+  }
+  return DEFAULT_HISTORIAN_CONTEXT_FALLBACK;
+}
+
+// ../plugin/src/hooks/magic-context/protected-tail-boundary.ts
+var ALPHA = 0.3;
+var FLOOR_RATIO = 0.08;
+var FLOOR_MIN = 2000;
+var FLOOR_MAX = 12000;
+var ABS_CAP = 96000;
+var MAX_USABLE_RATIO = 0.4;
+var RESERVED_HEADROOM_MIN = 1000;
+var RESERVED_HEADROOM_RATIO = 0.02;
+var NON_EMERGENCY_MAX_CAP = 250000;
+var FORCE80_MAX_CAP = 500000;
+var FORCE95_MAX_CAP = 750000;
+var NORMAL_HYSTERESIS_TOKENS = 256;
+var MIN_FORCE_ELIGIBLE_TOKENS_CAP = 1000;
+function deriveMinForceEligibleTokens(scaledN) {
+  return Math.min(MIN_FORCE_ELIGIBLE_TOKENS_CAP, Math.max(1, Math.floor(scaledN / 8)));
+}
+function clampPercentage(value) {
+  if (!Number.isFinite(value))
+    return 0;
+  return Math.max(0, Math.min(100, value));
+}
+function clampOrdinal(value, rawMessageCount) {
+  return Math.max(1, Math.min(rawMessageCount + 1, Math.floor(value)));
+}
+function deriveProtectedTailTokenTarget(args) {
+  const safeContextLimit = Number.isFinite(args.contextLimit) && args.contextLimit > 0 ? args.contextLimit : 128000;
+  const safeThreshold = Number.isFinite(args.executeThresholdPercentage) ? Math.max(0, args.executeThresholdPercentage) : 65;
+  const usable = Math.max(1, Math.round(safeContextLimit * safeThreshold / 100));
+  const usage = clampPercentage(args.usagePercentage);
+  const triggerBudget = args.triggerBudget ?? deriveTriggerBudget(safeContextLimit, safeThreshold);
+  const reserve = Math.max(RESERVED_HEADROOM_MIN, Math.round(usable * RESERVED_HEADROOM_RATIO));
+  const rawN = Math.round(usable * ALPHA * (1 - usage / 100));
+  const floorN = Math.min(FLOOR_MAX, Math.max(FLOOR_MIN, Math.round(usable * FLOOR_RATIO)));
+  const headroom = Math.min(triggerBudget + reserve, Math.floor(usable * 0.5));
+  const ceilingN = Math.max(1, Math.min(ABS_CAP, Math.floor(usable * MAX_USABLE_RATIO), usable - headroom));
+  const effectiveFloor = Math.min(floorN, ceilingN);
+  const N = Math.min(ceilingN, Math.max(effectiveFloor, rawN));
+  return { usable, rawN, floorN, ceilingN, effectiveFloor, N, headroom, triggerBudget, reserve };
+}
+function nonEmergencyPerRunCap(usable, N) {
+  return Math.min(NON_EMERGENCY_MAX_CAP, Math.max(2 * N, Math.min(Math.round(0.25 * usable), 1e5)));
+}
+function force80PerRunCap(usable, N) {
+  return Math.min(FORCE80_MAX_CAP, Math.max(3 * N, Math.min(Math.round(0.35 * usable), 150000)));
+}
+function force95PerRunCap(usable, N) {
+  return Math.min(FORCE95_MAX_CAP, Math.max(4 * N, Math.min(Math.round(0.5 * usable), 250000)));
+}
+function selectPerRunCap(snapshot) {
+  const usable = Math.max(1, Math.round(snapshot.contextLimit * snapshot.executeThresholdPercentage / 100));
+  if (snapshot.usagePercentage >= 95)
+    return force95PerRunCap(usable, snapshot.N);
+  if (snapshot.usagePercentage >= 80)
+    return force80PerRunCap(usable, snapshot.N);
+  return nonEmergencyPerRunCap(usable, snapshot.N);
+}
+function boundaryMessageId(index, ordinal) {
+  if (ordinal < 1 || ordinal > index.rawMessageCount)
+    return null;
+  return index.messageIdAtOrdinal(ordinal);
+}
+function isSemanticBoundaryCandidate(messageParts, role) {
+  if (role === "user" && hasMeaningfulUserText(messageParts))
+    return true;
+  if (messageParts.some((part) => String(typeof part === "object" && part !== null && "type" in part ? part.type : "") === "tool")) {
+    return true;
+  }
+  return false;
+}
+function semanticSnapBoundary(args) {
+  const { messages, index, candidate, scaledN, lastCompartmentEndOrdinal } = args;
+  let snapped = candidate;
+  for (const message of messages) {
+    if (message.ordinal > candidate)
+      break;
+    if (message.ordinal < lastCompartmentEndOrdinal + 1)
+      continue;
+    if (!isSemanticBoundaryCandidate(message.parts, message.role))
+      continue;
+    snapped = message.ordinal;
+  }
+  if (snapped === candidate)
+    return candidate;
+  const extraTokens = index.suffixTokensFromOrdinal(snapped) - index.suffixTokensFromOrdinal(candidate);
+  if (extraTokens > Math.min(Math.round(1.5 * scaledN), 48000))
+    return candidate;
+  const snappedMessage = messages.find((message) => message.ordinal === snapped);
+  if (snappedMessage?.role === "user" && index.tokenForOrdinal(snapped) > Math.max(2 * scaledN, 64000)) {
+    return candidate;
+  }
+  return snapped;
+}
+function snapWrapupBoundaryToUser(args) {
+  const { messages, index, candidate, offset, triggerBudget } = args;
+  if (candidate <= offset)
+    return candidate;
+  const snapTokenLimit = Math.min(Math.max(triggerBudget, 2000), 48000);
+  for (let ordinal = candidate;ordinal >= offset; ordinal -= 1) {
+    const message = messages.find((m) => m.ordinal === ordinal);
+    if (!message)
+      continue;
+    if (message.role !== "user" || !hasMeaningfulUserText(message.parts))
+      continue;
+    const extraTokens = index.rangeTokens(ordinal, candidate);
+    if (extraTokens <= snapTokenLimit)
+      return ordinal;
+    return candidate;
+  }
+  return candidate;
+}
+function fenceWrapupBoundaryForToolArcs(args) {
+  let boundary = args.candidate;
+  const maxPasses = args.arcs.length + 1;
+  for (let pass = 0;pass < maxPasses; pass += 1) {
+    let next = boundary;
+    for (const arc of args.arcs) {
+      if (arc.resOrdinal === null) {
+        continue;
+      }
+      if (arc.invOrdinal >= args.lastCompartmentEndOrdinal + 1 && completedToolArcCrossesBoundary(arc.invOrdinal, arc.resOrdinal, next)) {
+        next = arc.invOrdinal;
+      }
+    }
+    if (next === boundary)
+      return boundary;
+    boundary = next;
+  }
+  return boundary;
+}
+function applyHeadCap(args) {
+  const { index, protectedTailStart, offset, arcs, capTokens, recentOpenArcCutoff } = args;
+  if (offset >= protectedTailStart)
+    return { eligibleEndOrdinal: offset, oversizeAtomicUnit: false };
+  let end = index.findHeadEndForCap(offset, protectedTailStart, capTokens);
+  let oversizeAtomicUnit = end === offset + 1 && index.tokenForOrdinal(offset) > capTokens;
+  for (const arc of arcs) {
+    const resOrdinal = arc.resOrdinal;
+    if (resOrdinal === null) {
+      if (arc.invOrdinal >= recentOpenArcCutoff && arc.invOrdinal >= offset && arc.invOrdinal < end) {
+        end = Math.min(end, arc.invOrdinal);
+      }
+      continue;
+    }
+    if (arc.invOrdinal < end && end <= resOrdinal) {
+      end = Math.min(protectedTailStart, resOrdinal + 1);
+      if (index.rangeTokens(Math.max(offset, arc.invOrdinal), end) > capTokens)
+        oversizeAtomicUnit = true;
+    }
+  }
+  if (end <= offset && offset < protectedTailStart) {
+    return { eligibleEndOrdinal: offset, oversizeAtomicUnit };
+  }
+  return { eligibleEndOrdinal: Math.min(end, protectedTailStart), oversizeAtomicUnit };
+}
+function resolveProtectedTailBoundary(ctx) {
+  const createdAt = ctx.createdAt ?? Date.now();
+  const messages = readRawSessionMessages(ctx.sessionId);
+  const storedTotals = ctx.storedTokenTotals;
+  const absoluteMessageCount = getCachedAbsoluteMessageCount(ctx.sessionId) ?? undefined;
+  const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
+    providerShapeVersion: ctx.providerShapeVersion,
+    cacheNamespace: ctx.cacheNamespace,
+    absoluteMessageCount,
+    storedTotalForMessage: storedTotals ? (m) => {
+      const v = storedTotals.get(m.id);
+      return v === undefined ? null : v;
+    } : undefined
+  });
+  const rawMessageCount = index.rawMessageCount;
+  const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
+  const usagePercentage = clampPercentage(ctx.usage?.percentage ?? 0);
+  const usageInputTokens = Math.max(0, Math.round(ctx.usage?.inputTokens ?? 0));
+  if (rawMessageCount === 0) {
+    return {
+      sessionId: ctx.sessionId,
+      mode: ctx.mode,
+      offset,
+      offsetMessageId: null,
+      protectedTailStart: 1,
+      protectedTailStartMessageId: null,
+      eligibleEndOrdinal: 1,
+      eligibleEndMessageId: null,
+      rawMessageCountAtTrigger: 0,
+      rawLastMessageIdAtTrigger: null,
+      N: 0,
+      usagePercentage,
+      usageInputTokens,
+      usageSource: ctx.usageSource,
+      contextLimit: ctx.contextLimit,
+      executeThresholdPercentage: ctx.executeThresholdPercentage,
+      triggerBudget: ctx.triggerBudget,
+      priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
+      migrationFloorActive: ctx.migrationFloorActive,
+      emergencyTailScale: ctx.emergencyTailScale,
+      providerShapeVersion: ctx.providerShapeVersion,
+      cacheNamespace: ctx.cacheNamespace,
+      createdAt,
+      rawRangeFingerprint: "",
+      trueRawEligibleTokens: 0,
+      oversizeAtomicUnit: false,
+      boundaryReason: "empty-session"
+    };
+  }
+  if (ctx.mode === "manual-full-recomp") {
+    const arcs2 = buildToolArcs(messages);
+    const recompTarget = deriveProtectedTailTokenTarget({
+      contextLimit: ctx.contextLimit,
+      executeThresholdPercentage: ctx.executeThresholdPercentage,
+      usagePercentage: 0,
+      triggerBudget: ctx.triggerBudget
+    });
+    const recentOpenArcCutoff2 = index.findSuffixStartForTokens(recompTarget.N);
+    const firstOpenArc = arcs2.find((arc) => arc.resOrdinal === null && arc.invOrdinal >= offset && arc.invOrdinal >= recentOpenArcCutoff2);
+    const protectedTailStart2 = firstOpenArc?.invOrdinal ?? rawMessageCount + 1;
+    const rawRangeFingerprint2 = computeRawRangeFingerprint(messages, offset, protectedTailStart2);
+    return {
+      sessionId: ctx.sessionId,
+      mode: ctx.mode,
+      offset,
+      offsetMessageId: boundaryMessageId(index, offset),
+      protectedTailStart: protectedTailStart2,
+      protectedTailStartMessageId: null,
+      eligibleEndOrdinal: protectedTailStart2,
+      eligibleEndMessageId: boundaryMessageId(index, protectedTailStart2 - 1),
+      rawMessageCountAtTrigger: rawMessageCount,
+      rawLastMessageIdAtTrigger: boundaryMessageId(index, rawMessageCount),
+      N: 0,
+      usagePercentage: 0,
+      usageInputTokens: 0,
+      usageSource: "manual-none",
+      contextLimit: ctx.contextLimit,
+      executeThresholdPercentage: ctx.executeThresholdPercentage,
+      triggerBudget: ctx.triggerBudget,
+      priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
+      migrationFloorActive: false,
+      emergencyTailScale: ctx.emergencyTailScale,
+      providerShapeVersion: ctx.providerShapeVersion,
+      cacheNamespace: ctx.cacheNamespace,
+      createdAt,
+      rawRangeFingerprint: rawRangeFingerprint2,
+      trueRawEligibleTokens: index.rangeTokens(offset, protectedTailStart2),
+      oversizeAtomicUnit: false,
+      boundaryReason: firstOpenArc ? "open-tool-arc" : "manual-full-recomp"
+    };
+  }
+  const target = deriveProtectedTailTokenTarget({
+    contextLimit: ctx.contextLimit,
+    executeThresholdPercentage: ctx.executeThresholdPercentage,
+    usagePercentage,
+    triggerBudget: ctx.triggerBudget
+  });
+  const scaledN = ctx.emergencyTailScale ? Math.max(1, Math.floor(target.N * ctx.emergencyTailScale)) : target.N;
+  const arcs = buildToolArcs(messages);
+  let boundary = index.findSuffixStartForTokens(scaledN);
+  const recentOpenArcCutoff = boundary;
+  let boundaryReason = boundary === 1 ? "whole-session-smaller-than-tail" : "size-walk";
+  const tokenAtBoundary = index.tokenForOrdinal(boundary);
+  if (boundary <= rawMessageCount && tokenAtBoundary > Math.max(2 * scaledN, 64000) && boundary < rawMessageCount) {
+    boundary += 1;
+    boundaryReason = "huge-message-exception";
+  }
+  boundary = fenceBoundaryForToolArcs(boundary, arcs, ctx.lastCompartmentEndOrdinal, recentOpenArcCutoff);
+  const snapped = semanticSnapBoundary({
+    messages,
+    index,
+    candidate: boundary,
+    scaledN,
+    lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal
+  });
+  if (snapped !== boundary)
+    boundaryReason = "semantic-snap";
+  boundary = fenceBoundaryForToolArcs(snapped, arcs, ctx.lastCompartmentEndOrdinal, recentOpenArcCutoff);
+  let runtimeFloor = offset;
+  if (ctx.migrationFloorActive)
+    runtimeFloor = Math.max(runtimeFloor, ctx.priorBoundaryOrdinal);
+  let protectedTailStart = Math.max(boundary, runtimeFloor);
+  const forceMaterializationPercentage = escalationBands(ctx.executeThresholdPercentage).forceMaterializationPercentage;
+  if (!ctx.emergencyTailScale && usagePercentage < forceMaterializationPercentage) {
+    let lastMeaningfulUserOrdinal = 0;
+    for (let i = messages.length - 1;i >= 0; i--) {
+      const message = messages[i];
+      if (message.role !== "user")
+        continue;
+      if (!hasMeaningfulUserText(message.parts))
+        continue;
+      lastMeaningfulUserOrdinal = message.ordinal;
+      break;
+    }
+    if (lastMeaningfulUserOrdinal >= offset) {
+      protectedTailStart = Math.min(protectedTailStart, lastMeaningfulUserOrdinal);
+    }
+  }
+  if (protectedTailStart > offset && index.rangeTokens(offset, protectedTailStart) <= NORMAL_HYSTERESIS_TOKENS) {
+    protectedTailStart = offset;
+  }
+  protectedTailStart = clampOrdinal(protectedTailStart, rawMessageCount);
+  const perRunCap = selectPerRunCap({
+    usagePercentage,
+    N: scaledN,
+    contextLimit: ctx.contextLimit,
+    executeThresholdPercentage: ctx.executeThresholdPercentage
+  });
+  const head = applyHeadCap({
+    index,
+    protectedTailStart,
+    offset,
+    arcs,
+    lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal,
+    capTokens: perRunCap,
+    recentOpenArcCutoff
+  });
+  const rawRangeFingerprint = computeRawRangeFingerprint(messages, offset, head.eligibleEndOrdinal);
+  return {
+    sessionId: ctx.sessionId,
+    mode: ctx.mode,
+    offset,
+    offsetMessageId: boundaryMessageId(index, offset),
+    protectedTailStart,
+    protectedTailStartMessageId: boundaryMessageId(index, protectedTailStart),
+    eligibleEndOrdinal: head.eligibleEndOrdinal,
+    eligibleEndMessageId: boundaryMessageId(index, head.eligibleEndOrdinal - 1),
+    rawMessageCountAtTrigger: rawMessageCount,
+    rawLastMessageIdAtTrigger: boundaryMessageId(index, rawMessageCount),
+    N: scaledN,
+    usagePercentage,
+    usageInputTokens,
+    usageSource: ctx.usageSource,
+    contextLimit: ctx.contextLimit,
+    executeThresholdPercentage: ctx.executeThresholdPercentage,
+    triggerBudget: ctx.triggerBudget,
+    priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
+    migrationFloorActive: ctx.migrationFloorActive,
+    emergencyTailScale: ctx.emergencyTailScale,
+    providerShapeVersion: ctx.providerShapeVersion,
+    cacheNamespace: ctx.cacheNamespace,
+    createdAt,
+    rawRangeFingerprint,
+    trueRawEligibleTokens: index.rangeTokens(offset, protectedTailStart),
+    oversizeAtomicUnit: head.oversizeAtomicUnit,
+    boundaryReason
+  };
+}
+function resolveBoundaryContext(args) {
+  const lastCompartmentEndOrdinal = getLastCompartmentEndMessage(args.db, args.sessionId);
+  const triggerBudget = deriveTriggerBudget(args.contextLimit, args.executeThresholdPercentage);
+  let meta3 = loadProtectedTailMeta(args.db, args.sessionId);
+  let migrationFloorActive = false;
+  if (meta3.protectedTailPolicyVersion < 3) {
+    let legacyBoundary = 1;
+    try {
+      legacyBoundary = getLegacyProtectedTailStartOrdinal(args.sessionId);
+    } catch (error51) {
+      sessionLog(args.sessionId, "protected-tail migration seed fell back to ordinal 1:", error51);
+    }
+    const seedResult = markProtectedTailPolicyV3Seeded(args.db, args.sessionId, Math.max(1, legacyBoundary));
+    meta3 = seedResult;
+    migrationFloorActive = seedResult.seeded;
+  }
+  let storedTokenTotals;
+  try {
+    storedTokenTotals = getAllStatusTagTokenTotalsFlat(args.db, args.sessionId, args.taggerFloor ?? 0).totals;
+  } catch (error51) {
+    sessionLog(args.sessionId, "protected-tail stored-token map unavailable (live fallback):", error51);
+  }
+  return {
+    sessionId: args.sessionId,
+    mode: args.mode,
+    contextLimit: args.contextLimit,
+    executeThresholdPercentage: args.executeThresholdPercentage,
+    triggerBudget,
+    usage: args.usage ?? null,
+    usageSource: args.usageSource ?? (args.usage ? "live" : "provisional-zero"),
+    lastCompartmentEndOrdinal,
+    priorBoundaryOrdinal: meta3.priorBoundaryOrdinal,
+    protectedTailPolicyVersion: meta3.protectedTailPolicyVersion,
+    migrationFloorActive,
+    emergencyTailScale: args.emergencyTailScale,
+    providerShapeVersion: args.providerShapeVersion ?? "opencode-v1",
+    cacheNamespace: args.cacheNamespace ?? `opencode:${args.sessionId}`,
+    storedTokenTotals
+  };
+}
+function resolveOpenCodeProtectedTailBoundary(args) {
+  return resolveProtectedTailBoundary(resolveBoundaryContext(args));
+}
+function resolveWrapupProtectedTailBoundary(args) {
+  const ctx = resolveBoundaryContext({ ...args, mode: "manual-wrapup" });
+  const createdAt = ctx.createdAt ?? Date.now();
+  const messages = readRawSessionMessages(ctx.sessionId);
+  const absoluteMessageCount = getCachedAbsoluteMessageCount(ctx.sessionId) ?? undefined;
+  const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
+    providerShapeVersion: ctx.providerShapeVersion,
+    cacheNamespace: ctx.cacheNamespace,
+    absoluteMessageCount,
+    storedTotalForMessage: ctx.storedTokenTotals ? (m) => {
+      const value = ctx.storedTokenTotals?.get(m.id);
+      return value === undefined ? null : value;
+    } : undefined
+  });
+  const rawMessageCount = index.rawMessageCount;
+  const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
+  const anchorRawMessageCount = Math.max(0, Math.min(rawMessageCount, Math.floor(args.anchorRawMessageCount ?? rawMessageCount)));
+  const usagePercentage = clampPercentage(ctx.usage?.percentage ?? 0);
+  const usageInputTokens = Math.max(0, Math.round(ctx.usage?.inputTokens ?? 0));
+  const rawMessagesAboveLastCompartment = Math.max(0, anchorRawMessageCount - offset + 1);
+  const keep = Math.max(1, Math.floor(args.messagesToKeep));
+  let targetProtectedTailStart = offset;
+  let boundaryReason = "manual-wrapup-empty";
+  if (rawMessageCount === 0 || rawMessagesAboveLastCompartment <= keep) {
+    targetProtectedTailStart = offset;
+    boundaryReason = rawMessageCount === 0 ? "manual-wrapup-empty" : "manual-wrapup-within-keep";
+  } else {
+    targetProtectedTailStart = anchorRawMessageCount - keep + 1;
+    boundaryReason = "manual-wrapup-keep-watermark";
+    const arcs = buildToolArcs(messages);
+    const fenced = fenceWrapupBoundaryForToolArcs({
+      candidate: targetProtectedTailStart,
+      arcs,
+      lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal
+    });
+    if (fenced !== targetProtectedTailStart)
+      boundaryReason = "manual-wrapup-tool-arc";
+    targetProtectedTailStart = fenced;
+    const snapped = snapWrapupBoundaryToUser({
+      messages,
+      index,
+      candidate: targetProtectedTailStart,
+      offset,
+      triggerBudget: ctx.triggerBudget
+    });
+    if (snapped !== targetProtectedTailStart)
+      boundaryReason = "manual-wrapup-user-snap";
+    targetProtectedTailStart = snapped;
+    const refenced = fenceWrapupBoundaryForToolArcs({
+      candidate: targetProtectedTailStart,
+      arcs,
+      lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal
+    });
+    if (refenced !== targetProtectedTailStart)
+      boundaryReason = "manual-wrapup-tool-arc";
+    targetProtectedTailStart = refenced;
+  }
+  targetProtectedTailStart = clampOrdinal(targetProtectedTailStart, rawMessageCount);
+  const target = deriveProtectedTailTokenTarget({
+    contextLimit: ctx.contextLimit,
+    executeThresholdPercentage: ctx.executeThresholdPercentage,
+    usagePercentage,
+    triggerBudget: ctx.triggerBudget
+  });
+  const perRunCap = selectPerRunCap({
+    usagePercentage,
+    N: target.N,
+    contextLimit: ctx.contextLimit,
+    executeThresholdPercentage: ctx.executeThresholdPercentage
+  });
+  const head = applyHeadCap({
+    index,
+    protectedTailStart: targetProtectedTailStart,
+    offset,
+    arcs: buildToolArcs(messages),
+    lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal,
+    capTokens: perRunCap,
+    recentOpenArcCutoff: targetProtectedTailStart
+  });
+  const eligibleEndOrdinal = Math.min(head.eligibleEndOrdinal, targetProtectedTailStart);
+  const rawRangeFingerprint = computeRawRangeFingerprint(messages, offset, eligibleEndOrdinal);
+  const snapshot = {
+    sessionId: ctx.sessionId,
+    mode: "manual-wrapup",
+    offset,
+    offsetMessageId: boundaryMessageId(index, offset),
+    protectedTailStart: targetProtectedTailStart,
+    protectedTailStartMessageId: boundaryMessageId(index, targetProtectedTailStart),
+    eligibleEndOrdinal,
+    eligibleEndMessageId: boundaryMessageId(index, eligibleEndOrdinal - 1),
+    rawMessageCountAtTrigger: rawMessageCount,
+    rawLastMessageIdAtTrigger: boundaryMessageId(index, rawMessageCount),
+    N: keep,
+    usagePercentage,
+    usageInputTokens,
+    usageSource: ctx.usageSource,
+    contextLimit: ctx.contextLimit,
+    executeThresholdPercentage: ctx.executeThresholdPercentage,
+    triggerBudget: ctx.triggerBudget,
+    priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
+    migrationFloorActive: ctx.migrationFloorActive,
+    emergencyTailScale: ctx.emergencyTailScale,
+    providerShapeVersion: ctx.providerShapeVersion,
+    cacheNamespace: ctx.cacheNamespace,
+    createdAt,
+    rawRangeFingerprint,
+    trueRawEligibleTokens: index.rangeTokens(offset, targetProtectedTailStart),
+    oversizeAtomicUnit: head.oversizeAtomicUnit,
+    boundaryReason
+  };
+  return {
+    snapshot,
+    rawMessagesAboveLastCompartment,
+    anchorRawMessageCount,
+    targetProtectedTailStart,
+    targetEligibleEndOrdinal: targetProtectedTailStart
+  };
+}
+function hasRunnableCompartmentWindow(snapshot) {
+  if (snapshot.offset >= snapshot.protectedTailStart)
+    return false;
+  const forceMaterializationPercentage = escalationBands(snapshot.executeThresholdPercentage).forceMaterializationPercentage;
+  if (snapshot.usagePercentage >= forceMaterializationPercentage || snapshot.emergencyTailScale) {
+    return snapshot.trueRawEligibleTokens >= deriveMinForceEligibleTokens(snapshot.N) || snapshot.eligibleEndOrdinal > snapshot.offset;
+  }
+  return snapshot.eligibleEndOrdinal > snapshot.offset;
+}
+function validateBoundarySnapshot(args) {
+  const { snapshot } = args;
+  if (args.currentContextLimit && args.currentContextLimit !== snapshot.contextLimit) {
+    return {
+      ok: false,
+      reason: "model_or_limit_changed",
+      detail: `context limit changed from ${snapshot.contextLimit} to ${args.currentContextLimit}`
+    };
+  }
+  const messages = readRawSessionMessages(snapshot.sessionId);
+  const currentRawMessageCount = messages.reduce((max, message) => Math.max(max, message.ordinal), messages.length);
+  if (snapshot.rawMessageCountAtTrigger > currentRawMessageCount) {
+    return { ok: false, reason: "stale_snapshot", detail: "raw message count shrank" };
+  }
+  const idsByOrdinal = new Map(messages.map((message) => [message.ordinal, message.id]));
+  const idAt = (ordinal) => idsByOrdinal.get(ordinal) ?? null;
+  const checks3 = [
+    [snapshot.offset, snapshot.offsetMessageId, "offset"],
+    [snapshot.rawMessageCountAtTrigger, snapshot.rawLastMessageIdAtTrigger, "last"]
+  ];
+  if (snapshot.protectedTailStart <= snapshot.rawMessageCountAtTrigger) {
+    checks3.push([
+      snapshot.protectedTailStart,
+      snapshot.protectedTailStartMessageId,
+      "protectedTailStart"
+    ]);
+  }
+  if (snapshot.eligibleEndOrdinal > snapshot.offset) {
+    checks3.push([
+      snapshot.eligibleEndOrdinal - 1,
+      snapshot.eligibleEndMessageId,
+      "eligibleEnd"
+    ]);
+  }
+  for (const [ordinal, expected, label] of checks3) {
+    if (expected !== idAt(ordinal)) {
+      return {
+        ok: false,
+        reason: "stale_snapshot",
+        detail: `${label} ordinal ${ordinal} id changed`
+      };
+    }
+  }
+  const expectedOffset = Math.max(1, getLastCompartmentEndMessage(args.db, snapshot.sessionId) + 1);
+  if (expectedOffset !== snapshot.offset) {
+    return {
+      ok: false,
+      reason: "stale_snapshot",
+      detail: `last compartment moved: offset ${snapshot.offset} -> ${expectedOffset}`
+    };
+  }
+  const fingerprint = computeRawRangeFingerprint(messages, snapshot.offset, snapshot.eligibleEndOrdinal);
+  if (fingerprint !== snapshot.rawRangeFingerprint) {
+    return { ok: false, reason: "stale_snapshot", detail: "raw range fingerprint changed" };
+  }
+  return { ok: true };
+}
+function recordHighPressureNoEligibleHead(db, snapshot) {
+  const forceMaterializationPercentage = escalationBands(snapshot.executeThresholdPercentage).forceMaterializationPercentage;
+  if (snapshot.usagePercentage < forceMaterializationPercentage && !snapshot.emergencyTailScale) {
+    return 0;
+  }
+  return recordProtectedTailNoEligibleHead(db, snapshot.sessionId);
+}
+function createDefaultBoundarySnapshotForTests(sessionId) {
+  const messages = readRawSessionMessages(sessionId);
+  const rawMessageCount = messages.length;
+  const protectedTailStart = Math.max(1, Math.min(rawMessageCount + 1, getLegacyProtectedTailStartOrdinal(sessionId)));
+  const index = buildTrueRawTokenIndex(sessionId, messages, {
+    providerShapeVersion: "opencode-v1",
+    cacheNamespace: `test:${sessionId}`
+  });
+  const trueRawEligibleTokens = index.rangeTokens(1, protectedTailStart);
+  const messageIdAt = (ordinal) => messages.find((message) => message.ordinal === ordinal)?.id ?? null;
+  return {
+    sessionId,
+    mode: "incremental-runner",
+    offset: 1,
+    offsetMessageId: messageIdAt(1),
+    protectedTailStart,
+    protectedTailStartMessageId: messageIdAt(protectedTailStart),
+    eligibleEndOrdinal: protectedTailStart,
+    eligibleEndMessageId: messageIdAt(protectedTailStart - 1),
+    rawMessageCountAtTrigger: rawMessageCount,
+    rawLastMessageIdAtTrigger: messageIdAt(rawMessageCount),
+    N: 0,
+    usagePercentage: 0,
+    usageInputTokens: 0,
+    usageSource: "provisional-zero",
+    contextLimit: 128000,
+    executeThresholdPercentage: 65,
+    triggerBudget: deriveTriggerBudget(128000, 65),
+    priorBoundaryOrdinal: protectedTailStart,
+    migrationFloorActive: false,
+    providerShapeVersion: "opencode-v1",
+    cacheNamespace: `test:${sessionId}`,
+    createdAt: Date.now(),
+    rawRangeFingerprint: "",
+    trueRawEligibleTokens,
+    oversizeAtomicUnit: false,
+    boundaryReason: "test-legacy"
+  };
+}
+
+// ../plugin/src/hooks/magic-context/compartment-trigger.ts
+var PROACTIVE_TRIGGER_OFFSET_PERCENTAGE = 2;
+var POST_DROP_TARGET_RATIO = 0.75;
+function getProactiveCompartmentTriggerPercentage(executeThresholdPercentage) {
+  return Math.max(0, executeThresholdPercentage - PROACTIVE_TRIGGER_OFFSET_PERCENTAGE);
+}
+
+// ../plugin/src/hooks/magic-context/compartment-runner-drop-queue.ts
+function queueDropsForCompartmentalizedMessages(db, sessionId, upToMessageIndex) {
+  const tags = getTagsBySession(db, sessionId);
+  const { messageFileKeys, toolObservations } = getRawSessionTagKeysThrough(sessionId, upToMessageIndex);
+  let dropsQueued = 0;
+  for (const tag of tags) {
+    if (tag.status !== "active")
+      continue;
+    if (tag.type === "tool") {
+      const observedOwners = toolObservations.get(tag.messageId);
+      if (!observedOwners)
+        continue;
+      if (tag.toolOwnerMessageId !== null) {
+        if (!observedOwners.has(tag.toolOwnerMessageId))
+          continue;
+      }
+      queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+      dropsQueued += 1;
+      continue;
+    }
+    if (messageFileKeys.has(tag.messageId)) {
+      queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+      dropsQueued += 1;
+    }
+  }
+  sessionLog(sessionId, `compartment agent: queued ${dropsQueued} drops for messages 0-${upToMessageIndex}`);
+}
+
+// ../plugin/src/hooks/magic-context/compartment-runner-mapping.ts
+function tierFieldsOf(c) {
+  return {
+    p1: c.p1,
+    p2: c.p2,
+    p3: c.p3,
+    p4: c.p4,
+    importance: c.importance,
+    episodeType: c.episodeType
+  };
+}
+function mapParsedCompartmentsToChunk(compartments, chunk, sequenceOffset) {
+  const mapped = [];
+  for (const [index, compartment] of compartments.entries()) {
+    const startLine = chunk.lines.find((line) => line.ordinal === compartment.startMessage);
+    const endLine = chunk.lines.find((line) => line.ordinal === compartment.endMessage);
+    if (!startLine || !endLine) {
+      return {
+        ok: false,
+        error: `Compartment range ${compartment.startMessage}-${compartment.endMessage} does not map to raw session lines ${chunk.startIndex}-${chunk.endIndex}`
+      };
+    }
+    mapped.push({
+      sequence: sequenceOffset + index,
+      startMessage: compartment.startMessage,
+      endMessage: compartment.endMessage,
+      startMessageId: startLine.messageId,
+      endMessageId: endLine.messageId,
+      title: compartment.title,
+      content: compartment.content,
+      ...tierFieldsOf(compartment)
+    });
+  }
+  return { ok: true, compartments: mapped };
+}
+
+// ../plugin/src/hooks/magic-context/compartment-runner-validation.ts
+var MIN_RECOMP_CHUNK_TOKEN_BUDGET = 20;
+var HISTORIAN_BOUNDARY_HEALING_SLACK = 2;
+function healCompartmentGaps(compartments, toolOnlyRanges = []) {
+  for (let i = 1;i < compartments.length; i++) {
+    const prev = compartments[i - 1];
+    const curr = compartments[i];
+    const gapStart = prev.endMessage + 1;
+    const gapEnd = curr.startMessage - 1;
+    const gapSize = gapEnd - gapStart + 1;
+    if (gapSize <= 0)
+      continue;
+    const fullyInsideToolOnly = toolOnlyRanges.some((range) => range.start <= gapStart && range.end >= gapEnd);
+    if (fullyInsideToolOnly) {
+      prev.endMessage = gapEnd;
+    }
+  }
+}
+function boundarySplitsCompletedToolArc(boundary, arcs = []) {
+  return arcs.some((arc) => completedToolArcCrossesBoundary(arc.start, arc.end, boundary));
+}
+function healTerminalCompletedToolArc(compartments, unprocessedFrom, arcs = [], chunkEnd) {
+  const last = compartments[compartments.length - 1];
+  if (!last)
+    return unprocessedFrom;
+  const originalEnd = last.endMessage;
+  for (let pass = 0;pass <= arcs.length; pass += 1) {
+    const boundary = last.endMessage + 1;
+    let nextEnd = last.endMessage;
+    for (const arc of arcs) {
+      if (arc.end <= chunkEnd && completedToolArcCrossesBoundary(arc.start, arc.end, boundary)) {
+        nextEnd = Math.max(nextEnd, arc.end);
+      }
+    }
+    if (nextEnd === last.endMessage)
+      break;
+    last.endMessage = nextEnd;
+  }
+  return last.endMessage !== originalEnd && unprocessedFrom !== null ? last.endMessage + 1 : unprocessedFrom;
+}
+function shouldDiscardLastHistorianCompartment(compartments, chunk) {
+  if (compartments.length < 2)
+    return false;
+  const last = compartments[compartments.length - 1];
+  const previous = compartments[compartments.length - 2];
+  const lookaheadMargin = chunk.endIndex - last.endMessage;
+  return lookaheadMargin <= HISTORIAN_BOUNDARY_HEALING_SLACK && !boundarySplitsCompletedToolArc(previous.endMessage + 1, chunk.completedToolArcs);
+}
+function validateHistorianOutput(text, _sessionId, chunk, _priorCompartments, sequenceOffset) {
+  const parsed = parseCompartmentOutput(text);
+  if (parsed.compartments.length === 0) {
+    return {
+      ok: false,
+      error: "Historian returned no usable compartments."
+    };
+  }
+  healCompartmentGaps(parsed.compartments, chunk.toolOnlyRanges);
+  parsed.unprocessedFrom = healTerminalCompletedToolArc(parsed.compartments, parsed.unprocessedFrom, chunk.completedToolArcs, chunk.endIndex);
+  const mapped = mapParsedCompartmentsToChunk(parsed.compartments, chunk, sequenceOffset);
+  if (!mapped.ok) {
+    return {
+      ok: false,
+      error: `Historian returned invalid compartment output: ${mapped.error}`
+    };
+  }
+  const parsedValidationError = validateParsedCompartments(parsed.compartments, chunk.startIndex, chunk.endIndex, parsed.unprocessedFrom);
+  if (parsedValidationError) {
+    return {
+      ok: false,
+      error: `Historian returned invalid compartment output: ${parsedValidationError}`
+    };
+  }
+  const last = parsed.compartments[parsed.compartments.length - 1];
+  if (last && boundarySplitsCompletedToolArc(last.endMessage + 1, chunk.completedToolArcs)) {
+    return {
+      ok: false,
+      error: "Historian terminal boundary splits a completed tool invocation/result arc"
+    };
+  }
+  return {
+    ok: true,
+    compartments: mapped.compartments,
+    facts: parsed.facts,
+    userObservations: parsed.userObservations.length > 0 ? parsed.userObservations : undefined,
+    primerCandidates: parsed.primerCandidates.length > 0 ? parsed.primerCandidates.slice(0, 1) : undefined,
+    events: parsed.events.length > 0 ? parsed.events : undefined
+  };
+}
+var HISTORIAN_PERSISTENT_FAILURE_THRESHOLD = 3;
+function buildHistorianFailureNotice(failureCount, lastError) {
+  if (failureCount >= HISTORIAN_PERSISTENT_FAILURE_THRESHOLD) {
+    return [
+      "## Magic Context — history comparting needs attention",
+      "",
+      `Magic Context has been unable to compart this session's history ${failureCount} times in a row. This usually means the configured historian model is misconfigured or unreachable (Magic Context already retried every fallback model automatically).`,
+      "",
+      `Last error: ${lastError}`,
+      "",
+      "Check your historian model in magic-context.jsonc, then restart. Your conversation keeps working normally in the meantime — this only affects how older history is summarized."
+    ].join(`
+`);
+  }
+  return [
+    "## Magic Context",
+    "",
+    "Hit a transient issue comparting history this turn — Magic Context will retry automatically on the next turn. Nothing is lost and your conversation continues normally. You'll only be alerted again if this keeps happening."
+  ].join(`
+`);
+}
+function buildHistorianRepairPrompt(originalPrompt, previousOutput, validationError, language) {
+  const prompt = [
+    originalPrompt,
+    "",
+    "Your previous XML response was invalid and cannot be persisted.",
+    `Validation error: ${validationError}`,
+    "Return a corrected full XML response for the same existing state and new messages.",
+    "Do not skip any displayed raw ordinal or displayed raw range, even if the message looks trivial.",
+    "Every displayed message range must belong to exactly one compartment unless it is intentionally left in one trailing suffix marked by <unprocessed_from>.",
+    "",
+    "Previous invalid XML:",
+    previousOutput
+  ].join(`
+`);
+  return withContentLanguageDirective(prompt, language, { preserveUserQuotes: true });
+}
+function validateStoredCompartments(compartments) {
+  if (compartments.length === 0) {
+    return null;
+  }
+  let expectedStart = 1;
+  for (const compartment of compartments) {
+    if (compartment.startMessage !== expectedStart) {
+      if (compartment.startMessage < expectedStart) {
+        return `overlap before message ${expectedStart} (saw ${compartment.startMessage}-${compartment.endMessage})`;
+      }
+      return `gap before message ${compartment.startMessage} (expected ${expectedStart})`;
+    }
+    if (compartment.endMessage < compartment.startMessage) {
+      return `invalid range ${compartment.startMessage}-${compartment.endMessage}`;
+    }
+    expectedStart = compartment.endMessage + 1;
+  }
+  return null;
+}
+function validateParsedCompartments(compartments, chunkStart, chunkEnd, unprocessedFrom) {
+  let expectedStart = chunkStart;
+  for (const [index, compartment] of compartments.entries()) {
+    if (!compartment.p1?.trim()) {
+      return `compartment ${index + 1} is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers`;
+    }
+    if (compartment.endMessage < compartment.startMessage) {
+      return `invalid range ${compartment.startMessage}-${compartment.endMessage}`;
+    }
+    if (compartment.startMessage < chunkStart || compartment.endMessage > chunkEnd) {
+      return `range ${compartment.startMessage}-${compartment.endMessage} is outside chunk ${chunkStart}-${chunkEnd}`;
+    }
+    if (compartment.startMessage !== expectedStart) {
+      if (compartment.startMessage < expectedStart) {
+        return `overlap before message ${expectedStart} (saw ${compartment.startMessage}-${compartment.endMessage})`;
+      }
+      return `gap before message ${compartment.startMessage} (expected ${expectedStart})`;
+    }
+    expectedStart = compartment.endMessage + 1;
+  }
+  if (unprocessedFrom !== null) {
+    if (unprocessedFrom === chunkEnd + 1) {
+      return null;
+    }
+    if (unprocessedFrom < chunkStart || unprocessedFrom > chunkEnd) {
+      return `<unprocessed_from> ${unprocessedFrom} is outside chunk ${chunkStart}-${chunkEnd}`;
+    }
+    if (unprocessedFrom !== expectedStart) {
+      return `<unprocessed_from> ${unprocessedFrom} does not match next uncovered message ${expectedStart}`;
+    }
+    return null;
+  }
+  if (expectedStart <= chunkEnd) {
+    return `output left uncovered messages ${expectedStart}-${chunkEnd} without <unprocessed_from>`;
+  }
+  return null;
+}
+function validateChunkCoverage(chunk) {
+  if (chunk.lines.length === 0) {
+    return null;
+  }
+  let expectedOrdinal = chunk.startIndex;
+  for (const line of chunk.lines) {
+    if (line.ordinal !== expectedOrdinal) {
+      return `chunk omits raw message ${expectedOrdinal} while still claiming coverage through ${chunk.endIndex}`;
+    }
+    expectedOrdinal += 1;
+  }
+  if (expectedOrdinal - 1 !== chunk.endIndex) {
+    return `chunk coverage ends at ${expectedOrdinal - 1} but chunk end is ${chunk.endIndex}`;
+  }
+  return null;
+}
+function getReducedRecompTokenBudget(currentBudget) {
+  const reducedBudget = Math.max(MIN_RECOMP_CHUNK_TOKEN_BUDGET, Math.floor(currentBudget / 2));
+  return reducedBudget < currentBudget ? reducedBudget : null;
+}
+
+// ../plugin/src/hooks/magic-context/note-nudger.ts
+var NOTE_NUDGE_COOLDOWN_MS = 15 * 60 * 1000;
+var lastDeliveredAt = new Map;
+function getPersistedNoteNudgeDeliveredAt(_db, sessionId) {
+  return lastDeliveredAt.get(sessionId) ?? 0;
+}
+function recordNoteNudgeDeliveryTime(sessionId) {
+  lastDeliveredAt.set(sessionId, Date.now());
+}
+function onNoteTrigger(db, sessionId, trigger) {
+  setPersistedNoteNudgeTrigger(db, sessionId);
+  sessionLog(sessionId, `note-nudge: trigger fired (${trigger}), triggerPending=true`);
+}
+function peekNoteNudgeText(db, sessionId, currentUserMessageId, projectIdentity, noteReadStillVisible) {
+  const state = getPersistedNoteNudge(db, sessionId);
+  if (!state.triggerPending)
+    return null;
+  if (!state.triggerMessageId && currentUserMessageId) {
+    setPersistedNoteNudgeTriggerMessageId(db, sessionId, currentUserMessageId);
+    state.triggerMessageId = currentUserMessageId;
+  }
+  if (state.triggerMessageId && currentUserMessageId && state.triggerMessageId === currentUserMessageId) {
+    sessionLog(sessionId, `note-nudge: deferring — current user message ${currentUserMessageId} is same as trigger-time message`);
+    return null;
+  }
+  const deliveredAt = getPersistedNoteNudgeDeliveredAt(db, sessionId);
+  if (deliveredAt > 0 && Date.now() - deliveredAt < NOTE_NUDGE_COOLDOWN_MS) {
+    sessionLog(sessionId, `note-nudge: suppressing — last delivered ${Math.round((Date.now() - deliveredAt) / 1000)}s ago (cooldown ${NOTE_NUDGE_COOLDOWN_MS / 60000}m)`);
+    clearNoteNudgeTriggerOnly(db, sessionId);
+    return null;
+  }
+  const notes = getSessionNotes(db, sessionId);
+  const readySmartNotes = projectIdentity ? getReadySmartNotes(db, projectIdentity) : [];
+  const totalCount = notes.length + readySmartNotes.length;
+  if (totalCount === 0) {
+    sessionLog(sessionId, "note-nudge: triggerPending but no notes found, skipping");
+    clearNoteNudgeTriggerOnly(db, sessionId);
+    return null;
+  }
+  const lastReadAt = getNoteLastReadAt(db, sessionId);
+  if (lastReadAt > 0 && noteReadStillVisible) {
+    const mostRecentNoteActivity = maxNoteActivityTime([...notes, ...readySmartNotes]);
+    if (mostRecentNoteActivity > 0 && lastReadAt > mostRecentNoteActivity) {
+      sessionLog(sessionId, `note-nudge: suppressing — agent ran ctx_note(read) at ${new Date(lastReadAt).toISOString()} and the read is still visible; no new notes since ${new Date(mostRecentNoteActivity).toISOString()}`);
+      clearNoteNudgeTriggerOnly(db, sessionId);
+      return null;
+    }
+  }
+  const parts = [];
+  if (notes.length > 0) {
+    parts.push(`${notes.length} deferred note${notes.length === 1 ? "" : "s"}`);
+  }
+  if (readySmartNotes.length > 0) {
+    parts.push(`${readySmartNotes.length} ready smart note${readySmartNotes.length === 1 ? "" : "s"}`);
+  }
+  sessionLog(sessionId, `note-nudge: delivering nudge for ${parts.join(" and ")}`);
+  return `You have ${parts.join(" and ")}. Review with ctx_note read — some may be actionable now.`;
+}
+function maxNoteActivityTime(notes) {
+  let max = 0;
+  for (const note of notes) {
+    if (note.updatedAt > max)
+      max = note.updatedAt;
+    if (note.readyAt !== null && note.readyAt > max)
+      max = note.readyAt;
+  }
+  return max;
+}
+function markNoteNudgeDelivered(db, sessionId, text, messageId) {
+  if (!messageId) {
+    clearNoteNudgeTriggerAndCooldown(db, sessionId);
+    sessionLog(sessionId, "note-nudge: marked delivered without anchor");
+    return { ok: true, kind: "already-present" };
+  }
+  const outcome = deliverNoteNudgeAtomic(db, sessionId, messageId, text);
+  if (outcome.ok) {
+    recordNoteNudgeDeliveryTime(sessionId);
+  }
+  sessionLog(sessionId, outcome.ok ? `note-nudge: marked delivered, sticky anchor=${messageId} (${outcome.kind})` : `note-nudge: delivery not persisted for anchor=${messageId} (${outcome.kind})`);
+  return outcome;
+}
+function clearNoteNudgeTriggerAndCooldown(db, sessionId) {
+  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
+  lastDeliveredAt.delete(sessionId);
+}
+function clearNoteNudgeTriggerOnly(db, sessionId) {
+  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
+}
+
+// src/agent/outbox.ts
+var ADAPTER_META_KEY = "adapter_schema";
+var ADAPTER_SCHEMA_VERSION = "1";
+var OUTBOX_COLUMNS = "op_id, session_id, kind, source_watermark, input_digest, generation, status, dsh_ack_seq, error_detail, created_at, updated_at";
+function toRecord(row) {
+  return {
+    opId: row.op_id,
+    sessionId: row.session_id,
+    kind: row.kind,
+    sourceWatermark: row.source_watermark,
+    inputDigest: row.input_digest,
+    generation: row.generation,
+    status: row.status,
+    ackSeq: row.dsh_ack_seq,
+    errorDetail: row.error_detail,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+function initializeDshAdapterTables(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dsh_context_outbox (
+      op_id            TEXT PRIMARY KEY,
+      session_id       TEXT NOT NULL,
+      harness          TEXT NOT NULL DEFAULT 'dsh',
+      kind             TEXT NOT NULL,
+      source_watermark INTEGER NOT NULL,
+      input_digest     TEXT NOT NULL,
+      generation       INTEGER NOT NULL,
+      status           TEXT NOT NULL DEFAULT 'pending',
+      dsh_ack_seq      INTEGER,
+      error_detail     TEXT,
+      created_at       INTEGER NOT NULL,
+      updated_at       INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_dsh_outbox_session
+      ON dsh_context_outbox(session_id, status);
+
+    CREATE TABLE IF NOT EXISTS dsh_adapter_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS dsh_context_compaction_marker (
+      session_id     TEXT PRIMARY KEY,
+      ordinal        INTEGER NOT NULL,
+      end_message_id TEXT NOT NULL,
+      tokens_before  INTEGER NOT NULL,
+      summary        TEXT NOT NULL,
+      published_at   INTEGER NOT NULL,
+      status         TEXT NOT NULL DEFAULT 'pending'
+    );
+
+    CREATE TABLE IF NOT EXISTS dsh_feedback_signals (
+      session_id  TEXT NOT NULL,
+      message_id  TEXT NOT NULL,
+      rated_at    INTEGER NOT NULL,
+      rating      TEXT NOT NULL DEFAULT 'negative',
+      PRIMARY KEY (session_id, message_id)
+    );
+  `);
+  db.prepare(`INSERT INTO dsh_adapter_meta (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(ADAPTER_META_KEY, ADAPTER_SCHEMA_VERSION);
+}
+function insertOutboxPending(db, input) {
+  const now = Date.now();
+  db.transaction(() => {
+    db.prepare(`INSERT OR IGNORE INTO dsh_context_outbox
+         (op_id, session_id, kind, source_watermark, input_digest, generation, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(input.opId, input.sessionId, input.kind, input.sourceWatermark, input.inputDigest, input.generation, now, now);
+  })();
+}
+function markOutboxApplied(db, opId, ackSeq) {
+  db.transaction(() => {
+    db.prepare(`UPDATE dsh_context_outbox
+         SET status = 'applied', dsh_ack_seq = ?, updated_at = ?
+       WHERE op_id = ?`).run(ackSeq, Date.now(), opId);
+  })();
+}
+function markOutboxCommitted(db, opId) {
+  db.transaction(() => {
+    db.prepare(`UPDATE dsh_context_outbox
+         SET status = 'committed', updated_at = ?
+       WHERE op_id = ?`).run(Date.now(), opId);
+  })();
+}
+function markOutboxAbandoned(db, opId, errorDetail) {
+  db.transaction(() => {
+    db.prepare(`UPDATE dsh_context_outbox
+         SET status = 'abandoned', error_detail = ?, updated_at = ?
+       WHERE op_id = ?`).run(errorDetail ?? null, Date.now(), opId);
+  })();
+}
+function getOutboxRecord(db, opId) {
+  const row = db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM dsh_context_outbox WHERE op_id = ?`).get(opId);
+  return row === undefined || row === null ? undefined : toRecord(row);
+}
+function listOutboxBySession(db, sessionId, statuses) {
+  if (statuses === undefined || statuses.length === 0) {
+    const rows2 = db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM dsh_context_outbox
+         WHERE session_id = ? ORDER BY created_at ASC, op_id ASC`).all(sessionId);
+    return rows2.map(toRecord);
+  }
+  const placeholders4 = statuses.map(() => "?").join(", ");
+  const rows = db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM dsh_context_outbox
+       WHERE session_id = ? AND status IN (${placeholders4})
+       ORDER BY created_at ASC, op_id ASC`).all(sessionId, ...statuses);
+  return rows.map(toRecord);
+}
+function classifyOutboxRecord(record2, sessionLog2, options = {}) {
+  if (record2.status === "committed")
+    return "committed";
+  if (record2.status === "abandoned")
+    return "stale-input";
+  if (record2.ackSeq !== null && sessionLog2.hasSeq(record2.ackSeq))
+    return "committed";
+  if (options.digestMismatch === true)
+    return "conflict-recompute";
+  if (sessionLog2.generation !== record2.generation)
+    return "stale-input";
+  return "retryable";
+}
+function reconcileSessionOutbox(db, sessionId, sessionLog2) {
+  const outcomes = {};
+  const records = listOutboxBySession(db, sessionId, ["pending", "applied"]);
+  for (const record2 of records) {
+    const outcome = classifyOutboxRecord(record2, sessionLog2);
+    outcomes[record2.opId] = outcome;
+    if (outcome === "committed") {
+      markOutboxCommitted(db, record2.opId);
+    } else if (outcome === "stale-input" || outcome === "conflict-recompute") {
+      markOutboxAbandoned(db, record2.opId, `reconcile: ${outcome}`);
+    }
+  }
+  return outcomes;
+}
+function stageDshCompactionMarker(db, sessionId, marker) {
+  db.transaction(() => {
+    db.prepare(`INSERT OR REPLACE INTO dsh_context_compaction_marker
+         (session_id, ordinal, end_message_id, tokens_before, summary, published_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending')`).run(sessionId, marker.ordinal, marker.endMessageId, marker.tokensBefore, marker.summary, Date.now());
+  })();
+}
+
+// src/agent/historian.ts
+var HISTORIAN_WINDOW_FALLBACK = 128000;
+var DEFAULT_HISTORIAN_CHUNK_TOKENS = 16000;
+var DEFAULT_LEASE_HOLDER_PREFIX = "dsh-historian";
+var deferredSignalsBySession = new Map;
+function signalDshDeferredHistoryRefresh(sessionId) {
+  const current = deferredSignalsBySession.get(sessionId) ?? { historyRefresh: false, materialization: false };
+  current.historyRefresh = true;
+  deferredSignalsBySession.set(sessionId, current);
+}
+function signalDshDeferredMaterialization(sessionId) {
+  const current = deferredSignalsBySession.get(sessionId) ?? { historyRefresh: false, materialization: false };
+  current.materialization = true;
+  deferredSignalsBySession.set(sessionId, current);
+}
+function consumeDshDeferredSignals(sessionId) {
+  const current = deferredSignalsBySession.get(sessionId) ?? { historyRefresh: false, materialization: false };
+  deferredSignalsBySession.delete(sessionId);
+  return current;
+}
+function checkDshCompartmentTrigger(inputs, meta3) {
+  const threshold = Number.isFinite(inputs.executeThresholdPercentage) ? Math.max(0, inputs.executeThresholdPercentage) : 65;
+  const budget = Number.isFinite(inputs.triggerBudget) ? Math.max(0, inputs.triggerBudget) : 0;
+  if (budget <= 0)
+    return false;
+  const percentage = meta3.lastContextPercentage;
+  if (typeof percentage !== "number" || !Number.isFinite(percentage))
+    return false;
+  const proactiveFloor = getProactiveCompartmentTriggerPercentage(threshold);
+  return percentage >= proactiveFloor;
+}
+async function runHistorianPassCore(args) {
+  const { db, sessionId, provider: provider2, summarize } = args;
+  const log2 = args.log;
+  const priorCompartments = getCompartments(db, sessionId);
+  const existingValidationError = validateStoredCompartments(priorCompartments);
+  if (existingValidationError) {
+    return {
+      ok: false,
+      status: "failed",
+      reason: `existing compartment state invalid: ${existingValidationError}`
+    };
+  }
+  const offset = priorCompartments.length > 0 ? priorCompartments[priorCompartments.length - 1].endMessage + 1 : 1;
+  const rangeOverride = args.eligibleEndOrdinalOverride !== undefined && args.eligibleEndOrdinalOverride > 0 ? args.eligibleEndOrdinalOverride : null;
+  let eligibleEndOrdinal;
+  if (rangeOverride !== null && args.boundarySnapshot === undefined) {
+    eligibleEndOrdinal = rangeOverride;
+  } else {
+    let boundary = args.boundarySnapshot ?? createDefaultBoundarySnapshotForTests(sessionId);
+    let boundaryOk = true;
+    let boundaryDetail;
+    if (boundary.rawRangeFingerprint.length > 0) {
+      const validation = validateBoundarySnapshot({
+        db,
+        snapshot: boundary,
+        currentContextLimit: args.currentContextLimit ?? boundary.contextLimit
+      });
+      if (!validation.ok && validation.reason === "stale_snapshot" && args.refreshBoundarySnapshot) {
+        try {
+          const refreshed = args.refreshBoundarySnapshot();
+          if (hasRunnableCompartmentWindow(refreshed)) {
+            log2(`[magic-context] historian: refreshed stale protected-tail snapshot at run time (${validation.detail ?? "stale"})`);
+            boundary = refreshed;
+          }
+        } catch (error51) {
+          log2(`[magic-context] historian: boundary refresh failed: ${describeError(error51).brief}`);
+        }
+      }
+      const finalValidation = validateBoundarySnapshot({
+        db,
+        snapshot: boundary,
+        currentContextLimit: args.currentContextLimit ?? boundary.contextLimit
+      });
+      if (!finalValidation.ok) {
+        boundaryOk = false;
+        boundaryDetail = finalValidation.detail ?? finalValidation.reason ?? "unknown";
+      }
+    }
+    if (!boundaryOk) {
+      return { ok: false, status: "noop", reason: `stale protected-tail snapshot (${boundaryDetail})` };
+    }
+    eligibleEndOrdinal = Math.min(boundary.eligibleEndOrdinal, boundary.protectedTailStart, rangeOverride ?? Number.MAX_SAFE_INTEGER);
+  }
+  if (eligibleEndOrdinal <= offset) {
+    return { ok: false, status: "noop", reason: `nothing to compact (eligibleEnd=${eligibleEndOrdinal} <= offset=${offset})` };
+  }
+  const historianWindow = resolveHistorianContextLimit(args.model);
+  const resolvedWindow = historianWindow > 0 ? historianWindow : typeof args.currentContextLimit === "number" && args.currentContextLimit > 0 ? args.currentContextLimit : HISTORIAN_WINDOW_FALLBACK;
+  const derived = deriveHistorianChunkTokens(resolvedWindow);
+  const chunkTokens = args.chunkTokens ?? derived ?? DEFAULT_HISTORIAN_CHUNK_TOKENS;
+  const chunk = readSessionChunk(sessionId, chunkTokens, offset, eligibleEndOrdinal);
+  if (!chunk.text || chunk.messageCount === 0) {
+    return { ok: false, status: "noop", reason: "chunk empty after filtering" };
+  }
+  const chunkCoverageError = validateChunkCoverage(chunk);
+  if (chunkCoverageError) {
+    return { ok: false, status: "failed", reason: `chunk coverage: ${chunkCoverageError}` };
+  }
+  let text;
+  try {
+    text = await summarize(chunk, priorCompartments, args.signal);
+  } catch (error51) {
+    return { ok: false, status: "failed", reason: `llm call failed: ${describeError(error51).brief}` };
+  }
+  if (typeof text !== "string" || text.trim().length === 0) {
+    return { ok: false, status: "failed", reason: "historian returned no usable text" };
+  }
+  const maxExistingSequence = priorCompartments.reduce((max, c) => Math.max(max, c.sequence), -1);
+  const sequenceOffset = priorCompartments.length === 0 ? 0 : maxExistingSequence + 1;
+  const validated = validateHistorianOutput(text, sessionId, chunk, priorCompartments, sequenceOffset);
+  if (!validated.ok) {
+    return { ok: false, status: "failed", reason: validated.error };
+  }
+  let newCompartments = validated.compartments;
+  let discardedLast = false;
+  const inEmergency = getOverflowState(db, sessionId).needsEmergencyRecovery;
+  if (!args.keepLastCompartment && !inEmergency && shouldDiscardLastHistorianCompartment(newCompartments, chunk)) {
+    const lastEmitted = newCompartments[newCompartments.length - 1];
+    newCompartments = newCompartments.slice(0, -1);
+    discardedLast = true;
+    log2(`[magic-context] historian discard-last: dropped provisional compartment ${lastEmitted.startMessage}-${lastEmitted.endMessage} (lookaheadMargin=${chunk.endIndex - lastEmitted.endMessage}); will re-derive next run`);
+  }
+  const lastNewEnd = newCompartments[newCompartments.length - 1]?.endMessage ?? 0;
+  if (lastNewEnd + 1 <= offset) {
+    return {
+      ok: false,
+      status: "failed",
+      reason: `historian returned compartments that did not advance past raw message ${offset - 1}`
+    };
+  }
+  return {
+    ok: true,
+    status: "success",
+    chunk,
+    newCompartments,
+    lastNewEnd,
+    lastNewEndMessageId: newCompartments[newCompartments.length - 1]?.endMessageId ?? null,
+    discardedLast,
+    validated,
+    llmText: text
+  };
+}
+function publishHistorianResult(args) {
+  const { db, sessionId, leaseHolderId } = args;
+  const lastNewEndMessageId = args.newCompartments[args.newCompartments.length - 1]?.endMessageId;
+  const markerSummary = buildDshCompactionSummary(args.newCompartments);
+  const projectPath = args.directory ?? null;
+  const promotionActive = projectPath !== null;
+  const publishableEvents = (args.validated.events ?? []).filter((event) => {
+    if (typeof event.atCompartment !== "number")
+      return true;
+    return event.atCompartment <= args.newCompartments.length;
+  });
+  let published = false;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!isCompartmentLeaseHeld(db, sessionId, leaseHolderId)) {
+      db.exec("ROLLBACK");
+      published = true;
+      return { ok: false, persistedIds: [], eventsPublished: 0 };
+    }
+    appendCompartments(db, sessionId, args.newCompartments);
+    const persistedIds = getCompartments(db, sessionId).slice(-args.newCompartments.length).map((c) => c.id);
+    if (promotionActive) {
+      promoteSessionFactsDurable(db, sessionId, projectPath, args.validated.facts ?? []);
+    }
+    let eventsPublished = 0;
+    if (publishableEvents.length > 0) {
+      try {
+        insertCompartmentEvents(db, sessionId, publishableEvents, persistedIds);
+        eventsPublished = publishableEvents.length;
+      } catch (error51) {
+        args.log(`[magic-context] failed to store compartment events: ${describeError(error51).brief}`);
+      }
+    }
+    queueDropsForCompartmentalizedMessages(db, sessionId, args.lastNewEnd);
+    recordProtectedTailPublicationFloor(db, sessionId, args.lastNewEnd + 1);
+    if (lastNewEndMessageId) {
+      stageDshCompactionMarker(db, sessionId, {
+        ordinal: args.lastNewEnd,
+        endMessageId: lastNewEndMessageId,
+        tokensBefore: args.chunk.tokenEstimate,
+        summary: markerSummary
+      });
+    }
+    db.exec("COMMIT");
+    published = true;
+    return { ok: true, persistedIds, eventsPublished };
+  } finally {
+    if (!published) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
+function buildDshCompactionSummary(compartments) {
+  if (compartments.length === 0)
+    return "Magic Context compacted prior history.";
+  const titles = compartments.map((c) => c.title.trim()).filter((title) => title.length > 0);
+  if (titles.length === 0) {
+    const first = compartments[0];
+    const last = compartments[compartments.length - 1];
+    return `Magic Context compacted messages ${first?.startMessage ?? "?"}-${last?.endMessage ?? "?"}.`;
+  }
+  const MAX_SUMMARY_TITLES = 5;
+  if (titles.length <= MAX_SUMMARY_TITLES) {
+    return `Magic Context compacted: ${titles.join("; ")}`;
+  }
+  const shown = titles.slice(0, MAX_SUMMARY_TITLES).join("; ");
+  return `Magic Context compacted ${titles.length} segments: ${shown}; …and ${titles.length - MAX_SUMMARY_TITLES} more`;
+}
+async function runDshHistorian(deps) {
+  const { db, sessionId } = deps;
+  const log2 = deps.log ?? (() => {});
+  const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
+  if (typeof deps.summarize !== "function") {
+    log2(`[magic-context] historian: missing summarize call for ${sessionId}`);
+    return false;
+  }
+  const lease = acquireCompartmentLease(db, sessionId, holderId);
+  if (lease === null) {
+    log2(`[magic-context] historian: compartment lease busy for ${sessionId}`);
+    return false;
+  }
+  const telemetry = { runKind: "incremental", status: "failed" };
+  let completedSuccessfully = false;
+  try {
+    await withRawMessageProvider(sessionId, deps.provider, async () => {
+      updateSessionMeta(db, sessionId, { compartmentInProgress: true });
+      const result = await runHistorianPassCore({
+        db,
+        sessionId,
+        provider: deps.provider,
+        summarize: deps.summarize,
+        directory: deps.directory,
+        chunkTokens: deps.chunkTokens,
+        model: deps.model,
+        boundarySnapshot: deps.boundarySnapshot,
+        refreshBoundarySnapshot: deps.refreshBoundarySnapshot,
+        currentContextLimit: deps.currentContextLimit,
+        leaseHolderId: holderId,
+        log: log2,
+        signal: deps.signal
+      });
+      if (!result.ok) {
+        telemetry.status = result.status === "noop" ? "noop" : "failed";
+        telemetry.failureReason = result.reason ?? null;
+        telemetry.chunkStartOrdinal = result.chunk?.startIndex ?? null;
+        telemetry.chunkEndOrdinal = result.chunk?.endIndex ?? null;
+        if (result.status === "failed") {
+          const reason = result.reason ?? "unknown";
+          log2(`[magic-context] historian failure: ${reason}`);
+          try {
+            deps.notifyIssue?.(buildHistorianFailureNotice(1, reason));
+          } catch (error51) {
+            log2(`[magic-context] historian notify failed: ${describeError(error51).brief}`);
+          }
+        }
+        return;
+      }
+      const publish = publishHistorianResult({
+        db,
+        sessionId,
+        directory: deps.directory,
+        leaseHolderId: holderId,
+        chunk: result.chunk,
+        newCompartments: result.newCompartments,
+        lastNewEnd: result.lastNewEnd,
+        validated: result.validated,
+        log: log2
+      });
+      if (!publish.ok) {
+        telemetry.failureReason = "publish failed (lease lost or transaction error)";
+        return;
+      }
+      completedSuccessfully = true;
+      telemetry.status = "success";
+      telemetry.chunkStartOrdinal = result.chunk.startIndex;
+      telemetry.chunkEndOrdinal = result.chunk.endIndex;
+      telemetry.unprocessedFrom = result.lastNewEnd + 1;
+      telemetry.compartmentsProduced = result.newCompartments.length;
+      const validIds = publish.persistedIds.filter((id) => typeof id === "number");
+      telemetry.compartmentIdMin = validIds.length > 0 ? Math.min(...validIds) : null;
+      telemetry.compartmentIdMax = validIds.length > 0 ? Math.max(...validIds) : null;
+      const facts = result.validated.facts ?? [];
+      telemetry.factsEmitted = facts.length;
+      telemetry.factsByCategory = facts.length > 0 ? tallyFactsByCategory(facts) : null;
+      telemetry.eventsEmitted = publish.eventsPublished;
+      const imp = summarizeImportance(result.newCompartments.map((c) => c.importance ?? 50));
+      telemetry.importanceMin = imp.min;
+      telemetry.importanceMax = imp.max;
+      telemetry.importanceAvg = imp.avg;
+      telemetry.discardedLast = result.discardedLast === true;
+      deps.onPublished?.();
+      try {
+        onNoteTrigger(deps.db, deps.sessionId, "historian_complete");
+      } catch {}
+      log2(`[magic-context] historian: published ${result.newCompartments.length} compartment(s), ${facts.length} fact(s) covering messages ${result.chunk.startIndex}-${result.lastNewEnd}`);
+    });
+  } catch (error51) {
+    const desc = describeError(error51);
+    telemetry.failureReason = `exception: ${desc.brief}`;
+    log2(`[magic-context] historian failure: source=exception ${desc.brief}`);
+    try {
+      deps.notifyIssue?.(buildHistorianFailureNotice(1, desc.brief));
+    } catch {}
+  } finally {
+    try {
+      releaseCompartmentLease(db, sessionId, holderId);
+    } catch (error51) {
+      log2(`[magic-context] historian lease release failed: ${describeError(error51).brief}`);
+    }
+    try {
+      updateSessionMeta(db, sessionId, { compartmentInProgress: false });
+    } catch (error51) {
+      log2(`[magic-context] historian meta update failed: ${describeError(error51).brief}`);
+    }
+    try {
+      recordHistorianRun(db, {
+        sessionId,
+        harness: "dsh",
+        runKind: telemetry.runKind ?? "incremental",
+        status: telemetry.status ?? "failed",
+        failureReason: telemetry.failureReason ?? null,
+        chunkStartOrdinal: telemetry.chunkStartOrdinal ?? null,
+        chunkEndOrdinal: telemetry.chunkEndOrdinal ?? null,
+        unprocessedFrom: telemetry.unprocessedFrom ?? null,
+        compartmentsProduced: telemetry.compartmentsProduced ?? 0,
+        compartmentIdMin: telemetry.compartmentIdMin ?? null,
+        compartmentIdMax: telemetry.compartmentIdMax ?? null,
+        factsEmitted: telemetry.factsEmitted ?? 0,
+        factsByCategory: telemetry.factsByCategory ?? null,
+        eventsEmitted: telemetry.eventsEmitted ?? 0,
+        importanceMin: telemetry.importanceMin ?? null,
+        importanceMax: telemetry.importanceMax ?? null,
+        importanceAvg: telemetry.importanceAvg ?? null,
+        discardedLast: telemetry.discardedLast ?? false
+      });
+    } catch {}
+  }
+  return completedSuccessfully;
+}
+function defaultResolveModel(agent) {
+  const options = agent.options;
+  return {
+    provider: options.provider ?? "dsh",
+    model: options.model ?? "unknown"
+  };
+}
+function createMagicSummarizeHook(deps) {
+  const sessionId = deps.sessionId;
+  const log2 = deps.log ?? (() => {});
+  const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
+  return async (input, agent, signal) => {
+    const { provider: provider2, model } = (deps.resolveModel ?? defaultResolveModel)(agent);
+    const messages = input.messages;
+    const emptyResult = {
+      summary: [{ type: "text", text: "Magic Context compacted prior history." }],
+      provider: provider2,
+      model
+    };
+    if (messages.length === 0)
+      return emptyResult;
+    const firstId = String(messages[0].id);
+    const lastId = String(messages[messages.length - 1].id);
+    return withRawMessageProvider(sessionId, deps.provider, async () => {
+      const firstOrdinal = readRawSessionMessageOrdinalById(sessionId, firstId);
+      const lastOrdinal = readRawSessionMessageOrdinalById(sessionId, lastId);
+      if (firstOrdinal === null || lastOrdinal === null || lastOrdinal < firstOrdinal) {
+        throw new Error(`magic-context: summarize range unresolvable for ${sessionId} (messages ${firstId}..${lastId})`);
+      }
+      const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, sessionId);
+      let rawOutput;
+      if (lastCompartmentEnd < lastOrdinal) {
+        const lease = acquireCompartmentLease(deps.db, sessionId, holderId);
+        if (lease === null) {
+          throw new Error(`magic-context: summarize mini-historian lease busy for ${sessionId} (another historian pass is running)`);
+        }
+        try {
+          const result = await runHistorianPassCore({
+            db: deps.db,
+            sessionId,
+            provider: deps.provider,
+            summarize: deps.summarize,
+            directory: deps.directory,
+            chunkTokens: deps.chunkTokens,
+            leaseHolderId: holderId,
+            log: log2,
+            signal,
+            eligibleEndOrdinalOverride: lastOrdinal + 1,
+            keepLastCompartment: true
+          });
+          if (!result.ok) {
+            throw new Error(`magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`);
+          }
+          const publish = publishHistorianResult({
+            db: deps.db,
+            sessionId,
+            directory: deps.directory,
+            leaseHolderId: holderId,
+            chunk: result.chunk,
+            newCompartments: result.newCompartments,
+            lastNewEnd: result.lastNewEnd,
+            validated: result.validated,
+            log: log2
+          });
+          if (!publish.ok) {
+            throw new Error("magic-context: summarize mini-historian publish failed (lease lost or transaction error)");
+          }
+          rawOutput = result.llmText ?? undefined;
+        } finally {
+          try {
+            releaseCompartmentLease(deps.db, sessionId, holderId);
+          } catch (error51) {
+            log2(`[magic-context] summarize mini-historian lease release failed: ${describeError(error51).brief}`);
+          }
+        }
+      }
+      const compartments = getCompartments(deps.db, sessionId).filter((c) => c.endMessage >= firstOrdinal && c.startMessage <= lastOrdinal);
+      const facts = getSessionFacts(deps.db, sessionId);
+      const text = buildCompartmentBlock(compartments, facts);
+      if (text.length === 0) {
+        throw new Error(`magic-context: summarize produced no compartment content for ${sessionId} range ${firstOrdinal}-${lastOrdinal}`);
+      }
+      return {
+        summary: [{ type: "text", text }],
+        provider: provider2,
+        model,
+        ...rawOutput !== undefined ? { rawOutput: [{ type: "text", text: rawOutput }] } : {}
+      };
+    });
+  };
 }
 
 // ../plugin/src/features/magic-context/scheduler.ts
@@ -37350,7 +39492,7 @@ function computeHardSignals(deps, meta3, agent) {
   }
   return { systemHash, modelKey, cacheExpired, lastResponseTime: meta3.lastResponseTime };
 }
-function materializeKnowledgeBlocks(deps, db, magicSessionId, projectPath, directory, agent) {
+function materializeKnowledgeBlocks(deps, db, magicSessionId, projectPath, directory, agent, forceMaterialize = false) {
   const meta3 = getOrCreateSessionMeta(db, magicSessionId);
   const state = meta3;
   const hardSignals = computeHardSignals(deps, meta3, agent);
@@ -37361,14 +39503,14 @@ function materializeKnowledgeBlocks(deps, db, magicSessionId, projectPath, direc
     projectPath,
     projectDirectory: directory ?? "",
     injectDocs: deps.config.injectDocs ?? true,
-    compactionOff: deps.config.compactionOff ?? true,
+    compactionOff: deps.config.compactionOff ?? false,
     memoryInjectionBudgetTokens: deps.config.memoryInjectionBudgetTokens,
     historyBudgetTokens: deps.config.historyBudgetTokens,
     userProfileBudgetTokens: deps.config.userProfileBudgetTokens,
     muralEnabled: deps.config.muralEnabled ?? false,
     hardSignals
   };
-  const decision = mustMaterialize({
+  const decision = forceMaterialize ? { value: true, reason: "deferred_materialization" } : mustMaterialize({
     db,
     sessionId: magicSessionId,
     state,
@@ -37434,13 +39576,13 @@ function isMagicWatermarkOnSurface(session, watermark) {
   }
   return false;
 }
-async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory) {
+async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, forceMaterialize = false) {
   if (deps.config.enabled === false)
     return;
   const generation = agent.session.surface.replaceGeneration;
   if (state.injectedGenerations.get(magicSessionId) === generation)
     return;
-  const blocks = materializeKnowledgeBlocks(deps, db, magicSessionId, projectPath, directory, agent);
+  const blocks = materializeKnowledgeBlocks(deps, db, magicSessionId, projectPath, directory, agent, forceMaterialize);
   if (blocks === null)
     return;
   if (isMagicWatermarkOnSurface(agent.session, blocks.watermark)) {
@@ -37531,7 +39673,8 @@ async function runKnowledgeGateStep(state, deps, payload, next) {
       const directory = sessionProjectPath(agent, deps.config.directory);
       const projectPath = resolveKnowledgeProjectPath(directory);
       trackSessionProjectOnce(state.trackedSessions, db, magicSessionId, projectPath);
-      await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory);
+      const deferred = consumeDshDeferredSignals(magicSessionId);
+      await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory, deferred.materialization);
       if (state.lastInjectedMessages.length > 0) {
         const injected = state.lastInjectedMessages;
         state.lastInjectedMessages = [];
@@ -37821,7 +39964,7 @@ Two recovery modes for finer detail:
 var CTX_EXPAND_TOKEN_BUDGET = 15000;
 
 // ../plugin/src/tools/ctx-expand/render.ts
-function isRecord2(value) {
+function isRecord3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function roleLabel(role) {
@@ -37850,15 +39993,15 @@ function keyArg(input) {
 function asToolPart(part) {
   const type = typeof part.type === "string" ? part.type : "";
   if (type === "tool") {
-    const state = isRecord2(part.state) ? part.state : null;
+    const state = isRecord3(part.state) ? part.state : null;
     const output = state && typeof state.output === "string" ? state.output : state && state.output != null ? JSON.stringify(state.output) : null;
-    const metadata = state && isRecord2(state.metadata) ? state.metadata : null;
+    const metadata = state && isRecord3(state.metadata) ? state.metadata : null;
     const title = state && typeof state.title === "string" && state.title || metadata && typeof metadata.title === "string" && metadata.title || null;
     return {
       name: typeof part.tool === "string" ? part.tool : "tool",
       callId: typeof part.callID === "string" ? part.callID : "",
       title,
-      input: state && isRecord2(state.input) ? state.input : null,
+      input: state && isRecord3(state.input) ? state.input : null,
       output
     };
   }
@@ -37867,7 +40010,7 @@ function asToolPart(part) {
       name: typeof part.name === "string" ? part.name : "tool",
       callId: typeof part.id === "string" ? part.id : "",
       title: null,
-      input: isRecord2(part.input) ? part.input : null,
+      input: isRecord3(part.input) ? part.input : null,
       output: null
     };
   }
@@ -37896,7 +40039,7 @@ function reasoningOf(part) {
   return null;
 }
 function renderPartPreview(part) {
-  if (!isRecord2(part))
+  if (!isRecord3(part))
     return null;
   const text = textOf(part);
   if (text !== null) {
@@ -37920,7 +40063,7 @@ function renderPartPreview(part) {
   return `    • [${type}]`;
 }
 function renderPartFull(part) {
-  if (!isRecord2(part))
+  if (!isRecord3(part))
     return null;
   const text = textOf(part);
   if (text !== null) {
@@ -38064,95 +40207,6 @@ Picking sources:
 - "did we discuss this earlier" → ["message"]
 - "did we decide something about this / leave a follow-up" → ["note"]
 - "what's our convention / rule for X" → ["memory"]`;
-
-// ../plugin/src/hooks/magic-context/note-nudger.ts
-var NOTE_NUDGE_COOLDOWN_MS = 15 * 60 * 1000;
-var lastDeliveredAt = new Map;
-function getPersistedNoteNudgeDeliveredAt(_db, sessionId) {
-  return lastDeliveredAt.get(sessionId) ?? 0;
-}
-function recordNoteNudgeDeliveryTime(sessionId) {
-  lastDeliveredAt.set(sessionId, Date.now());
-}
-function onNoteTrigger(db, sessionId, trigger) {
-  setPersistedNoteNudgeTrigger(db, sessionId);
-  sessionLog(sessionId, `note-nudge: trigger fired (${trigger}), triggerPending=true`);
-}
-function peekNoteNudgeText(db, sessionId, currentUserMessageId, projectIdentity, noteReadStillVisible) {
-  const state = getPersistedNoteNudge(db, sessionId);
-  if (!state.triggerPending)
-    return null;
-  if (!state.triggerMessageId && currentUserMessageId) {
-    setPersistedNoteNudgeTriggerMessageId(db, sessionId, currentUserMessageId);
-    state.triggerMessageId = currentUserMessageId;
-  }
-  if (state.triggerMessageId && currentUserMessageId && state.triggerMessageId === currentUserMessageId) {
-    sessionLog(sessionId, `note-nudge: deferring — current user message ${currentUserMessageId} is same as trigger-time message`);
-    return null;
-  }
-  const deliveredAt = getPersistedNoteNudgeDeliveredAt(db, sessionId);
-  if (deliveredAt > 0 && Date.now() - deliveredAt < NOTE_NUDGE_COOLDOWN_MS) {
-    sessionLog(sessionId, `note-nudge: suppressing — last delivered ${Math.round((Date.now() - deliveredAt) / 1000)}s ago (cooldown ${NOTE_NUDGE_COOLDOWN_MS / 60000}m)`);
-    clearNoteNudgeTriggerOnly(db, sessionId);
-    return null;
-  }
-  const notes = getSessionNotes(db, sessionId);
-  const readySmartNotes = projectIdentity ? getReadySmartNotes(db, projectIdentity) : [];
-  const totalCount = notes.length + readySmartNotes.length;
-  if (totalCount === 0) {
-    sessionLog(sessionId, "note-nudge: triggerPending but no notes found, skipping");
-    clearNoteNudgeTriggerOnly(db, sessionId);
-    return null;
-  }
-  const lastReadAt = getNoteLastReadAt(db, sessionId);
-  if (lastReadAt > 0 && noteReadStillVisible) {
-    const mostRecentNoteActivity = maxNoteActivityTime([...notes, ...readySmartNotes]);
-    if (mostRecentNoteActivity > 0 && lastReadAt > mostRecentNoteActivity) {
-      sessionLog(sessionId, `note-nudge: suppressing — agent ran ctx_note(read) at ${new Date(lastReadAt).toISOString()} and the read is still visible; no new notes since ${new Date(mostRecentNoteActivity).toISOString()}`);
-      clearNoteNudgeTriggerOnly(db, sessionId);
-      return null;
-    }
-  }
-  const parts = [];
-  if (notes.length > 0) {
-    parts.push(`${notes.length} deferred note${notes.length === 1 ? "" : "s"}`);
-  }
-  if (readySmartNotes.length > 0) {
-    parts.push(`${readySmartNotes.length} ready smart note${readySmartNotes.length === 1 ? "" : "s"}`);
-  }
-  sessionLog(sessionId, `note-nudge: delivering nudge for ${parts.join(" and ")}`);
-  return `You have ${parts.join(" and ")}. Review with ctx_note read — some may be actionable now.`;
-}
-function maxNoteActivityTime(notes) {
-  let max = 0;
-  for (const note of notes) {
-    if (note.updatedAt > max)
-      max = note.updatedAt;
-    if (note.readyAt !== null && note.readyAt > max)
-      max = note.readyAt;
-  }
-  return max;
-}
-function markNoteNudgeDelivered(db, sessionId, text, messageId) {
-  if (!messageId) {
-    clearNoteNudgeTriggerAndCooldown(db, sessionId);
-    sessionLog(sessionId, "note-nudge: marked delivered without anchor");
-    return { ok: true, kind: "already-present" };
-  }
-  const outcome = deliverNoteNudgeAtomic(db, sessionId, messageId, text);
-  if (outcome.ok) {
-    recordNoteNudgeDeliveryTime(sessionId);
-  }
-  sessionLog(sessionId, outcome.ok ? `note-nudge: marked delivered, sticky anchor=${messageId} (${outcome.kind})` : `note-nudge: delivery not persisted for anchor=${messageId} (${outcome.kind})`);
-  return outcome;
-}
-function clearNoteNudgeTriggerAndCooldown(db, sessionId) {
-  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
-  lastDeliveredAt.delete(sessionId);
-}
-function clearNoteNudgeTriggerOnly(db, sessionId) {
-  db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '' WHERE session_id = ?").run(sessionId);
-}
 
 // ../plugin/src/tools/unwrap-imitated-reduced-args.ts
 var MAX_DECODED_STRING_LENGTH = 1024 * 1024;
@@ -40201,7 +42255,7 @@ function getToolPartTokenCount(part, text) {
     return estimateTokens(text);
   const raw = part.rawByteSize?.();
   if (typeof raw === "number" && raw > 0) {
-    const record2 = isRecord3(part) ? part : undefined;
+    const record2 = isRecord4(part) ? part : undefined;
     const content = record2?.content ?? record2?.rawContent ?? record2?.rawPart ?? record2?.part ?? record2?.data ?? record2?.image ?? record2?.source;
     const serialized = safeJsonStringify(content ?? part);
     return serialized === undefined ? 0 : estimateTokens(serialized);
@@ -40221,7 +42275,7 @@ function getNonTextToolResultByteSize(part) {
   const raw = part.rawByteSize?.();
   if (typeof raw === "number" && raw > 0)
     return raw;
-  const record2 = isRecord3(part) ? part : undefined;
+  const record2 = isRecord4(part) ? part : undefined;
   const content = record2?.content ?? record2?.rawContent ?? record2?.rawPart ?? record2?.part ?? record2?.data ?? record2?.image ?? record2?.source;
   const serialized = safeJsonStringify(content ?? part);
   return serialized === undefined ? 0 : byteSize(serialized);
@@ -40233,7 +42287,7 @@ function safeJsonStringify(value) {
     return;
   }
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null;
 }
 function tagTextPart(args) {
@@ -40450,11 +42504,11 @@ function buildToolTarget(part, message, tagId) {
 }
 
 // src/agent/transcript.ts
-function isRecord4(value) {
+function isRecord5(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function asEvent(value) {
-  return isRecord4(value) ? value : null;
+  return isRecord5(value) ? value : null;
 }
 function seqOf(event) {
   return typeof event.seq === "number" ? event.seq : -1;
@@ -40463,7 +42517,7 @@ function timeOf(event) {
   return typeof event.time === "number" ? event.time : undefined;
 }
 function dataOf(event) {
-  return isRecord4(event.data) ? event.data : null;
+  return isRecord5(event.data) ? event.data : null;
 }
 function sha256Hex2(value) {
   return createHash17("sha256").update(value, "utf8").digest("hex");
@@ -40473,11 +42527,11 @@ function isSyntheticUserMessage(message) {
   return typeof message.id === "string" && message.id.startsWith(SYNTH_USER_ID_PREFIX);
 }
 function isKnowledgeMessage(message) {
-  const source = isRecord4(message.source) ? message.source : null;
+  const source = isRecord5(message.source) ? message.source : null;
   return source !== null && source.kind === "plugin" && source.plugin === "magic-context";
 }
 function isSkillCatalogMessage(message) {
-  const source = isRecord4(message.source) ? message.source : null;
+  const source = isRecord5(message.source) ? message.source : null;
   return source !== null && source.kind === "skill-catalog";
 }
 function parseToolArguments(raw) {
@@ -40485,7 +42539,7 @@ function parseToolArguments(raw) {
     return {};
   try {
     const parsed = JSON.parse(raw);
-    return isRecord4(parsed) ? parsed : {};
+    return isRecord5(parsed) ? parsed : {};
   } catch {
     return {};
   }
@@ -40495,7 +42549,7 @@ function userTextParts(content) {
     return [];
   const parts = [];
   for (const block of content) {
-    if (!isRecord4(block) || block.type !== "text" || typeof block.text !== "string")
+    if (!isRecord5(block) || block.type !== "text" || typeof block.text !== "string")
       continue;
     parts.push({ type: "text", text: block.text });
   }
@@ -40507,7 +42561,7 @@ function assistantParts(message, keepReasoning, toolNameByCallId) {
     return [];
   const parts = [];
   for (const block of content) {
-    if (!isRecord4(block))
+    if (!isRecord5(block))
       continue;
     if (block.type === "text" && typeof block.text === "string") {
       parts.push({ type: "text", text: block.text });
@@ -40531,13 +42585,13 @@ function assistantParts(message, keepReasoning, toolNameByCallId) {
 function toolResultParts(message, toolNameByCallId) {
   const content = Array.isArray(message.content) ? message.content : [];
   let callId;
-  const source = isRecord4(message.source) ? message.source : null;
+  const source = isRecord5(message.source) ? message.source : null;
   if (source && typeof source.callId === "string" && source.callId.length > 0) {
     callId = source.callId;
   }
   if (!callId) {
     for (const block of content) {
-      if (isRecord4(block) && block.type === "tool-result" && typeof block.toolCallId === "string" && block.toolCallId.length > 0) {
+      if (isRecord5(block) && block.type === "tool-result" && typeof block.toolCallId === "string" && block.toolCallId.length > 0) {
         callId = block.toolCallId;
         break;
       }
@@ -40547,13 +42601,13 @@ function toolResultParts(message, toolNameByCallId) {
     return [];
   const fragments = [];
   for (const block of content) {
-    if (!isRecord4(block) || block.type !== "tool-result")
+    if (!isRecord5(block) || block.type !== "tool-result")
       continue;
     const inner = block.content;
     if (!Array.isArray(inner))
       continue;
     for (const fragment of inner) {
-      if (isRecord4(fragment) && fragment.type === "text" && typeof fragment.text === "string") {
+      if (isRecord5(fragment) && fragment.type === "text" && typeof fragment.text === "string") {
         fragments.push(fragment.text);
       }
     }
@@ -40679,7 +42733,7 @@ function walkDshLog(events, surfaceNodes) {
       if (pendingParts.length > 0)
         flushSynthetic();
       const parts = assistantParts(record2, surfaceNodes !== null, toolNameByCallId);
-      const hasToolCalls = parts.some((part) => isRecord4(part) && part.type === "tool" && typeof part.callID === "string");
+      const hasToolCalls = parts.some((part) => isRecord5(part) && part.type === "tool" && typeof part.callID === "string");
       if (hasToolCalls) {
         pendingAssistant = {
           nodeIndex,
@@ -40815,7 +42869,7 @@ function classifyRecordingPart(raw) {
     case "thinking":
       return "thinking";
     case "tool": {
-      const state = isRecord4(raw.state) ? raw.state : null;
+      const state = isRecord5(raw.state) ? raw.state : null;
       return state !== null && state.output !== undefined ? "tool_result" : "tool_use";
     }
     case "image":
@@ -40838,7 +42892,7 @@ class RecordingPart {
   constructor(owner, partIndex, raw) {
     this.owner = owner;
     this.partIndex = partIndex;
-    this.raw = isRecord4(raw) ? raw : {};
+    this.raw = isRecord5(raw) ? raw : {};
     this.kind = classifyRecordingPart(this.raw);
     this.callId = typeof this.raw.callID === "string" ? this.raw.callID : undefined;
     this.toolName = typeof this.raw.tool === "string" ? this.raw.tool : undefined;
@@ -40849,8 +42903,8 @@ class RecordingPart {
   readInputState() {
     if (this.kind !== "tool_use" && this.kind !== "tool_result")
       return null;
-    const state = isRecord4(this.raw.state) ? this.raw.state : null;
-    return state !== null && isRecord4(state.input) ? state.input : null;
+    const state = isRecord5(this.raw.state) ? this.raw.state : null;
+    return state !== null && isRecord5(state.input) ? state.input : null;
   }
   initPayload() {
     if (this.kind === "text")
@@ -40862,7 +42916,7 @@ class RecordingPart {
     if (this.kind === "tool_use")
       return JSON.stringify(this.input ?? {});
     if (this.kind === "tool_result") {
-      const state = isRecord4(this.raw.state) ? this.raw.state : null;
+      const state = isRecord5(this.raw.state) ? this.raw.state : null;
       const output = state !== null ? state.output : undefined;
       if (typeof output === "string")
         return output;
@@ -41112,7 +43166,7 @@ function planTemporalMarkers(view) {
 }
 function hasTemporalMarker(message) {
   for (const part of message.parts) {
-    if (!isRecord4(part) || part.type !== "text" || typeof part.text !== "string")
+    if (!isRecord5(part) || part.type !== "text" || typeof part.text !== "string")
       continue;
     return TEMPORAL_MARKER_PATTERN.test(peelLeadingMcTagNotation(part.text).body);
   }
@@ -41121,7 +43175,7 @@ function hasTemporalMarker(message) {
 function isTemporalMarkerMessage(message) {
   let sawMarker = false;
   for (const part of message.parts) {
-    if (!isRecord4(part) || part.type !== "text")
+    if (!isRecord5(part) || part.type !== "text")
       continue;
     const text = typeof part.text === "string" ? part.text : "";
     if (text.trim().length === 0)
@@ -41156,7 +43210,7 @@ function planReasoningReplay(view, byMessageId, targets, db) {
       continue;
     const reasoningTexts = [];
     for (const part of message.parts) {
-      if (!isRecord4(part))
+      if (!isRecord5(part))
         continue;
       const type = part.type;
       if (type !== "reasoning" && type !== "thinking")
@@ -43417,644 +45471,6 @@ function formatThresholdClampNote(opts) {
   return ` [clamped: ${opts.configuredValue}% > ${opts.maxPercentage}%]`;
 }
 
-// ../plugin/src/hooks/magic-context/derive-budgets.ts
-var TRIGGER_BUDGET_PERCENTAGE = 0.05;
-var TRIGGER_BUDGET_MIN = 5000;
-var TRIGGER_BUDGET_MAX = 50000;
-function deriveTriggerBudget(mainContextLimit, executeThresholdPercentage) {
-  if (!Number.isFinite(mainContextLimit) || mainContextLimit <= 0) {
-    return TRIGGER_BUDGET_MIN;
-  }
-  const thresholdFraction = Math.max(0, executeThresholdPercentage) / 100;
-  const usable = mainContextLimit * thresholdFraction;
-  const derived = Math.round(usable * TRIGGER_BUDGET_PERCENTAGE);
-  return Math.max(TRIGGER_BUDGET_MIN, Math.min(TRIGGER_BUDGET_MAX, derived));
-}
-
-// ../plugin/src/hooks/magic-context/protected-tail-boundary.ts
-var ALPHA = 0.3;
-var FLOOR_RATIO = 0.08;
-var FLOOR_MIN = 2000;
-var FLOOR_MAX = 12000;
-var ABS_CAP = 96000;
-var MAX_USABLE_RATIO = 0.4;
-var RESERVED_HEADROOM_MIN = 1000;
-var RESERVED_HEADROOM_RATIO = 0.02;
-var NON_EMERGENCY_MAX_CAP = 250000;
-var FORCE80_MAX_CAP = 500000;
-var FORCE95_MAX_CAP = 750000;
-var NORMAL_HYSTERESIS_TOKENS = 256;
-var MIN_FORCE_ELIGIBLE_TOKENS_CAP = 1000;
-function deriveMinForceEligibleTokens(scaledN) {
-  return Math.min(MIN_FORCE_ELIGIBLE_TOKENS_CAP, Math.max(1, Math.floor(scaledN / 8)));
-}
-function clampPercentage(value) {
-  if (!Number.isFinite(value))
-    return 0;
-  return Math.max(0, Math.min(100, value));
-}
-function clampOrdinal(value, rawMessageCount) {
-  return Math.max(1, Math.min(rawMessageCount + 1, Math.floor(value)));
-}
-function deriveProtectedTailTokenTarget(args) {
-  const safeContextLimit = Number.isFinite(args.contextLimit) && args.contextLimit > 0 ? args.contextLimit : 128000;
-  const safeThreshold = Number.isFinite(args.executeThresholdPercentage) ? Math.max(0, args.executeThresholdPercentage) : 65;
-  const usable = Math.max(1, Math.round(safeContextLimit * safeThreshold / 100));
-  const usage = clampPercentage(args.usagePercentage);
-  const triggerBudget = args.triggerBudget ?? deriveTriggerBudget(safeContextLimit, safeThreshold);
-  const reserve = Math.max(RESERVED_HEADROOM_MIN, Math.round(usable * RESERVED_HEADROOM_RATIO));
-  const rawN = Math.round(usable * ALPHA * (1 - usage / 100));
-  const floorN = Math.min(FLOOR_MAX, Math.max(FLOOR_MIN, Math.round(usable * FLOOR_RATIO)));
-  const headroom = Math.min(triggerBudget + reserve, Math.floor(usable * 0.5));
-  const ceilingN = Math.max(1, Math.min(ABS_CAP, Math.floor(usable * MAX_USABLE_RATIO), usable - headroom));
-  const effectiveFloor = Math.min(floorN, ceilingN);
-  const N = Math.min(ceilingN, Math.max(effectiveFloor, rawN));
-  return { usable, rawN, floorN, ceilingN, effectiveFloor, N, headroom, triggerBudget, reserve };
-}
-function nonEmergencyPerRunCap(usable, N) {
-  return Math.min(NON_EMERGENCY_MAX_CAP, Math.max(2 * N, Math.min(Math.round(0.25 * usable), 1e5)));
-}
-function force80PerRunCap(usable, N) {
-  return Math.min(FORCE80_MAX_CAP, Math.max(3 * N, Math.min(Math.round(0.35 * usable), 150000)));
-}
-function force95PerRunCap(usable, N) {
-  return Math.min(FORCE95_MAX_CAP, Math.max(4 * N, Math.min(Math.round(0.5 * usable), 250000)));
-}
-function selectPerRunCap(snapshot) {
-  const usable = Math.max(1, Math.round(snapshot.contextLimit * snapshot.executeThresholdPercentage / 100));
-  if (snapshot.usagePercentage >= 95)
-    return force95PerRunCap(usable, snapshot.N);
-  if (snapshot.usagePercentage >= 80)
-    return force80PerRunCap(usable, snapshot.N);
-  return nonEmergencyPerRunCap(usable, snapshot.N);
-}
-function boundaryMessageId(index, ordinal) {
-  if (ordinal < 1 || ordinal > index.rawMessageCount)
-    return null;
-  return index.messageIdAtOrdinal(ordinal);
-}
-function isSemanticBoundaryCandidate(messageParts, role) {
-  if (role === "user" && hasMeaningfulUserText(messageParts))
-    return true;
-  if (messageParts.some((part) => String(typeof part === "object" && part !== null && "type" in part ? part.type : "") === "tool")) {
-    return true;
-  }
-  return false;
-}
-function semanticSnapBoundary(args) {
-  const { messages, index, candidate, scaledN, lastCompartmentEndOrdinal } = args;
-  let snapped = candidate;
-  for (const message of messages) {
-    if (message.ordinal > candidate)
-      break;
-    if (message.ordinal < lastCompartmentEndOrdinal + 1)
-      continue;
-    if (!isSemanticBoundaryCandidate(message.parts, message.role))
-      continue;
-    snapped = message.ordinal;
-  }
-  if (snapped === candidate)
-    return candidate;
-  const extraTokens = index.suffixTokensFromOrdinal(snapped) - index.suffixTokensFromOrdinal(candidate);
-  if (extraTokens > Math.min(Math.round(1.5 * scaledN), 48000))
-    return candidate;
-  const snappedMessage = messages.find((message) => message.ordinal === snapped);
-  if (snappedMessage?.role === "user" && index.tokenForOrdinal(snapped) > Math.max(2 * scaledN, 64000)) {
-    return candidate;
-  }
-  return snapped;
-}
-function snapWrapupBoundaryToUser(args) {
-  const { messages, index, candidate, offset, triggerBudget } = args;
-  if (candidate <= offset)
-    return candidate;
-  const snapTokenLimit = Math.min(Math.max(triggerBudget, 2000), 48000);
-  for (let ordinal = candidate;ordinal >= offset; ordinal -= 1) {
-    const message = messages.find((m) => m.ordinal === ordinal);
-    if (!message)
-      continue;
-    if (message.role !== "user" || !hasMeaningfulUserText(message.parts))
-      continue;
-    const extraTokens = index.rangeTokens(ordinal, candidate);
-    if (extraTokens <= snapTokenLimit)
-      return ordinal;
-    return candidate;
-  }
-  return candidate;
-}
-function fenceWrapupBoundaryForToolArcs(args) {
-  let boundary = args.candidate;
-  const maxPasses = args.arcs.length + 1;
-  for (let pass = 0;pass < maxPasses; pass += 1) {
-    let next = boundary;
-    for (const arc of args.arcs) {
-      if (arc.resOrdinal === null) {
-        continue;
-      }
-      if (arc.invOrdinal >= args.lastCompartmentEndOrdinal + 1 && completedToolArcCrossesBoundary(arc.invOrdinal, arc.resOrdinal, next)) {
-        next = arc.invOrdinal;
-      }
-    }
-    if (next === boundary)
-      return boundary;
-    boundary = next;
-  }
-  return boundary;
-}
-function applyHeadCap(args) {
-  const { index, protectedTailStart, offset, arcs, capTokens, recentOpenArcCutoff } = args;
-  if (offset >= protectedTailStart)
-    return { eligibleEndOrdinal: offset, oversizeAtomicUnit: false };
-  let end = index.findHeadEndForCap(offset, protectedTailStart, capTokens);
-  let oversizeAtomicUnit = end === offset + 1 && index.tokenForOrdinal(offset) > capTokens;
-  for (const arc of arcs) {
-    const resOrdinal = arc.resOrdinal;
-    if (resOrdinal === null) {
-      if (arc.invOrdinal >= recentOpenArcCutoff && arc.invOrdinal >= offset && arc.invOrdinal < end) {
-        end = Math.min(end, arc.invOrdinal);
-      }
-      continue;
-    }
-    if (arc.invOrdinal < end && end <= resOrdinal) {
-      end = Math.min(protectedTailStart, resOrdinal + 1);
-      if (index.rangeTokens(Math.max(offset, arc.invOrdinal), end) > capTokens)
-        oversizeAtomicUnit = true;
-    }
-  }
-  if (end <= offset && offset < protectedTailStart) {
-    return { eligibleEndOrdinal: offset, oversizeAtomicUnit };
-  }
-  return { eligibleEndOrdinal: Math.min(end, protectedTailStart), oversizeAtomicUnit };
-}
-function resolveProtectedTailBoundary(ctx) {
-  const createdAt = ctx.createdAt ?? Date.now();
-  const messages = readRawSessionMessages(ctx.sessionId);
-  const storedTotals = ctx.storedTokenTotals;
-  const absoluteMessageCount = getCachedAbsoluteMessageCount(ctx.sessionId) ?? undefined;
-  const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
-    providerShapeVersion: ctx.providerShapeVersion,
-    cacheNamespace: ctx.cacheNamespace,
-    absoluteMessageCount,
-    storedTotalForMessage: storedTotals ? (m) => {
-      const v = storedTotals.get(m.id);
-      return v === undefined ? null : v;
-    } : undefined
-  });
-  const rawMessageCount = index.rawMessageCount;
-  const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
-  const usagePercentage = clampPercentage(ctx.usage?.percentage ?? 0);
-  const usageInputTokens = Math.max(0, Math.round(ctx.usage?.inputTokens ?? 0));
-  if (rawMessageCount === 0) {
-    return {
-      sessionId: ctx.sessionId,
-      mode: ctx.mode,
-      offset,
-      offsetMessageId: null,
-      protectedTailStart: 1,
-      protectedTailStartMessageId: null,
-      eligibleEndOrdinal: 1,
-      eligibleEndMessageId: null,
-      rawMessageCountAtTrigger: 0,
-      rawLastMessageIdAtTrigger: null,
-      N: 0,
-      usagePercentage,
-      usageInputTokens,
-      usageSource: ctx.usageSource,
-      contextLimit: ctx.contextLimit,
-      executeThresholdPercentage: ctx.executeThresholdPercentage,
-      triggerBudget: ctx.triggerBudget,
-      priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
-      migrationFloorActive: ctx.migrationFloorActive,
-      emergencyTailScale: ctx.emergencyTailScale,
-      providerShapeVersion: ctx.providerShapeVersion,
-      cacheNamespace: ctx.cacheNamespace,
-      createdAt,
-      rawRangeFingerprint: "",
-      trueRawEligibleTokens: 0,
-      oversizeAtomicUnit: false,
-      boundaryReason: "empty-session"
-    };
-  }
-  if (ctx.mode === "manual-full-recomp") {
-    const arcs2 = buildToolArcs(messages);
-    const recompTarget = deriveProtectedTailTokenTarget({
-      contextLimit: ctx.contextLimit,
-      executeThresholdPercentage: ctx.executeThresholdPercentage,
-      usagePercentage: 0,
-      triggerBudget: ctx.triggerBudget
-    });
-    const recentOpenArcCutoff2 = index.findSuffixStartForTokens(recompTarget.N);
-    const firstOpenArc = arcs2.find((arc) => arc.resOrdinal === null && arc.invOrdinal >= offset && arc.invOrdinal >= recentOpenArcCutoff2);
-    const protectedTailStart2 = firstOpenArc?.invOrdinal ?? rawMessageCount + 1;
-    const rawRangeFingerprint2 = computeRawRangeFingerprint(messages, offset, protectedTailStart2);
-    return {
-      sessionId: ctx.sessionId,
-      mode: ctx.mode,
-      offset,
-      offsetMessageId: boundaryMessageId(index, offset),
-      protectedTailStart: protectedTailStart2,
-      protectedTailStartMessageId: null,
-      eligibleEndOrdinal: protectedTailStart2,
-      eligibleEndMessageId: boundaryMessageId(index, protectedTailStart2 - 1),
-      rawMessageCountAtTrigger: rawMessageCount,
-      rawLastMessageIdAtTrigger: boundaryMessageId(index, rawMessageCount),
-      N: 0,
-      usagePercentage: 0,
-      usageInputTokens: 0,
-      usageSource: "manual-none",
-      contextLimit: ctx.contextLimit,
-      executeThresholdPercentage: ctx.executeThresholdPercentage,
-      triggerBudget: ctx.triggerBudget,
-      priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
-      migrationFloorActive: false,
-      emergencyTailScale: ctx.emergencyTailScale,
-      providerShapeVersion: ctx.providerShapeVersion,
-      cacheNamespace: ctx.cacheNamespace,
-      createdAt,
-      rawRangeFingerprint: rawRangeFingerprint2,
-      trueRawEligibleTokens: index.rangeTokens(offset, protectedTailStart2),
-      oversizeAtomicUnit: false,
-      boundaryReason: firstOpenArc ? "open-tool-arc" : "manual-full-recomp"
-    };
-  }
-  const target = deriveProtectedTailTokenTarget({
-    contextLimit: ctx.contextLimit,
-    executeThresholdPercentage: ctx.executeThresholdPercentage,
-    usagePercentage,
-    triggerBudget: ctx.triggerBudget
-  });
-  const scaledN = ctx.emergencyTailScale ? Math.max(1, Math.floor(target.N * ctx.emergencyTailScale)) : target.N;
-  const arcs = buildToolArcs(messages);
-  let boundary = index.findSuffixStartForTokens(scaledN);
-  const recentOpenArcCutoff = boundary;
-  let boundaryReason = boundary === 1 ? "whole-session-smaller-than-tail" : "size-walk";
-  const tokenAtBoundary = index.tokenForOrdinal(boundary);
-  if (boundary <= rawMessageCount && tokenAtBoundary > Math.max(2 * scaledN, 64000) && boundary < rawMessageCount) {
-    boundary += 1;
-    boundaryReason = "huge-message-exception";
-  }
-  boundary = fenceBoundaryForToolArcs(boundary, arcs, ctx.lastCompartmentEndOrdinal, recentOpenArcCutoff);
-  const snapped = semanticSnapBoundary({
-    messages,
-    index,
-    candidate: boundary,
-    scaledN,
-    lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal
-  });
-  if (snapped !== boundary)
-    boundaryReason = "semantic-snap";
-  boundary = fenceBoundaryForToolArcs(snapped, arcs, ctx.lastCompartmentEndOrdinal, recentOpenArcCutoff);
-  let runtimeFloor = offset;
-  if (ctx.migrationFloorActive)
-    runtimeFloor = Math.max(runtimeFloor, ctx.priorBoundaryOrdinal);
-  let protectedTailStart = Math.max(boundary, runtimeFloor);
-  const forceMaterializationPercentage = escalationBands(ctx.executeThresholdPercentage).forceMaterializationPercentage;
-  if (!ctx.emergencyTailScale && usagePercentage < forceMaterializationPercentage) {
-    let lastMeaningfulUserOrdinal = 0;
-    for (let i = messages.length - 1;i >= 0; i--) {
-      const message = messages[i];
-      if (message.role !== "user")
-        continue;
-      if (!hasMeaningfulUserText(message.parts))
-        continue;
-      lastMeaningfulUserOrdinal = message.ordinal;
-      break;
-    }
-    if (lastMeaningfulUserOrdinal >= offset) {
-      protectedTailStart = Math.min(protectedTailStart, lastMeaningfulUserOrdinal);
-    }
-  }
-  if (protectedTailStart > offset && index.rangeTokens(offset, protectedTailStart) <= NORMAL_HYSTERESIS_TOKENS) {
-    protectedTailStart = offset;
-  }
-  protectedTailStart = clampOrdinal(protectedTailStart, rawMessageCount);
-  const perRunCap = selectPerRunCap({
-    usagePercentage,
-    N: scaledN,
-    contextLimit: ctx.contextLimit,
-    executeThresholdPercentage: ctx.executeThresholdPercentage
-  });
-  const head = applyHeadCap({
-    index,
-    protectedTailStart,
-    offset,
-    arcs,
-    lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal,
-    capTokens: perRunCap,
-    recentOpenArcCutoff
-  });
-  const rawRangeFingerprint = computeRawRangeFingerprint(messages, offset, head.eligibleEndOrdinal);
-  return {
-    sessionId: ctx.sessionId,
-    mode: ctx.mode,
-    offset,
-    offsetMessageId: boundaryMessageId(index, offset),
-    protectedTailStart,
-    protectedTailStartMessageId: boundaryMessageId(index, protectedTailStart),
-    eligibleEndOrdinal: head.eligibleEndOrdinal,
-    eligibleEndMessageId: boundaryMessageId(index, head.eligibleEndOrdinal - 1),
-    rawMessageCountAtTrigger: rawMessageCount,
-    rawLastMessageIdAtTrigger: boundaryMessageId(index, rawMessageCount),
-    N: scaledN,
-    usagePercentage,
-    usageInputTokens,
-    usageSource: ctx.usageSource,
-    contextLimit: ctx.contextLimit,
-    executeThresholdPercentage: ctx.executeThresholdPercentage,
-    triggerBudget: ctx.triggerBudget,
-    priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
-    migrationFloorActive: ctx.migrationFloorActive,
-    emergencyTailScale: ctx.emergencyTailScale,
-    providerShapeVersion: ctx.providerShapeVersion,
-    cacheNamespace: ctx.cacheNamespace,
-    createdAt,
-    rawRangeFingerprint,
-    trueRawEligibleTokens: index.rangeTokens(offset, protectedTailStart),
-    oversizeAtomicUnit: head.oversizeAtomicUnit,
-    boundaryReason
-  };
-}
-function resolveBoundaryContext(args) {
-  const lastCompartmentEndOrdinal = getLastCompartmentEndMessage(args.db, args.sessionId);
-  const triggerBudget = deriveTriggerBudget(args.contextLimit, args.executeThresholdPercentage);
-  let meta3 = loadProtectedTailMeta(args.db, args.sessionId);
-  let migrationFloorActive = false;
-  if (meta3.protectedTailPolicyVersion < 3) {
-    let legacyBoundary = 1;
-    try {
-      legacyBoundary = getLegacyProtectedTailStartOrdinal(args.sessionId);
-    } catch (error51) {
-      sessionLog(args.sessionId, "protected-tail migration seed fell back to ordinal 1:", error51);
-    }
-    const seedResult = markProtectedTailPolicyV3Seeded(args.db, args.sessionId, Math.max(1, legacyBoundary));
-    meta3 = seedResult;
-    migrationFloorActive = seedResult.seeded;
-  }
-  let storedTokenTotals;
-  try {
-    storedTokenTotals = getAllStatusTagTokenTotalsFlat(args.db, args.sessionId, args.taggerFloor ?? 0).totals;
-  } catch (error51) {
-    sessionLog(args.sessionId, "protected-tail stored-token map unavailable (live fallback):", error51);
-  }
-  return {
-    sessionId: args.sessionId,
-    mode: args.mode,
-    contextLimit: args.contextLimit,
-    executeThresholdPercentage: args.executeThresholdPercentage,
-    triggerBudget,
-    usage: args.usage ?? null,
-    usageSource: args.usageSource ?? (args.usage ? "live" : "provisional-zero"),
-    lastCompartmentEndOrdinal,
-    priorBoundaryOrdinal: meta3.priorBoundaryOrdinal,
-    protectedTailPolicyVersion: meta3.protectedTailPolicyVersion,
-    migrationFloorActive,
-    emergencyTailScale: args.emergencyTailScale,
-    providerShapeVersion: args.providerShapeVersion ?? "opencode-v1",
-    cacheNamespace: args.cacheNamespace ?? `opencode:${args.sessionId}`,
-    storedTokenTotals
-  };
-}
-function resolveOpenCodeProtectedTailBoundary(args) {
-  return resolveProtectedTailBoundary(resolveBoundaryContext(args));
-}
-function resolveWrapupProtectedTailBoundary(args) {
-  const ctx = resolveBoundaryContext({ ...args, mode: "manual-wrapup" });
-  const createdAt = ctx.createdAt ?? Date.now();
-  const messages = readRawSessionMessages(ctx.sessionId);
-  const absoluteMessageCount = getCachedAbsoluteMessageCount(ctx.sessionId) ?? undefined;
-  const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
-    providerShapeVersion: ctx.providerShapeVersion,
-    cacheNamespace: ctx.cacheNamespace,
-    absoluteMessageCount,
-    storedTotalForMessage: ctx.storedTokenTotals ? (m) => {
-      const value = ctx.storedTokenTotals?.get(m.id);
-      return value === undefined ? null : value;
-    } : undefined
-  });
-  const rawMessageCount = index.rawMessageCount;
-  const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
-  const anchorRawMessageCount = Math.max(0, Math.min(rawMessageCount, Math.floor(args.anchorRawMessageCount ?? rawMessageCount)));
-  const usagePercentage = clampPercentage(ctx.usage?.percentage ?? 0);
-  const usageInputTokens = Math.max(0, Math.round(ctx.usage?.inputTokens ?? 0));
-  const rawMessagesAboveLastCompartment = Math.max(0, anchorRawMessageCount - offset + 1);
-  const keep = Math.max(1, Math.floor(args.messagesToKeep));
-  let targetProtectedTailStart = offset;
-  let boundaryReason = "manual-wrapup-empty";
-  if (rawMessageCount === 0 || rawMessagesAboveLastCompartment <= keep) {
-    targetProtectedTailStart = offset;
-    boundaryReason = rawMessageCount === 0 ? "manual-wrapup-empty" : "manual-wrapup-within-keep";
-  } else {
-    targetProtectedTailStart = anchorRawMessageCount - keep + 1;
-    boundaryReason = "manual-wrapup-keep-watermark";
-    const arcs = buildToolArcs(messages);
-    const fenced = fenceWrapupBoundaryForToolArcs({
-      candidate: targetProtectedTailStart,
-      arcs,
-      lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal
-    });
-    if (fenced !== targetProtectedTailStart)
-      boundaryReason = "manual-wrapup-tool-arc";
-    targetProtectedTailStart = fenced;
-    const snapped = snapWrapupBoundaryToUser({
-      messages,
-      index,
-      candidate: targetProtectedTailStart,
-      offset,
-      triggerBudget: ctx.triggerBudget
-    });
-    if (snapped !== targetProtectedTailStart)
-      boundaryReason = "manual-wrapup-user-snap";
-    targetProtectedTailStart = snapped;
-    const refenced = fenceWrapupBoundaryForToolArcs({
-      candidate: targetProtectedTailStart,
-      arcs,
-      lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal
-    });
-    if (refenced !== targetProtectedTailStart)
-      boundaryReason = "manual-wrapup-tool-arc";
-    targetProtectedTailStart = refenced;
-  }
-  targetProtectedTailStart = clampOrdinal(targetProtectedTailStart, rawMessageCount);
-  const target = deriveProtectedTailTokenTarget({
-    contextLimit: ctx.contextLimit,
-    executeThresholdPercentage: ctx.executeThresholdPercentage,
-    usagePercentage,
-    triggerBudget: ctx.triggerBudget
-  });
-  const perRunCap = selectPerRunCap({
-    usagePercentage,
-    N: target.N,
-    contextLimit: ctx.contextLimit,
-    executeThresholdPercentage: ctx.executeThresholdPercentage
-  });
-  const head = applyHeadCap({
-    index,
-    protectedTailStart: targetProtectedTailStart,
-    offset,
-    arcs: buildToolArcs(messages),
-    lastCompartmentEndOrdinal: ctx.lastCompartmentEndOrdinal,
-    capTokens: perRunCap,
-    recentOpenArcCutoff: targetProtectedTailStart
-  });
-  const eligibleEndOrdinal = Math.min(head.eligibleEndOrdinal, targetProtectedTailStart);
-  const rawRangeFingerprint = computeRawRangeFingerprint(messages, offset, eligibleEndOrdinal);
-  const snapshot = {
-    sessionId: ctx.sessionId,
-    mode: "manual-wrapup",
-    offset,
-    offsetMessageId: boundaryMessageId(index, offset),
-    protectedTailStart: targetProtectedTailStart,
-    protectedTailStartMessageId: boundaryMessageId(index, targetProtectedTailStart),
-    eligibleEndOrdinal,
-    eligibleEndMessageId: boundaryMessageId(index, eligibleEndOrdinal - 1),
-    rawMessageCountAtTrigger: rawMessageCount,
-    rawLastMessageIdAtTrigger: boundaryMessageId(index, rawMessageCount),
-    N: keep,
-    usagePercentage,
-    usageInputTokens,
-    usageSource: ctx.usageSource,
-    contextLimit: ctx.contextLimit,
-    executeThresholdPercentage: ctx.executeThresholdPercentage,
-    triggerBudget: ctx.triggerBudget,
-    priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
-    migrationFloorActive: ctx.migrationFloorActive,
-    emergencyTailScale: ctx.emergencyTailScale,
-    providerShapeVersion: ctx.providerShapeVersion,
-    cacheNamespace: ctx.cacheNamespace,
-    createdAt,
-    rawRangeFingerprint,
-    trueRawEligibleTokens: index.rangeTokens(offset, targetProtectedTailStart),
-    oversizeAtomicUnit: head.oversizeAtomicUnit,
-    boundaryReason
-  };
-  return {
-    snapshot,
-    rawMessagesAboveLastCompartment,
-    anchorRawMessageCount,
-    targetProtectedTailStart,
-    targetEligibleEndOrdinal: targetProtectedTailStart
-  };
-}
-function hasRunnableCompartmentWindow(snapshot) {
-  if (snapshot.offset >= snapshot.protectedTailStart)
-    return false;
-  const forceMaterializationPercentage = escalationBands(snapshot.executeThresholdPercentage).forceMaterializationPercentage;
-  if (snapshot.usagePercentage >= forceMaterializationPercentage || snapshot.emergencyTailScale) {
-    return snapshot.trueRawEligibleTokens >= deriveMinForceEligibleTokens(snapshot.N) || snapshot.eligibleEndOrdinal > snapshot.offset;
-  }
-  return snapshot.eligibleEndOrdinal > snapshot.offset;
-}
-function validateBoundarySnapshot(args) {
-  const { snapshot } = args;
-  if (args.currentContextLimit && args.currentContextLimit !== snapshot.contextLimit) {
-    return {
-      ok: false,
-      reason: "model_or_limit_changed",
-      detail: `context limit changed from ${snapshot.contextLimit} to ${args.currentContextLimit}`
-    };
-  }
-  const messages = readRawSessionMessages(snapshot.sessionId);
-  const currentRawMessageCount = messages.reduce((max, message) => Math.max(max, message.ordinal), messages.length);
-  if (snapshot.rawMessageCountAtTrigger > currentRawMessageCount) {
-    return { ok: false, reason: "stale_snapshot", detail: "raw message count shrank" };
-  }
-  const idsByOrdinal = new Map(messages.map((message) => [message.ordinal, message.id]));
-  const idAt = (ordinal) => idsByOrdinal.get(ordinal) ?? null;
-  const checks3 = [
-    [snapshot.offset, snapshot.offsetMessageId, "offset"],
-    [snapshot.rawMessageCountAtTrigger, snapshot.rawLastMessageIdAtTrigger, "last"]
-  ];
-  if (snapshot.protectedTailStart <= snapshot.rawMessageCountAtTrigger) {
-    checks3.push([
-      snapshot.protectedTailStart,
-      snapshot.protectedTailStartMessageId,
-      "protectedTailStart"
-    ]);
-  }
-  if (snapshot.eligibleEndOrdinal > snapshot.offset) {
-    checks3.push([
-      snapshot.eligibleEndOrdinal - 1,
-      snapshot.eligibleEndMessageId,
-      "eligibleEnd"
-    ]);
-  }
-  for (const [ordinal, expected, label] of checks3) {
-    if (expected !== idAt(ordinal)) {
-      return {
-        ok: false,
-        reason: "stale_snapshot",
-        detail: `${label} ordinal ${ordinal} id changed`
-      };
-    }
-  }
-  const expectedOffset = Math.max(1, getLastCompartmentEndMessage(args.db, snapshot.sessionId) + 1);
-  if (expectedOffset !== snapshot.offset) {
-    return {
-      ok: false,
-      reason: "stale_snapshot",
-      detail: `last compartment moved: offset ${snapshot.offset} -> ${expectedOffset}`
-    };
-  }
-  const fingerprint = computeRawRangeFingerprint(messages, snapshot.offset, snapshot.eligibleEndOrdinal);
-  if (fingerprint !== snapshot.rawRangeFingerprint) {
-    return { ok: false, reason: "stale_snapshot", detail: "raw range fingerprint changed" };
-  }
-  return { ok: true };
-}
-function recordHighPressureNoEligibleHead(db, snapshot) {
-  const forceMaterializationPercentage = escalationBands(snapshot.executeThresholdPercentage).forceMaterializationPercentage;
-  if (snapshot.usagePercentage < forceMaterializationPercentage && !snapshot.emergencyTailScale) {
-    return 0;
-  }
-  return recordProtectedTailNoEligibleHead(db, snapshot.sessionId);
-}
-function createDefaultBoundarySnapshotForTests(sessionId) {
-  const messages = readRawSessionMessages(sessionId);
-  const rawMessageCount = messages.length;
-  const protectedTailStart = Math.max(1, Math.min(rawMessageCount + 1, getLegacyProtectedTailStartOrdinal(sessionId)));
-  const index = buildTrueRawTokenIndex(sessionId, messages, {
-    providerShapeVersion: "opencode-v1",
-    cacheNamespace: `test:${sessionId}`
-  });
-  const trueRawEligibleTokens = index.rangeTokens(1, protectedTailStart);
-  const messageIdAt = (ordinal) => messages.find((message) => message.ordinal === ordinal)?.id ?? null;
-  return {
-    sessionId,
-    mode: "incremental-runner",
-    offset: 1,
-    offsetMessageId: messageIdAt(1),
-    protectedTailStart,
-    protectedTailStartMessageId: messageIdAt(protectedTailStart),
-    eligibleEndOrdinal: protectedTailStart,
-    eligibleEndMessageId: messageIdAt(protectedTailStart - 1),
-    rawMessageCountAtTrigger: rawMessageCount,
-    rawLastMessageIdAtTrigger: messageIdAt(rawMessageCount),
-    N: 0,
-    usagePercentage: 0,
-    usageInputTokens: 0,
-    usageSource: "provisional-zero",
-    contextLimit: 128000,
-    executeThresholdPercentage: 65,
-    triggerBudget: deriveTriggerBudget(128000, 65),
-    priorBoundaryOrdinal: protectedTailStart,
-    migrationFloorActive: false,
-    providerShapeVersion: "opencode-v1",
-    cacheNamespace: `test:${sessionId}`,
-    createdAt: Date.now(),
-    rawRangeFingerprint: "",
-    trueRawEligibleTokens,
-    oversizeAtomicUnit: false,
-    boundaryReason: "test-legacy"
-  };
-}
-
-// ../plugin/src/hooks/magic-context/compartment-trigger.ts
-var PROACTIVE_TRIGGER_OFFSET_PERCENTAGE = 2;
-var POST_DROP_TARGET_RATIO = 0.75;
-function getProactiveCompartmentTriggerPercentage(executeThresholdPercentage) {
-  return Math.max(0, executeThresholdPercentage - PROACTIVE_TRIGGER_OFFSET_PERCENTAGE);
-}
-
 // ../plugin/src/shared/format-bytes.ts
 function formatBytes(bytes) {
   if (bytes < 1024)
@@ -44733,150 +46149,6 @@ function registerCtxCommands(ctx, opts = {}) {
   };
 }
 
-// src/agent/outbox.ts
-var ADAPTER_META_KEY = "adapter_schema";
-var ADAPTER_SCHEMA_VERSION = "1";
-var OUTBOX_COLUMNS = "op_id, session_id, kind, source_watermark, input_digest, generation, status, dsh_ack_seq, error_detail, created_at, updated_at";
-function toRecord(row) {
-  return {
-    opId: row.op_id,
-    sessionId: row.session_id,
-    kind: row.kind,
-    sourceWatermark: row.source_watermark,
-    inputDigest: row.input_digest,
-    generation: row.generation,
-    status: row.status,
-    ackSeq: row.dsh_ack_seq,
-    errorDetail: row.error_detail,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  };
-}
-function initializeDshAdapterTables(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS dsh_context_outbox (
-      op_id            TEXT PRIMARY KEY,
-      session_id       TEXT NOT NULL,
-      harness          TEXT NOT NULL DEFAULT 'dsh',
-      kind             TEXT NOT NULL,
-      source_watermark INTEGER NOT NULL,
-      input_digest     TEXT NOT NULL,
-      generation       INTEGER NOT NULL,
-      status           TEXT NOT NULL DEFAULT 'pending',
-      dsh_ack_seq      INTEGER,
-      error_detail     TEXT,
-      created_at       INTEGER NOT NULL,
-      updated_at       INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_dsh_outbox_session
-      ON dsh_context_outbox(session_id, status);
-
-    CREATE TABLE IF NOT EXISTS dsh_adapter_meta (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS dsh_context_compaction_marker (
-      session_id     TEXT PRIMARY KEY,
-      ordinal        INTEGER NOT NULL,
-      end_message_id TEXT NOT NULL,
-      tokens_before  INTEGER NOT NULL,
-      summary        TEXT NOT NULL,
-      published_at   INTEGER NOT NULL,
-      status         TEXT NOT NULL DEFAULT 'pending'
-    );
-
-    CREATE TABLE IF NOT EXISTS dsh_feedback_signals (
-      session_id  TEXT NOT NULL,
-      message_id  TEXT NOT NULL,
-      rated_at    INTEGER NOT NULL,
-      rating      TEXT NOT NULL DEFAULT 'negative',
-      PRIMARY KEY (session_id, message_id)
-    );
-  `);
-  db.prepare(`INSERT INTO dsh_adapter_meta (key, value) VALUES (?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(ADAPTER_META_KEY, ADAPTER_SCHEMA_VERSION);
-}
-function insertOutboxPending(db, input) {
-  const now = Date.now();
-  db.transaction(() => {
-    db.prepare(`INSERT OR IGNORE INTO dsh_context_outbox
-         (op_id, session_id, kind, source_watermark, input_digest, generation, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(input.opId, input.sessionId, input.kind, input.sourceWatermark, input.inputDigest, input.generation, now, now);
-  })();
-}
-function markOutboxApplied(db, opId, ackSeq) {
-  db.transaction(() => {
-    db.prepare(`UPDATE dsh_context_outbox
-         SET status = 'applied', dsh_ack_seq = ?, updated_at = ?
-       WHERE op_id = ?`).run(ackSeq, Date.now(), opId);
-  })();
-}
-function markOutboxCommitted(db, opId) {
-  db.transaction(() => {
-    db.prepare(`UPDATE dsh_context_outbox
-         SET status = 'committed', updated_at = ?
-       WHERE op_id = ?`).run(Date.now(), opId);
-  })();
-}
-function markOutboxAbandoned(db, opId, errorDetail) {
-  db.transaction(() => {
-    db.prepare(`UPDATE dsh_context_outbox
-         SET status = 'abandoned', error_detail = ?, updated_at = ?
-       WHERE op_id = ?`).run(errorDetail ?? null, Date.now(), opId);
-  })();
-}
-function getOutboxRecord(db, opId) {
-  const row = db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM dsh_context_outbox WHERE op_id = ?`).get(opId);
-  return row === undefined || row === null ? undefined : toRecord(row);
-}
-function listOutboxBySession(db, sessionId, statuses) {
-  if (statuses === undefined || statuses.length === 0) {
-    const rows2 = db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM dsh_context_outbox
-         WHERE session_id = ? ORDER BY created_at ASC, op_id ASC`).all(sessionId);
-    return rows2.map(toRecord);
-  }
-  const placeholders4 = statuses.map(() => "?").join(", ");
-  const rows = db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM dsh_context_outbox
-       WHERE session_id = ? AND status IN (${placeholders4})
-       ORDER BY created_at ASC, op_id ASC`).all(sessionId, ...statuses);
-  return rows.map(toRecord);
-}
-function classifyOutboxRecord(record2, sessionLog2, options = {}) {
-  if (record2.status === "committed")
-    return "committed";
-  if (record2.status === "abandoned")
-    return "stale-input";
-  if (record2.ackSeq !== null && sessionLog2.hasSeq(record2.ackSeq))
-    return "committed";
-  if (options.digestMismatch === true)
-    return "conflict-recompute";
-  if (sessionLog2.generation !== record2.generation)
-    return "stale-input";
-  return "retryable";
-}
-function reconcileSessionOutbox(db, sessionId, sessionLog2) {
-  const outcomes = {};
-  const records = listOutboxBySession(db, sessionId, ["pending", "applied"]);
-  for (const record2 of records) {
-    const outcome = classifyOutboxRecord(record2, sessionLog2);
-    outcomes[record2.opId] = outcome;
-    if (outcome === "committed") {
-      markOutboxCommitted(db, record2.opId);
-    } else if (outcome === "stale-input" || outcome === "conflict-recompute") {
-      markOutboxAbandoned(db, record2.opId, `reconcile: ${outcome}`);
-    }
-  }
-  return outcomes;
-}
-function stageDshCompactionMarker(db, sessionId, marker) {
-  db.transaction(() => {
-    db.prepare(`INSERT OR REPLACE INTO dsh_context_compaction_marker
-         (session_id, ordinal, end_message_id, tokens_before, summary, published_at, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending')`).run(sessionId, marker.ordinal, marker.endMessageId, marker.tokensBefore, marker.summary, Date.now());
-  })();
-}
-
 // src/agent/coordinator.ts
 function createCoordinatorState() {
   return { queues: new Map, appliedOps: new Map };
@@ -45003,779 +46275,6 @@ async function executePlan(state, host, session, plan, sessionId) {
     log2(`[magic-context] plan ${plan.opId} failed (abandoned): ${detail}`);
     return { status: "error", detail };
   }
-}
-
-// ../plugin/src/features/magic-context/compartment-events.ts
-function insertCompartmentEvents(db, sessionId, events, compartmentIds) {
-  if (events.length === 0)
-    return;
-  const now = Date.now();
-  const harness = getHarness();
-  const stmt = db.prepare("INSERT INTO compartment_events (session_id, compartment_id, kind, at_compartment, fields_json, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?)");
-  for (const ev of events) {
-    const idx = ev.atCompartment != null && ev.atCompartment >= 1 ? ev.atCompartment - 1 : -1;
-    const compartmentId = idx >= 0 && idx < compartmentIds.length ? compartmentIds[idx] : null;
-    stmt.run(sessionId, compartmentId, ev.kind, ev.atCompartment, JSON.stringify(ev.fields ?? {}), now, harness);
-  }
-}
-function getCompartmentEvents(db, sessionId) {
-  const rows = db.prepare("SELECT id, session_id, compartment_id, kind, at_compartment, fields_json, created_at FROM compartment_events WHERE session_id = ? ORDER BY id DESC").all(sessionId);
-  return rows.map((r) => ({
-    id: r.id,
-    sessionId: r.session_id,
-    compartmentId: r.compartment_id,
-    kind: r.kind,
-    atCompartment: r.at_compartment,
-    fields: parseFields(r.fields_json),
-    createdAt: r.created_at
-  }));
-}
-function parseFields(json2) {
-  try {
-    const parsed = JSON.parse(json2);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const out = {};
-      for (const [k, v] of Object.entries(parsed)) {
-        if (typeof v === "string")
-          out[k] = v;
-      }
-      return out;
-    }
-  } catch {}
-  return {};
-}
-
-// ../plugin/src/features/magic-context/storage-historian-runs.ts
-function recordHistorianRun(db, input) {
-  try {
-    const result = db.prepare(`INSERT INTO historian_runs (
-                    session_id, harness, subagent_invocation_id, run_kind, status,
-                    failure_reason, chunk_start_ordinal, chunk_end_ordinal, unprocessed_from,
-                    compartments_produced, compartment_id_min, compartment_id_max,
-                    facts_emitted, facts_by_category_json, events_emitted,
-                    importance_min, importance_max, importance_avg,
-                    discarded_last, legacy, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.sessionId, input.harness, input.subagentInvocationId ?? null, input.runKind, input.status, input.failureReason ?? null, input.chunkStartOrdinal ?? null, input.chunkEndOrdinal ?? null, input.unprocessedFrom ?? null, input.compartmentsProduced ?? 0, input.compartmentIdMin ?? null, input.compartmentIdMax ?? null, input.factsEmitted ?? 0, input.factsByCategory ? JSON.stringify(input.factsByCategory) : null, input.eventsEmitted ?? 0, input.importanceMin ?? null, input.importanceMax ?? null, input.importanceAvg ?? null, input.discardedLast ? 1 : 0, input.legacy ? 1 : 0, Date.now());
-    return Number(result.lastInsertRowid);
-  } catch {
-    return null;
-  }
-}
-function summarizeImportance(values) {
-  const nums = values.filter((v) => typeof v === "number" && Number.isFinite(v));
-  if (nums.length === 0)
-    return { min: null, max: null, avg: null };
-  let min = nums[0];
-  let max = nums[0];
-  let sum = 0;
-  for (const v of nums) {
-    if (v < min)
-      min = v;
-    if (v > max)
-      max = v;
-    sum += v;
-  }
-  return { min, max, avg: sum / nums.length };
-}
-function tallyFactsByCategory(facts) {
-  const out = {};
-  for (const f of facts) {
-    const cat = (f.category ?? "UNKNOWN").trim() || "UNKNOWN";
-    out[cat] = (out[cat] ?? 0) + 1;
-  }
-  return out;
-}
-
-// ../plugin/src/hooks/magic-context/compartment-runner-drop-queue.ts
-function queueDropsForCompartmentalizedMessages(db, sessionId, upToMessageIndex) {
-  const tags = getTagsBySession(db, sessionId);
-  const { messageFileKeys, toolObservations } = getRawSessionTagKeysThrough(sessionId, upToMessageIndex);
-  let dropsQueued = 0;
-  for (const tag of tags) {
-    if (tag.status !== "active")
-      continue;
-    if (tag.type === "tool") {
-      const observedOwners = toolObservations.get(tag.messageId);
-      if (!observedOwners)
-        continue;
-      if (tag.toolOwnerMessageId !== null) {
-        if (!observedOwners.has(tag.toolOwnerMessageId))
-          continue;
-      }
-      queuePendingOp(db, sessionId, tag.tagNumber, "drop");
-      dropsQueued += 1;
-      continue;
-    }
-    if (messageFileKeys.has(tag.messageId)) {
-      queuePendingOp(db, sessionId, tag.tagNumber, "drop");
-      dropsQueued += 1;
-    }
-  }
-  sessionLog(sessionId, `compartment agent: queued ${dropsQueued} drops for messages 0-${upToMessageIndex}`);
-}
-
-// ../plugin/src/hooks/magic-context/compartment-runner-mapping.ts
-function tierFieldsOf(c) {
-  return {
-    p1: c.p1,
-    p2: c.p2,
-    p3: c.p3,
-    p4: c.p4,
-    importance: c.importance,
-    episodeType: c.episodeType
-  };
-}
-function mapParsedCompartmentsToChunk(compartments, chunk, sequenceOffset) {
-  const mapped = [];
-  for (const [index, compartment] of compartments.entries()) {
-    const startLine = chunk.lines.find((line) => line.ordinal === compartment.startMessage);
-    const endLine = chunk.lines.find((line) => line.ordinal === compartment.endMessage);
-    if (!startLine || !endLine) {
-      return {
-        ok: false,
-        error: `Compartment range ${compartment.startMessage}-${compartment.endMessage} does not map to raw session lines ${chunk.startIndex}-${chunk.endIndex}`
-      };
-    }
-    mapped.push({
-      sequence: sequenceOffset + index,
-      startMessage: compartment.startMessage,
-      endMessage: compartment.endMessage,
-      startMessageId: startLine.messageId,
-      endMessageId: endLine.messageId,
-      title: compartment.title,
-      content: compartment.content,
-      ...tierFieldsOf(compartment)
-    });
-  }
-  return { ok: true, compartments: mapped };
-}
-
-// ../plugin/src/hooks/magic-context/compartment-runner-validation.ts
-var MIN_RECOMP_CHUNK_TOKEN_BUDGET = 20;
-var HISTORIAN_BOUNDARY_HEALING_SLACK = 2;
-function healCompartmentGaps(compartments, toolOnlyRanges = []) {
-  for (let i = 1;i < compartments.length; i++) {
-    const prev = compartments[i - 1];
-    const curr = compartments[i];
-    const gapStart = prev.endMessage + 1;
-    const gapEnd = curr.startMessage - 1;
-    const gapSize = gapEnd - gapStart + 1;
-    if (gapSize <= 0)
-      continue;
-    const fullyInsideToolOnly = toolOnlyRanges.some((range) => range.start <= gapStart && range.end >= gapEnd);
-    if (fullyInsideToolOnly) {
-      prev.endMessage = gapEnd;
-    }
-  }
-}
-function boundarySplitsCompletedToolArc(boundary, arcs = []) {
-  return arcs.some((arc) => completedToolArcCrossesBoundary(arc.start, arc.end, boundary));
-}
-function healTerminalCompletedToolArc(compartments, unprocessedFrom, arcs = [], chunkEnd) {
-  const last = compartments[compartments.length - 1];
-  if (!last)
-    return unprocessedFrom;
-  const originalEnd = last.endMessage;
-  for (let pass = 0;pass <= arcs.length; pass += 1) {
-    const boundary = last.endMessage + 1;
-    let nextEnd = last.endMessage;
-    for (const arc of arcs) {
-      if (arc.end <= chunkEnd && completedToolArcCrossesBoundary(arc.start, arc.end, boundary)) {
-        nextEnd = Math.max(nextEnd, arc.end);
-      }
-    }
-    if (nextEnd === last.endMessage)
-      break;
-    last.endMessage = nextEnd;
-  }
-  return last.endMessage !== originalEnd && unprocessedFrom !== null ? last.endMessage + 1 : unprocessedFrom;
-}
-function shouldDiscardLastHistorianCompartment(compartments, chunk) {
-  if (compartments.length < 2)
-    return false;
-  const last = compartments[compartments.length - 1];
-  const previous = compartments[compartments.length - 2];
-  const lookaheadMargin = chunk.endIndex - last.endMessage;
-  return lookaheadMargin <= HISTORIAN_BOUNDARY_HEALING_SLACK && !boundarySplitsCompletedToolArc(previous.endMessage + 1, chunk.completedToolArcs);
-}
-function validateHistorianOutput(text, _sessionId, chunk, _priorCompartments, sequenceOffset) {
-  const parsed = parseCompartmentOutput(text);
-  if (parsed.compartments.length === 0) {
-    return {
-      ok: false,
-      error: "Historian returned no usable compartments."
-    };
-  }
-  healCompartmentGaps(parsed.compartments, chunk.toolOnlyRanges);
-  parsed.unprocessedFrom = healTerminalCompletedToolArc(parsed.compartments, parsed.unprocessedFrom, chunk.completedToolArcs, chunk.endIndex);
-  const mapped = mapParsedCompartmentsToChunk(parsed.compartments, chunk, sequenceOffset);
-  if (!mapped.ok) {
-    return {
-      ok: false,
-      error: `Historian returned invalid compartment output: ${mapped.error}`
-    };
-  }
-  const parsedValidationError = validateParsedCompartments(parsed.compartments, chunk.startIndex, chunk.endIndex, parsed.unprocessedFrom);
-  if (parsedValidationError) {
-    return {
-      ok: false,
-      error: `Historian returned invalid compartment output: ${parsedValidationError}`
-    };
-  }
-  const last = parsed.compartments[parsed.compartments.length - 1];
-  if (last && boundarySplitsCompletedToolArc(last.endMessage + 1, chunk.completedToolArcs)) {
-    return {
-      ok: false,
-      error: "Historian terminal boundary splits a completed tool invocation/result arc"
-    };
-  }
-  return {
-    ok: true,
-    compartments: mapped.compartments,
-    facts: parsed.facts,
-    userObservations: parsed.userObservations.length > 0 ? parsed.userObservations : undefined,
-    primerCandidates: parsed.primerCandidates.length > 0 ? parsed.primerCandidates.slice(0, 1) : undefined,
-    events: parsed.events.length > 0 ? parsed.events : undefined
-  };
-}
-var HISTORIAN_PERSISTENT_FAILURE_THRESHOLD = 3;
-function buildHistorianFailureNotice(failureCount, lastError) {
-  if (failureCount >= HISTORIAN_PERSISTENT_FAILURE_THRESHOLD) {
-    return [
-      "## Magic Context — history comparting needs attention",
-      "",
-      `Magic Context has been unable to compart this session's history ${failureCount} times in a row. This usually means the configured historian model is misconfigured or unreachable (Magic Context already retried every fallback model automatically).`,
-      "",
-      `Last error: ${lastError}`,
-      "",
-      "Check your historian model in magic-context.jsonc, then restart. Your conversation keeps working normally in the meantime — this only affects how older history is summarized."
-    ].join(`
-`);
-  }
-  return [
-    "## Magic Context",
-    "",
-    "Hit a transient issue comparting history this turn — Magic Context will retry automatically on the next turn. Nothing is lost and your conversation continues normally. You'll only be alerted again if this keeps happening."
-  ].join(`
-`);
-}
-function buildHistorianRepairPrompt(originalPrompt, previousOutput, validationError, language) {
-  const prompt = [
-    originalPrompt,
-    "",
-    "Your previous XML response was invalid and cannot be persisted.",
-    `Validation error: ${validationError}`,
-    "Return a corrected full XML response for the same existing state and new messages.",
-    "Do not skip any displayed raw ordinal or displayed raw range, even if the message looks trivial.",
-    "Every displayed message range must belong to exactly one compartment unless it is intentionally left in one trailing suffix marked by <unprocessed_from>.",
-    "",
-    "Previous invalid XML:",
-    previousOutput
-  ].join(`
-`);
-  return withContentLanguageDirective(prompt, language, { preserveUserQuotes: true });
-}
-function validateStoredCompartments(compartments) {
-  if (compartments.length === 0) {
-    return null;
-  }
-  let expectedStart = 1;
-  for (const compartment of compartments) {
-    if (compartment.startMessage !== expectedStart) {
-      if (compartment.startMessage < expectedStart) {
-        return `overlap before message ${expectedStart} (saw ${compartment.startMessage}-${compartment.endMessage})`;
-      }
-      return `gap before message ${compartment.startMessage} (expected ${expectedStart})`;
-    }
-    if (compartment.endMessage < compartment.startMessage) {
-      return `invalid range ${compartment.startMessage}-${compartment.endMessage}`;
-    }
-    expectedStart = compartment.endMessage + 1;
-  }
-  return null;
-}
-function validateParsedCompartments(compartments, chunkStart, chunkEnd, unprocessedFrom) {
-  let expectedStart = chunkStart;
-  for (const [index, compartment] of compartments.entries()) {
-    if (!compartment.p1?.trim()) {
-      return `compartment ${index + 1} is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers`;
-    }
-    if (compartment.endMessage < compartment.startMessage) {
-      return `invalid range ${compartment.startMessage}-${compartment.endMessage}`;
-    }
-    if (compartment.startMessage < chunkStart || compartment.endMessage > chunkEnd) {
-      return `range ${compartment.startMessage}-${compartment.endMessage} is outside chunk ${chunkStart}-${chunkEnd}`;
-    }
-    if (compartment.startMessage !== expectedStart) {
-      if (compartment.startMessage < expectedStart) {
-        return `overlap before message ${expectedStart} (saw ${compartment.startMessage}-${compartment.endMessage})`;
-      }
-      return `gap before message ${compartment.startMessage} (expected ${expectedStart})`;
-    }
-    expectedStart = compartment.endMessage + 1;
-  }
-  if (unprocessedFrom !== null) {
-    if (unprocessedFrom === chunkEnd + 1) {
-      return null;
-    }
-    if (unprocessedFrom < chunkStart || unprocessedFrom > chunkEnd) {
-      return `<unprocessed_from> ${unprocessedFrom} is outside chunk ${chunkStart}-${chunkEnd}`;
-    }
-    if (unprocessedFrom !== expectedStart) {
-      return `<unprocessed_from> ${unprocessedFrom} does not match next uncovered message ${expectedStart}`;
-    }
-    return null;
-  }
-  if (expectedStart <= chunkEnd) {
-    return `output left uncovered messages ${expectedStart}-${chunkEnd} without <unprocessed_from>`;
-  }
-  return null;
-}
-function validateChunkCoverage(chunk) {
-  if (chunk.lines.length === 0) {
-    return null;
-  }
-  let expectedOrdinal = chunk.startIndex;
-  for (const line of chunk.lines) {
-    if (line.ordinal !== expectedOrdinal) {
-      return `chunk omits raw message ${expectedOrdinal} while still claiming coverage through ${chunk.endIndex}`;
-    }
-    expectedOrdinal += 1;
-  }
-  if (expectedOrdinal - 1 !== chunk.endIndex) {
-    return `chunk coverage ends at ${expectedOrdinal - 1} but chunk end is ${chunk.endIndex}`;
-  }
-  return null;
-}
-function getReducedRecompTokenBudget(currentBudget) {
-  const reducedBudget = Math.max(MIN_RECOMP_CHUNK_TOKEN_BUDGET, Math.floor(currentBudget / 2));
-  return reducedBudget < currentBudget ? reducedBudget : null;
-}
-
-// src/agent/historian.ts
-var DEFAULT_HISTORIAN_CHUNK_TOKENS = 16000;
-var DEFAULT_LEASE_HOLDER_PREFIX = "dsh-historian";
-var deferredSignalsBySession = new Map;
-function signalDshDeferredHistoryRefresh(sessionId) {
-  const current = deferredSignalsBySession.get(sessionId) ?? { historyRefresh: false, materialization: false };
-  current.historyRefresh = true;
-  deferredSignalsBySession.set(sessionId, current);
-}
-function signalDshDeferredMaterialization(sessionId) {
-  const current = deferredSignalsBySession.get(sessionId) ?? { historyRefresh: false, materialization: false };
-  current.materialization = true;
-  deferredSignalsBySession.set(sessionId, current);
-}
-function checkDshCompartmentTrigger(inputs, meta3) {
-  const threshold = Number.isFinite(inputs.executeThresholdPercentage) ? Math.max(0, inputs.executeThresholdPercentage) : 65;
-  const budget = Number.isFinite(inputs.triggerBudget) ? Math.max(0, inputs.triggerBudget) : 0;
-  if (budget <= 0)
-    return false;
-  const percentage = meta3.lastContextPercentage;
-  if (typeof percentage !== "number" || !Number.isFinite(percentage))
-    return false;
-  const proactiveFloor = getProactiveCompartmentTriggerPercentage(threshold);
-  return percentage >= proactiveFloor;
-}
-async function runHistorianPassCore(args) {
-  const { db, sessionId, provider: provider2, summarize } = args;
-  const log2 = args.log;
-  const priorCompartments = getCompartments(db, sessionId);
-  const existingValidationError = validateStoredCompartments(priorCompartments);
-  if (existingValidationError) {
-    return {
-      ok: false,
-      status: "failed",
-      reason: `existing compartment state invalid: ${existingValidationError}`
-    };
-  }
-  const offset = priorCompartments.length > 0 ? priorCompartments[priorCompartments.length - 1].endMessage + 1 : 1;
-  const rangeOverride = args.eligibleEndOrdinalOverride !== undefined && args.eligibleEndOrdinalOverride > 0 ? args.eligibleEndOrdinalOverride : null;
-  let eligibleEndOrdinal;
-  if (rangeOverride !== null && args.boundarySnapshot === undefined) {
-    eligibleEndOrdinal = rangeOverride;
-  } else {
-    let boundary = args.boundarySnapshot ?? createDefaultBoundarySnapshotForTests(sessionId);
-    let boundaryOk = true;
-    let boundaryDetail;
-    if (boundary.rawRangeFingerprint.length > 0) {
-      const validation = validateBoundarySnapshot({
-        db,
-        snapshot: boundary,
-        currentContextLimit: args.currentContextLimit ?? boundary.contextLimit
-      });
-      if (!validation.ok && validation.reason === "stale_snapshot" && args.refreshBoundarySnapshot) {
-        try {
-          const refreshed = args.refreshBoundarySnapshot();
-          if (hasRunnableCompartmentWindow(refreshed)) {
-            log2(`[magic-context] historian: refreshed stale protected-tail snapshot at run time (${validation.detail ?? "stale"})`);
-            boundary = refreshed;
-          }
-        } catch (error51) {
-          log2(`[magic-context] historian: boundary refresh failed: ${describeError(error51).brief}`);
-        }
-      }
-      const finalValidation = validateBoundarySnapshot({
-        db,
-        snapshot: boundary,
-        currentContextLimit: args.currentContextLimit ?? boundary.contextLimit
-      });
-      if (!finalValidation.ok) {
-        boundaryOk = false;
-        boundaryDetail = finalValidation.detail ?? finalValidation.reason ?? "unknown";
-      }
-    }
-    if (!boundaryOk) {
-      return { ok: false, status: "noop", reason: `stale protected-tail snapshot (${boundaryDetail})` };
-    }
-    eligibleEndOrdinal = Math.min(boundary.eligibleEndOrdinal, boundary.protectedTailStart, rangeOverride ?? Number.MAX_SAFE_INTEGER);
-  }
-  if (eligibleEndOrdinal <= offset) {
-    return { ok: false, status: "noop", reason: `nothing to compact (eligibleEnd=${eligibleEndOrdinal} <= offset=${offset})` };
-  }
-  const chunkTokens = args.chunkTokens ?? DEFAULT_HISTORIAN_CHUNK_TOKENS;
-  const chunk = readSessionChunk(sessionId, chunkTokens, offset, eligibleEndOrdinal);
-  if (!chunk.text || chunk.messageCount === 0) {
-    return { ok: false, status: "noop", reason: "chunk empty after filtering" };
-  }
-  const chunkCoverageError = validateChunkCoverage(chunk);
-  if (chunkCoverageError) {
-    return { ok: false, status: "failed", reason: `chunk coverage: ${chunkCoverageError}` };
-  }
-  let text;
-  try {
-    text = await summarize(chunk, priorCompartments, args.signal);
-  } catch (error51) {
-    return { ok: false, status: "failed", reason: `llm call failed: ${describeError(error51).brief}` };
-  }
-  if (typeof text !== "string" || text.trim().length === 0) {
-    return { ok: false, status: "failed", reason: "historian returned no usable text" };
-  }
-  const maxExistingSequence = priorCompartments.reduce((max, c) => Math.max(max, c.sequence), -1);
-  const sequenceOffset = priorCompartments.length === 0 ? 0 : maxExistingSequence + 1;
-  const validated = validateHistorianOutput(text, sessionId, chunk, priorCompartments, sequenceOffset);
-  if (!validated.ok) {
-    return { ok: false, status: "failed", reason: validated.error };
-  }
-  let newCompartments = validated.compartments;
-  let discardedLast = false;
-  const inEmergency = getOverflowState(db, sessionId).needsEmergencyRecovery;
-  if (!args.keepLastCompartment && !inEmergency && shouldDiscardLastHistorianCompartment(newCompartments, chunk)) {
-    const lastEmitted = newCompartments[newCompartments.length - 1];
-    newCompartments = newCompartments.slice(0, -1);
-    discardedLast = true;
-    log2(`[magic-context] historian discard-last: dropped provisional compartment ${lastEmitted.startMessage}-${lastEmitted.endMessage} (lookaheadMargin=${chunk.endIndex - lastEmitted.endMessage}); will re-derive next run`);
-  }
-  const lastNewEnd = newCompartments[newCompartments.length - 1]?.endMessage ?? 0;
-  if (lastNewEnd + 1 <= offset) {
-    return {
-      ok: false,
-      status: "failed",
-      reason: `historian returned compartments that did not advance past raw message ${offset - 1}`
-    };
-  }
-  return {
-    ok: true,
-    status: "success",
-    chunk,
-    newCompartments,
-    lastNewEnd,
-    lastNewEndMessageId: newCompartments[newCompartments.length - 1]?.endMessageId ?? null,
-    discardedLast,
-    validated,
-    llmText: text
-  };
-}
-function publishHistorianResult(args) {
-  const { db, sessionId, leaseHolderId } = args;
-  const lastNewEndMessageId = args.newCompartments[args.newCompartments.length - 1]?.endMessageId;
-  const markerSummary = buildDshCompactionSummary(args.newCompartments);
-  const projectPath = args.directory ?? null;
-  const promotionActive = projectPath !== null;
-  const publishableEvents = (args.validated.events ?? []).filter((event) => {
-    if (typeof event.atCompartment !== "number")
-      return true;
-    return event.atCompartment <= args.newCompartments.length;
-  });
-  let published = false;
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    if (!isCompartmentLeaseHeld(db, sessionId, leaseHolderId)) {
-      db.exec("ROLLBACK");
-      published = true;
-      return { ok: false, persistedIds: [], eventsPublished: 0 };
-    }
-    appendCompartments(db, sessionId, args.newCompartments);
-    const persistedIds = getCompartments(db, sessionId).slice(-args.newCompartments.length).map((c) => c.id);
-    if (promotionActive) {
-      promoteSessionFactsDurable(db, sessionId, projectPath, args.validated.facts ?? []);
-    }
-    let eventsPublished = 0;
-    if (publishableEvents.length > 0) {
-      try {
-        insertCompartmentEvents(db, sessionId, publishableEvents, persistedIds);
-        eventsPublished = publishableEvents.length;
-      } catch (error51) {
-        args.log(`[magic-context] failed to store compartment events: ${describeError(error51).brief}`);
-      }
-    }
-    queueDropsForCompartmentalizedMessages(db, sessionId, args.lastNewEnd);
-    recordProtectedTailPublicationFloor(db, sessionId, args.lastNewEnd + 1);
-    if (lastNewEndMessageId) {
-      stageDshCompactionMarker(db, sessionId, {
-        ordinal: args.lastNewEnd,
-        endMessageId: lastNewEndMessageId,
-        tokensBefore: args.chunk.tokenEstimate,
-        summary: markerSummary
-      });
-    }
-    db.exec("COMMIT");
-    published = true;
-    return { ok: true, persistedIds, eventsPublished };
-  } finally {
-    if (!published) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {}
-    }
-  }
-}
-function buildDshCompactionSummary(compartments) {
-  if (compartments.length === 0)
-    return "Magic Context compacted prior history.";
-  const titles = compartments.map((c) => c.title.trim()).filter((title) => title.length > 0);
-  if (titles.length === 0) {
-    const first = compartments[0];
-    const last = compartments[compartments.length - 1];
-    return `Magic Context compacted messages ${first?.startMessage ?? "?"}-${last?.endMessage ?? "?"}.`;
-  }
-  const MAX_SUMMARY_TITLES = 5;
-  if (titles.length <= MAX_SUMMARY_TITLES) {
-    return `Magic Context compacted: ${titles.join("; ")}`;
-  }
-  const shown = titles.slice(0, MAX_SUMMARY_TITLES).join("; ");
-  return `Magic Context compacted ${titles.length} segments: ${shown}; …and ${titles.length - MAX_SUMMARY_TITLES} more`;
-}
-async function runDshHistorian(deps) {
-  const { db, sessionId } = deps;
-  const log2 = deps.log ?? (() => {});
-  const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
-  if (typeof deps.summarize !== "function") {
-    log2(`[magic-context] historian: missing summarize call for ${sessionId}`);
-    return false;
-  }
-  const lease = acquireCompartmentLease(db, sessionId, holderId);
-  if (lease === null) {
-    log2(`[magic-context] historian: compartment lease busy for ${sessionId}`);
-    return false;
-  }
-  const telemetry = { runKind: "incremental", status: "failed" };
-  let completedSuccessfully = false;
-  try {
-    await withRawMessageProvider(sessionId, deps.provider, async () => {
-      updateSessionMeta(db, sessionId, { compartmentInProgress: true });
-      const result = await runHistorianPassCore({
-        db,
-        sessionId,
-        provider: deps.provider,
-        summarize: deps.summarize,
-        directory: deps.directory,
-        chunkTokens: deps.chunkTokens,
-        boundarySnapshot: deps.boundarySnapshot,
-        refreshBoundarySnapshot: deps.refreshBoundarySnapshot,
-        currentContextLimit: deps.currentContextLimit,
-        leaseHolderId: holderId,
-        log: log2,
-        signal: deps.signal
-      });
-      if (!result.ok) {
-        telemetry.status = result.status === "noop" ? "noop" : "failed";
-        telemetry.failureReason = result.reason ?? null;
-        telemetry.chunkStartOrdinal = result.chunk?.startIndex ?? null;
-        telemetry.chunkEndOrdinal = result.chunk?.endIndex ?? null;
-        if (result.status === "failed") {
-          const reason = result.reason ?? "unknown";
-          log2(`[magic-context] historian failure: ${reason}`);
-          try {
-            deps.notifyIssue?.(buildHistorianFailureNotice(1, reason));
-          } catch (error51) {
-            log2(`[magic-context] historian notify failed: ${describeError(error51).brief}`);
-          }
-        }
-        return;
-      }
-      const publish = publishHistorianResult({
-        db,
-        sessionId,
-        directory: deps.directory,
-        leaseHolderId: holderId,
-        chunk: result.chunk,
-        newCompartments: result.newCompartments,
-        lastNewEnd: result.lastNewEnd,
-        validated: result.validated,
-        log: log2
-      });
-      if (!publish.ok) {
-        telemetry.failureReason = "publish failed (lease lost or transaction error)";
-        return;
-      }
-      completedSuccessfully = true;
-      telemetry.status = "success";
-      telemetry.chunkStartOrdinal = result.chunk.startIndex;
-      telemetry.chunkEndOrdinal = result.chunk.endIndex;
-      telemetry.unprocessedFrom = result.lastNewEnd + 1;
-      telemetry.compartmentsProduced = result.newCompartments.length;
-      const validIds = publish.persistedIds.filter((id) => typeof id === "number");
-      telemetry.compartmentIdMin = validIds.length > 0 ? Math.min(...validIds) : null;
-      telemetry.compartmentIdMax = validIds.length > 0 ? Math.max(...validIds) : null;
-      const facts = result.validated.facts ?? [];
-      telemetry.factsEmitted = facts.length;
-      telemetry.factsByCategory = facts.length > 0 ? tallyFactsByCategory(facts) : null;
-      telemetry.eventsEmitted = publish.eventsPublished;
-      const imp = summarizeImportance(result.newCompartments.map((c) => c.importance ?? 50));
-      telemetry.importanceMin = imp.min;
-      telemetry.importanceMax = imp.max;
-      telemetry.importanceAvg = imp.avg;
-      telemetry.discardedLast = result.discardedLast === true;
-      deps.onPublished?.();
-      try {
-        onNoteTrigger(deps.db, deps.sessionId, "historian_complete");
-      } catch {}
-      log2(`[magic-context] historian: published ${result.newCompartments.length} compartment(s), ${facts.length} fact(s) covering messages ${result.chunk.startIndex}-${result.lastNewEnd}`);
-    });
-  } catch (error51) {
-    const desc = describeError(error51);
-    telemetry.failureReason = `exception: ${desc.brief}`;
-    log2(`[magic-context] historian failure: source=exception ${desc.brief}`);
-    try {
-      deps.notifyIssue?.(buildHistorianFailureNotice(1, desc.brief));
-    } catch {}
-  } finally {
-    try {
-      releaseCompartmentLease(db, sessionId, holderId);
-    } catch (error51) {
-      log2(`[magic-context] historian lease release failed: ${describeError(error51).brief}`);
-    }
-    try {
-      updateSessionMeta(db, sessionId, { compartmentInProgress: false });
-    } catch (error51) {
-      log2(`[magic-context] historian meta update failed: ${describeError(error51).brief}`);
-    }
-    try {
-      recordHistorianRun(db, {
-        sessionId,
-        harness: "dsh",
-        runKind: telemetry.runKind ?? "incremental",
-        status: telemetry.status ?? "failed",
-        failureReason: telemetry.failureReason ?? null,
-        chunkStartOrdinal: telemetry.chunkStartOrdinal ?? null,
-        chunkEndOrdinal: telemetry.chunkEndOrdinal ?? null,
-        unprocessedFrom: telemetry.unprocessedFrom ?? null,
-        compartmentsProduced: telemetry.compartmentsProduced ?? 0,
-        compartmentIdMin: telemetry.compartmentIdMin ?? null,
-        compartmentIdMax: telemetry.compartmentIdMax ?? null,
-        factsEmitted: telemetry.factsEmitted ?? 0,
-        factsByCategory: telemetry.factsByCategory ?? null,
-        eventsEmitted: telemetry.eventsEmitted ?? 0,
-        importanceMin: telemetry.importanceMin ?? null,
-        importanceMax: telemetry.importanceMax ?? null,
-        importanceAvg: telemetry.importanceAvg ?? null,
-        discardedLast: telemetry.discardedLast ?? false
-      });
-    } catch {}
-  }
-  return completedSuccessfully;
-}
-function defaultResolveModel(agent) {
-  const options = agent.options;
-  return {
-    provider: options.provider ?? "dsh",
-    model: options.model ?? "unknown"
-  };
-}
-function createMagicSummarizeHook(deps) {
-  const sessionId = deps.sessionId;
-  const log2 = deps.log ?? (() => {});
-  const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
-  return async (input, agent, signal) => {
-    const { provider: provider2, model } = (deps.resolveModel ?? defaultResolveModel)(agent);
-    const messages = input.messages;
-    const emptyResult = {
-      summary: [{ type: "text", text: "Magic Context compacted prior history." }],
-      provider: provider2,
-      model
-    };
-    if (messages.length === 0)
-      return emptyResult;
-    const firstId = String(messages[0].id);
-    const lastId = String(messages[messages.length - 1].id);
-    return withRawMessageProvider(sessionId, deps.provider, async () => {
-      const firstOrdinal = readRawSessionMessageOrdinalById(sessionId, firstId);
-      const lastOrdinal = readRawSessionMessageOrdinalById(sessionId, lastId);
-      if (firstOrdinal === null || lastOrdinal === null || lastOrdinal < firstOrdinal) {
-        throw new Error(`magic-context: summarize range unresolvable for ${sessionId} (messages ${firstId}..${lastId})`);
-      }
-      const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, sessionId);
-      let rawOutput;
-      if (lastCompartmentEnd < lastOrdinal) {
-        const lease = acquireCompartmentLease(deps.db, sessionId, holderId);
-        if (lease === null) {
-          throw new Error(`magic-context: summarize mini-historian lease busy for ${sessionId} (another historian pass is running)`);
-        }
-        try {
-          const result = await runHistorianPassCore({
-            db: deps.db,
-            sessionId,
-            provider: deps.provider,
-            summarize: deps.summarize,
-            directory: deps.directory,
-            chunkTokens: deps.chunkTokens,
-            leaseHolderId: holderId,
-            log: log2,
-            signal,
-            eligibleEndOrdinalOverride: lastOrdinal + 1,
-            keepLastCompartment: true
-          });
-          if (!result.ok) {
-            throw new Error(`magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`);
-          }
-          const publish = publishHistorianResult({
-            db: deps.db,
-            sessionId,
-            directory: deps.directory,
-            leaseHolderId: holderId,
-            chunk: result.chunk,
-            newCompartments: result.newCompartments,
-            lastNewEnd: result.lastNewEnd,
-            validated: result.validated,
-            log: log2
-          });
-          if (!publish.ok) {
-            throw new Error("magic-context: summarize mini-historian publish failed (lease lost or transaction error)");
-          }
-          rawOutput = result.llmText ?? undefined;
-        } finally {
-          try {
-            releaseCompartmentLease(deps.db, sessionId, holderId);
-          } catch (error51) {
-            log2(`[magic-context] summarize mini-historian lease release failed: ${describeError(error51).brief}`);
-          }
-        }
-      }
-      const compartments = getCompartments(deps.db, sessionId).filter((c) => c.endMessage >= firstOrdinal && c.startMessage <= lastOrdinal);
-      const facts = getSessionFacts(deps.db, sessionId);
-      const text = buildCompartmentBlock(compartments, facts);
-      if (text.length === 0) {
-        throw new Error(`magic-context: summarize produced no compartment content for ${sessionId} range ${firstOrdinal}-${lastOrdinal}`);
-      }
-      return {
-        summary: [{ type: "text", text }],
-        provider: provider2,
-        model,
-        ...rawOutput !== undefined ? { rawOutput: [{ type: "text", text: rawOutput }] } : {}
-      };
-    });
-  };
 }
 
 // src/agent/nudge.ts
@@ -46830,13 +47329,13 @@ function currentRoute(ctx) {
     model: selection?.model ?? "deepseek-chat"
   };
 }
-function createLlmSummarizeCall(ctx) {
+function createLlmSummarizeCall(ctx, modelOverride) {
   const llm = readLlm(ctx);
   if (llm === undefined) {
     throw new Error("magic-context: llm service unavailable (historian wiring)");
   }
   return async (chunk, _priorCompartments, signal) => {
-    const { provider: provider2, model } = currentRoute(ctx);
+    const { provider: provider2, model } = modelOverride !== undefined && modelOverride.includes("/") ? { provider: modelOverride.split("/")[0], model: modelOverride.split("/").slice(1).join("/") } : currentRoute(ctx);
     const prompt = buildCompartmentAgentPrompt({
       seedExamples: "",
       sessionReferences: "",
@@ -47032,7 +47531,8 @@ function maybeFireHistorian(historian, db, sessionId, agent, directory) {
         db,
         sessionId,
         directory,
-        provider: transcriptRawMessageProvider(agent, sessionId)
+        provider: transcriptRawMessageProvider(agent, sessionId),
+        contextWindow
       });
     }
   } catch {}
@@ -47465,14 +47965,14 @@ async function createChildSessionWithFence(args) {
 
 // ../plugin/src/shared/assistant-message-extractor.ts
 function asSessionMessage(value) {
-  if (!isRecord(value))
+  if (!isRecord2(value))
     return null;
   const info = value.info;
   const parts = value.parts;
   return {
-    info: isRecord(info) ? {
+    info: isRecord2(info) ? {
       role: typeof info.role === "string" ? info.role : undefined,
-      time: isRecord(info.time) ? {
+      time: isRecord2(info.time) ? {
         created: typeof info.time.created === "number" ? info.time.created : undefined
       } : undefined
     } : undefined,
@@ -47485,7 +47985,7 @@ function getCreatedTime(message) {
 function getTextParts(message) {
   if (!Array.isArray(message.parts))
     return [];
-  return message.parts.filter((part) => isRecord(part)).map((part) => ({
+  return message.parts.filter((part) => isRecord2(part)).map((part) => ({
     type: typeof part.type === "string" ? part.type : undefined,
     text: typeof part.text === "string" ? part.text : undefined
   })).filter((part) => part.type === "text" && Boolean(part.text));
@@ -47503,7 +48003,7 @@ function extractLatestAssistantText(messages) {
 function hasLengthCappedOutput(value) {
   if (Array.isArray(value))
     return value.some((item) => hasLengthCappedOutput(item));
-  if (!isRecord(value))
+  if (!isRecord2(value))
     return false;
   if (value.length_capped === true || value.lengthCapped === true)
     return true;
@@ -47652,13 +48152,13 @@ function finiteTokenCount(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 function completionShape(value) {
-  if (!isRecord(value))
+  if (!isRecord2(value))
     return null;
-  const info = isRecord(value.info) ? value.info : value;
+  const info = isRecord2(value.info) ? value.info : value;
   if (info.role !== "assistant")
     return null;
-  const time3 = isRecord(info.time) ? info.time : null;
-  const tokens = isRecord(info.tokens) ? info.tokens : null;
+  const time3 = isRecord2(info.time) ? info.time : null;
+  const tokens = isRecord2(info.tokens) ? info.tokens : null;
   return {
     createdAt: typeof time3?.created === "number" ? time3.created : 0,
     finish: typeof info.finish === "string" ? info.finish : typeof info.finish_reason === "string" ? info.finish_reason : typeof info.finishReason === "string" ? info.finishReason : null,
@@ -50863,8 +51363,8 @@ Output exactly JSON: {"met": false}`;
 }
 
 // ../plugin/src/features/magic-context/dreamer/maintain-docs-protected-enforcement.ts
-import { existsSync as existsSync10, readFileSync as readFileSync8, writeFileSync as writeFileSync2 } from "node:fs";
-import { join as join8 } from "node:path";
+import { existsSync as existsSync10, readFileSync as readFileSync9, writeFileSync as writeFileSync2 } from "node:fs";
+import { join as join9 } from "node:path";
 
 // ../plugin/src/features/magic-context/dreamer/protected-regions.ts
 var PROTECTED_START_TOKEN = "mc:protected START";
@@ -50965,10 +51465,10 @@ var MAINTAIN_DOCS_SNAPSHOT_FILES = ["ARCHITECTURE.md", "STRUCTURE.md"];
 function snapshotMaintainDocsFiles(docsDir) {
   const snapshot = new Map;
   for (const name of MAINTAIN_DOCS_SNAPSHOT_FILES) {
-    const path5 = join8(docsDir, name);
+    const path5 = join9(docsDir, name);
     try {
       if (existsSync10(path5)) {
-        snapshot.set(name, readFileSync8(path5, "utf8"));
+        snapshot.set(name, readFileSync9(path5, "utf8"));
       }
     } catch {}
   }
@@ -50976,9 +51476,9 @@ function snapshotMaintainDocsFiles(docsDir) {
 }
 function enforceMaintainDocsProtectedRegions(args) {
   for (const [fileName, original] of args.snapshot) {
-    const path5 = join8(args.docsDir, fileName);
+    const path5 = join9(args.docsDir, fileName);
     try {
-      const current = readFileSync8(path5, "utf8");
+      const current = readFileSync9(path5, "utf8");
       const { text, violated } = enforceProtectedRegions(original, current);
       if (!violated) {
         continue;
@@ -53972,7 +54472,7 @@ function cleanupHistorianStateFile(path7) {
 }
 // ../plugin/src/hooks/magic-context/compartment-runner-historian.ts
 import { mkdirSync as mkdirSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
-import { join as join9 } from "node:path";
+import { join as join10 } from "node:path";
 function historianResponseDumpDir(directory) {
   return getProjectMagicContextHistorianDir(directory);
 }
@@ -53981,17 +54481,17 @@ var HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted
 function extractLatestHistorianReasoning(messages) {
   if (!Array.isArray(messages))
     return null;
-  const latest = messages.filter((message) => isRecord(message) && isRecord(message.info) && message.info.role === "assistant").sort((left, right) => historianMessageCreatedAt(right) - historianMessageCreatedAt(left))[0];
+  const latest = messages.filter((message) => isRecord2(message) && isRecord2(message.info) && message.info.role === "assistant").sort((left, right) => historianMessageCreatedAt(right) - historianMessageCreatedAt(left))[0];
   if (!latest || !Array.isArray(latest.parts))
     return null;
   return latest.parts.filter(isHistorianReasoningPart).map((part) => part.text).join(`
 `) || null;
 }
 function isHistorianReasoningPart(part) {
-  return isRecord(part) && typeof part.type === "string" && HISTORIAN_REASONING_PART_TYPES.has(part.type) && typeof part.text === "string" && part.text.length > 0;
+  return isRecord2(part) && typeof part.type === "string" && HISTORIAN_REASONING_PART_TYPES.has(part.type) && typeof part.text === "string" && part.text.length > 0;
 }
 function historianMessageCreatedAt(message) {
-  if (!isRecord(message.info) || !isRecord(message.info.time))
+  if (!isRecord2(message.info) || !isRecord2(message.info.time))
     return 0;
   return typeof message.info.time.created === "number" ? message.info.time.created : 0;
 }
@@ -54314,7 +54814,7 @@ function dumpHistorianResponse(sessionId, directory, label, text) {
     ensureCortexKitArtifactGitignore(directory);
     const safeSessionId = sanitizeDumpName(sessionId);
     const safeLabel = sanitizeDumpName(label);
-    const dumpPath = join9(dumpDir, `${safeSessionId}-${safeLabel}-${Date.now()}.xml`);
+    const dumpPath = join10(dumpDir, `${safeSessionId}-${safeLabel}-${Date.now()}.xml`);
     writeFileSync4(dumpPath, text, "utf8");
     sessionLog(sessionId, "compartment agent: historian response dumped", {
       label,
@@ -58054,26 +58554,26 @@ var HISTORIAN_SYSTEM_PROMPTS = new Map([
   ["historian-recomp", COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT],
   ["historian-editor", HISTORIAN_EDITOR_SYSTEM_PROMPT]
 ]);
-function isRecord5(value) {
+function isRecord6(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function readPromptInput(input) {
-  if (!isRecord5(input))
+  if (!isRecord6(input))
     return {};
-  const path7 = isRecord5(input.path) ? input.path : undefined;
-  const body = isRecord5(input.body) ? input.body : undefined;
-  const query = isRecord5(input.query) ? input.query : undefined;
+  const path7 = isRecord6(input.path) ? input.path : undefined;
+  const body = isRecord6(input.body) ? input.body : undefined;
+  const query = isRecord6(input.query) ? input.query : undefined;
   const signal = input.signal instanceof AbortSignal ? input.signal : undefined;
   return { path: path7, query, body, signal };
 }
 function extractPromptText(parts) {
   if (!Array.isArray(parts))
     return "";
-  return parts.map((part) => isRecord5(part) ? part.text : undefined).filter((text) => typeof text === "string" && text.length > 0).join(`
+  return parts.map((part) => isRecord6(part) ? part.text : undefined).filter((text) => typeof text === "string" && text.length > 0).join(`
 `);
 }
 function readBodyModel(model) {
-  if (!isRecord5(model))
+  if (!isRecord6(model))
     return;
   const { providerID, modelID } = model;
   if (typeof providerID === "string" && providerID.length > 0 && typeof modelID === "string" && modelID.length > 0) {
@@ -58203,8 +58703,8 @@ function createDshSessionClient(deps) {
         return { data: directory ? { directory } : {} };
       },
       create: async (input) => {
-        const record2 = isRecord5(input) ? input : {};
-        const body = isRecord5(record2.body) ? record2.body : {};
+        const record2 = isRecord6(input) ? input : {};
+        const body = isRecord6(record2.body) ? record2.body : {};
         const id = `dsh-magic-context-recomp-${++counter}`;
         const parentID = typeof body.parentID === "string" ? body.parentID : "";
         if (parentID.length > 0)
@@ -58660,6 +59160,7 @@ function bridgeMagicConfig(config2, directory) {
     knowledge: {
       ...config2.knowledge,
       injectDocs: config2.knowledge?.injectDocs ?? dreamerCfg?.inject_docs ?? true,
+      compactionOff: config2.knowledge?.compactionOff ?? compactionCfg?.enabled === false,
       memoryInjectionBudgetTokens: config2.knowledge?.memoryInjectionBudgetTokens ?? memoryCfg?.injection_budget_tokens,
       muralEnabled: config2.knowledge?.muralEnabled ?? muralCfg?.enabled ?? false,
       cacheTtl: config2.knowledge?.cacheTtl ?? (typeof cfg.cache_ttl === "string" ? cfg.cache_ttl : undefined)
@@ -58683,6 +59184,7 @@ function bridgeMagicConfig(config2, directory) {
     historian: {
       ...config2.historian,
       executeThresholdPercentage: config2.historian?.executeThresholdPercentage ?? threshold,
+      model: config2.historian?.model ?? (typeof cfg.historian?.model === "string" ? cfg.historian.model : undefined),
       commitClusterTrigger: config2.historian?.commitClusterTrigger ?? (commitCluster !== undefined ? { enabled: commitCluster.enabled ?? true, min_clusters: commitCluster.min_clusters ?? 3 } : undefined)
     },
     autoSearch: {
@@ -58748,14 +59250,15 @@ function apply(ctx, config2 = {}) {
     historian: {
       config: config2.historian,
       readPressure: readContextPressure(ctx),
-      fire: ({ db, sessionId, directory: fireDirectory, provider: provider2 }) => {
+      fire: ({ db, sessionId, directory: fireDirectory, provider: provider2, contextWindow }) => {
         runDshHistorian({
           db,
           sessionId,
           directory: fireDirectory,
           provider: provider2,
-          summarize: createLlmSummarizeCall(ctx),
+          summarize: createLlmSummarizeCall(ctx, config2.historian?.model),
           model: currentModel(ctx),
+          currentContextLimit: contextWindow,
           onPublished: () => {
             signalDshDeferredHistoryRefresh(sessionId);
             signalDshDeferredMaterialization(sessionId);

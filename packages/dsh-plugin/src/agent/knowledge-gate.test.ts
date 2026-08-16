@@ -441,3 +441,57 @@ describe("synthetic todowrite replay (Magic todo-view parity)", () => {
     }
   });
 });
+
+describe("deferred materialization after historian publish (Pi parity)", () => {
+  it("forces an m0 re-materialization that renders <session-history> compartments", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kg-deferred-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const deps = { ...fakeDeps(db, dir), config: { injectDocs: false, compactionOff: false } };
+      const state = createKnowledgeGateState();
+      const harness = makeFakeAgent(dir);
+      const sid = canonicalSessionKey(HOME_HASH, harness.agent.id);
+
+      // 首轮物化：空 m0。
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("first")] }, passThroughNext());
+      let meta = db.prepare("SELECT cached_m0_bytes FROM session_meta WHERE session_id=?").get(sid) as { cached_m0_bytes: Buffer | null };
+      let text = meta.cached_m0_bytes ? new TextDecoder().decode(meta.cached_m0_bytes) : "";
+      expect(text).toContain("<session-history></session-history>");
+
+      // 模拟 historian 发布：用共享 appendCompartments 写入 + 发 deferred 信号。
+      const { appendCompartments } = await import("@magic-context/core/features/magic-context/compartment-storage");
+      appendCompartments(db, sid, [
+        {
+          sequence: 0,
+          title: "First compacted arc",
+          importance: 10,
+          startMessage: 1,
+          endMessage: 3,
+          content: "First compacted arc content",
+          p1: "p1 text",
+          p2: "p2",
+          p3: "p3",
+          p4: "p4",
+          episodeType: "docs",
+          firstKeptEntryId: "e1",
+        },
+      ]);
+      const { signalDshDeferredMaterialization } = await import("./historian");
+      signalDshDeferredMaterialization(sid);
+
+      // 下一轮 pre-step：应强制 HARD 物化 → m0 渲染 <session-history> 含 compartment。
+      state.injectedGenerations.delete(sid);
+      harness.replaceGeneration = 1;
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("after publish")] }, passThroughNext());
+      meta = db.prepare("SELECT cached_m0_bytes FROM session_meta WHERE session_id=?").get(sid) as { cached_m0_bytes: Buffer | null };
+      text = meta.cached_m0_bytes ? new TextDecoder().decode(meta.cached_m0_bytes) : "";
+      expect(text).toContain("<session-history>");
+      expect(text).toContain("First compacted arc");
+      expect(text).not.toContain("<session-history></session-history>");
+    } finally {
+      db?.close();
+      await cleanupDir(dir, db);
+    }
+  });
+});
