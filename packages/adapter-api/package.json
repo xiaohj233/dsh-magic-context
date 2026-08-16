@@ -1,6 +1,6 @@
 {
   "name": "dsh-magic-context-adapter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Magic Context adapter-api: stable Host-neutral facade over the shared Magic Context core for harness adapters (initial: type + contract surface only, per PLAN §2).",
   "main": "dist/index.js",

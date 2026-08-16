@@ -4,7 +4,7 @@
 
 [English](./README.en.md) | **中文**
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)
+![Version](https://img.shields.io/badge/version-0.1.1-blue.svg)
 ![DSH](https://img.shields.io/badge/DSH-0.1.0--rc.6-111827.svg)
 ![Magic Context](https://img.shields.io/badge/Magic%20Context-0.36.1-7C3AED.svg)
 ![Harness](https://img.shields.io/badge/harness-dsh-5391FE.svg)
