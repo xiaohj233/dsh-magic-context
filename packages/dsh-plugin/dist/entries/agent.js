@@ -37141,7 +37141,7 @@ ${hintText}`;
 
 // src/agent/knowledge-gate.ts
 function createKnowledgeGateState() {
-  return { injectedGenerations: new Map, trackedSessions: new Set };
+  return { injectedGenerations: new Map, trackedSessions: new Set, lastInjectedMessages: [] };
 }
 var M1_EMPTY_PLACEHOLDER2 = "<session-history-since>(no new content since last materialization)</session-history-since>";
 function sha256Hex(input) {
@@ -37292,9 +37292,17 @@ async function maybeInjectKnowledge(state, deps, agent, db, magicSessionId, proj
       deps.log?.(`[magic-context] mural injection skipped (fail-open): ${error51 instanceof Error ? error51.message : String(error51)}`);
     }
   }
-  const message = magicUserMessage(blocks.text, source, muralBlock === null || muralBlock === undefined ? [] : [muralBlock]);
-  agent.inject(message);
+  const muralBlocks = muralBlock === null || muralBlock === undefined ? [] : [muralBlock];
+  const m0Message = magicUserMessage(blocks.m0Text, source, muralBlocks);
+  const m1Source = {
+    ...source,
+    messageId: `${blocks.watermark}:m1`
+  };
+  const m1Message = magicUserMessage(blocks.m1Text, m1Source, []);
+  agent.inject(m0Message);
+  agent.inject(m1Message);
   state.injectedGenerations.set(magicSessionId, generation);
+  state.lastInjectedMessages = [m0Message, m1Message];
   deps.log?.(`[magic-context] injected knowledge baseline ${blocks.watermark} for ${magicSessionId}@gen${generation}`);
 }
 function resolveKnowledgeProjectPath(directory) {
@@ -37320,6 +37328,11 @@ async function runKnowledgeGateStep(state, deps, payload, next) {
       const projectPath = resolveKnowledgeProjectPath(directory);
       trackSessionProjectOnce(state.trackedSessions, db, magicSessionId, projectPath);
       await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory);
+      if (state.lastInjectedMessages.length > 0) {
+        const injected = state.lastInjectedMessages;
+        state.lastInjectedMessages = [];
+        payload.messages.unshift(...injected);
+      }
       maybeRunAutoSearchHint({
         db,
         sessionId: magicSessionId,
@@ -58374,6 +58387,17 @@ function bridgeMagicConfig(config2, directory) {
       dreamerEnabled: config2.tools?.dreamerEnabled ?? isDreamerRunnable(cfg),
       compactionOff: config2.tools?.compactionOff ?? !isCompactionEnabled(cfg),
       protectedTags: config2.tools?.protectedTags ?? cfg.protected_tags
+    },
+    guidance: {
+      ...config2.guidance,
+      directory: config2.guidance?.directory ?? directory,
+      protectedTags: config2.guidance?.protectedTags ?? cfg.protected_tags,
+      ctxReduceCallable: config2.guidance?.ctxReduceCallable ?? isCompactionEnabled(cfg),
+      dreamerEnabled: config2.guidance?.dreamerEnabled ?? isDreamerRunnable(cfg),
+      temporalAwarenessEnabled: config2.guidance?.temporalAwarenessEnabled ?? cfg.temporal_awareness === true,
+      cavemanTextCompressionEnabled: config2.guidance?.cavemanTextCompressionEnabled ?? (typeof cfg.caveman_text_compression === "object" && cfg.caveman_text_compression !== null && cfg.caveman_text_compression.enabled === true),
+      memoryEnabled: config2.guidance?.memoryEnabled ?? memoryCfg?.enabled !== false,
+      promptSurface: config2.guidance?.promptSurface ?? cfg.prompt_surface
     },
     commands: {
       ...config2.commands,

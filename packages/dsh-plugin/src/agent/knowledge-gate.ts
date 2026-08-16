@@ -111,10 +111,12 @@ export interface KnowledgeGateState {
   readonly injectedGenerations: Map<string, number>;
   /** sessionId → project attribution already recorded for. */
   readonly trackedSessions: Set<string>;
+  /** Messages injected by the most recent pass (first-round prepend). */
+  lastInjectedMessages: unknown[];
 }
 
 export function createKnowledgeGateState(): KnowledgeGateState {
-  return { injectedGenerations: new Map(), trackedSessions: new Set() };
+  return { injectedGenerations: new Map(), trackedSessions: new Set(), lastInjectedMessages: [] };
 }
 
 /** The session surface slice the gate reads (test-friendly structural view). */
@@ -374,15 +376,22 @@ export async function maybeInjectKnowledge(
     }
   }
 
-  const message = magicUserMessage(
-    blocks.text,
-    source,
+  const muralBlocks =
     muralBlock === null || muralBlock === undefined
       ? []
-      : ([muralBlock] as unknown as Parameters<typeof magicUserMessage>[2]),
-  );
-  agent.inject(message);
+      : ([muralBlock] as unknown as Parameters<typeof magicUserMessage>[2]);
+  // Pi 语义：m0 与 m1 是两条独立合成 user 消息（m0/m1 缓存分裂契约）。
+  const m0Message = magicUserMessage(blocks.m0Text, source, muralBlocks);
+  const m1Source: MagicMessageSource = {
+    ...source,
+    messageId: `${blocks.watermark}:m1`,
+  };
+  const m1Message = magicUserMessage(blocks.m1Text, m1Source, []);
+  agent.inject(m0Message);
+  agent.inject(m1Message);
   state.injectedGenerations.set(magicSessionId, generation);
+  // 首轮 pre-step 前置用：本次 LLM 调用即可见（Pi transform unshift 语义）。
+  state.lastInjectedMessages = [m0Message, m1Message];
   deps.log?.(
     `[magic-context] injected knowledge baseline ${blocks.watermark} for ${magicSessionId}@gen${generation}`,
   );
@@ -424,6 +433,14 @@ export async function runKnowledgeGateStep(
 
       // Knowledge baseline (once per surface generation).
       await maybeInjectKnowledge(state, deps, agent, db, magicSessionId, projectPath, directory);
+      // Pi transform 语义：首轮注入的消息前置到本次调用的消息列表（立即可见）。
+      // agent.inject 排队到下一批 pre-step；前置只影响本次调用，不写 surface，
+      // 因此不会与下一批 surface 中的基线重复（watermark/状态去重）。
+      if (state.lastInjectedMessages.length > 0) {
+        const injected = state.lastInjectedMessages;
+        state.lastInjectedMessages = [];
+        (payload.messages as unknown[]).unshift(...injected);
+      }
 
       // Auto-search hint on the incoming user message — fire-and-forget so the
       // pre-step chain is never delayed by search latency (3s cap inside).

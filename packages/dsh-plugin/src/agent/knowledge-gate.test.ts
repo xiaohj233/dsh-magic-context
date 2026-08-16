@@ -150,12 +150,15 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       );
 
       expect(decision.kind).toBe("enter");
-      expect(harness.injected.length).toBe(1);
+      // Pi 语义：m0 与 m1 是两条独立合成消息。
+      expect(harness.injected.length).toBe(2);
       const message = harness.injected[0];
       expect(message.role).toBe("user");
       expect(message.content[0].type).toBe("text");
       const text = message.content[0].type === "text" ? message.content[0].text : "";
       expect(text).toContain("unique knowledge content alpha");
+      const m1Text = harness.injected[1].content[0].type === "text" ? harness.injected[1].content[0].text : "";
+      expect(m1Text).toContain("<session-history-since>");
       const source = message.source as {
         kind: string;
         plugin: string;
@@ -198,7 +201,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("second message about the build pipeline")] }, passThroughNext());
       await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("third message about the release process")] }, passThroughNext());
 
-      expect(harness.injected.length).toBe(1);
+      expect(harness.injected.length).toBe(2);
     } finally {
       await cleanupDir(dir, db);
     }
@@ -221,7 +224,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const harness = makeFakeAgent(dir);
 
       await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("first turn question")] }, passThroughNext());
-      expect(harness.injected.length).toBe(1);
+      expect(harness.injected.length).toBe(2);
       const firstWatermark = (harness.injected[0].source as { messageId?: string }).messageId;
 
       // Compact/clear: surface replaced → new generation, old nodes shadowed.
@@ -231,8 +234,9 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
 
       await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("second turn after compaction")] }, passThroughNext());
 
-      expect(harness.injected.length).toBe(2);
-      const secondWatermark = (harness.injected[1].source as { messageId?: string }).messageId;
+      // 新 generation 重新注入两条（m0+m1）→ 累计 4 条。
+      expect(harness.injected.length).toBe(4);
+      const secondWatermark = (harness.injected[2].source as { messageId?: string }).messageId;
       // Cache was valid: same persisted bytes → same content watermark.
       expect(secondWatermark).toBe(firstWatermark);
     } finally {
@@ -251,7 +255,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       // First process: inject once.
       const firstState = createKnowledgeGateState();
       await runKnowledgeGateStep(firstState, deps, { agent: harness.agent, messages: [userMessage("resume scenario first message")] }, passThroughNext());
-      expect(harness.injected.length).toBe(1);
+      expect(harness.injected.length).toBe(2);
       const watermark = (harness.injected[0].source as { messageId?: string }).messageId as string;
       expect(isMagicWatermarkOnSurface(harness.agent.session, watermark)).toBe(true);
 
@@ -259,7 +263,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       // the visible surface still carries the watermark → no re-injection.
       const resumedState = createKnowledgeGateState();
       await runKnowledgeGateStep(resumedState, deps, { agent: harness.agent, messages: [userMessage("post-restart message")] }, passThroughNext());
-      expect(harness.injected.length).toBe(1);
+      expect(harness.injected.length).toBe(2);
     } finally {
       await cleanupDir(dir, db);
     }
@@ -363,7 +367,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const state2 = createKnowledgeGateState();
       const harness2 = makeFakeAgent(dir);
       await maybeInjectKnowledge(state2, depsMuralConfig, harness2.agent, db, magicSessionId, resolveKnowledgeProjectPath(dir), dir);
-      expect(harness2.injected.length).toBe(1);
+      expect(harness2.injected.length).toBe(2);
       const content = harness2.injected[0]?.content ?? [];
       expect(content.some((block) => block.type === "image")).toBe(true);
       expect(content.some((block) => block.type === "text")).toBe(true);

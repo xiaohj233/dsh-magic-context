@@ -210,6 +210,22 @@ export function bridgeMagicConfig(
       compactionOff: config.tools?.compactionOff ?? !isCompactionEnabled(cfg),
       protectedTags: config.tools?.protectedTags ?? cfg.protected_tags,
     },
+    guidance: {
+      ...config.guidance,
+      directory: config.guidance?.directory ?? directory,
+      protectedTags: config.guidance?.protectedTags ?? cfg.protected_tags,
+      ctxReduceCallable: config.guidance?.ctxReduceCallable ?? isCompactionEnabled(cfg),
+      dreamerEnabled: config.guidance?.dreamerEnabled ?? isDreamerRunnable(cfg),
+      temporalAwarenessEnabled:
+        config.guidance?.temporalAwarenessEnabled ?? cfg.temporal_awareness === true,
+      cavemanTextCompressionEnabled:
+        config.guidance?.cavemanTextCompressionEnabled ??
+        (typeof cfg.caveman_text_compression === "object" &&
+        cfg.caveman_text_compression !== null &&
+        (cfg.caveman_text_compression as { enabled?: unknown }).enabled === true),
+      memoryEnabled: config.guidance?.memoryEnabled ?? memoryCfg?.enabled !== false,
+      promptSurface: config.guidance?.promptSurface ?? cfg.prompt_surface,
+    },
     commands: {
       ...config.commands,
       executeThresholdPercentage: config.commands?.executeThresholdPercentage ?? threshold,
