@@ -31975,6 +31975,19 @@ function rollbackProtectedTailDrainReservation(db, reservation) {
              WHERE session_id = ?`).run(reservation.tokens, reservation.sessionId);
   })();
 }
+function isEmergencyInputSampleRow(row) {
+  return typeof row === "object" && row !== null && typeof row.last_emergency_input_sample === "number";
+}
+function getEmergencyInputSample(db, sessionId) {
+  const result = db.prepare("SELECT last_emergency_input_sample FROM session_meta WHERE session_id = ?").get(sessionId);
+  return isEmergencyInputSampleRow(result) ? result.last_emergency_input_sample : 0;
+}
+function setEmergencyDropSample(db, sessionId, inputSample) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET last_emergency_input_sample = ? WHERE session_id = ?").run(Math.max(0, Math.round(inputSample)), sessionId);
+  })();
+}
 function isLastNudgeUndroppedRow(row) {
   return typeof row === "object" && row !== null && typeof row.last_nudge_undropped === "number";
 }
@@ -32878,8 +32891,32 @@ function bumpProjectUserProfileVersion(db, projectPath = GLOBAL_USER_PROFILE_PRO
   return state;
 }
 // ../plugin/src/features/magic-context/storage-source.ts
+function isSourceContentRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.tag_id === "number" && typeof r.content === "string";
+}
 function saveSourceContent(db, sessionId, tagId, content) {
   db.prepare("INSERT OR IGNORE INTO source_contents (tag_id, session_id, content, created_at, harness) VALUES (?, ?, ?, ?, ?)").run(tagId, sessionId, content, Date.now(), getHarness());
+}
+function replaceSourceContent(db, sessionId, tagId, content) {
+  db.prepare(`INSERT INTO source_contents (tag_id, session_id, content, created_at, harness)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(session_id, tag_id)
+     DO UPDATE SET content = excluded.content, created_at = excluded.created_at`).run(tagId, sessionId, content, Date.now(), getHarness());
+}
+function getSourceContents(db, sessionId, tagIds) {
+  if (tagIds.length === 0) {
+    return new Map;
+  }
+  const placeholders4 = tagIds.map(() => "?").join(", ");
+  const rows = db.prepare(`SELECT tag_id, content FROM source_contents WHERE session_id = ? AND tag_id IN (${placeholders4})`).all(sessionId, ...tagIds).filter(isSourceContentRow);
+  const sources = new Map;
+  for (const row of rows) {
+    sources.set(row.tag_id, row.content);
+  }
+  return sources;
 }
 // ../plugin/src/features/magic-context/storage-subagent-invocations.ts
 function clampToken(value) {
@@ -33114,6 +33151,9 @@ function updateTagStatus(db, sessionId, tagId, status) {
 function updateTagDropMode(db, sessionId, tagNumber, dropMode) {
   getUpdateTagDropModeStatement(db).run(dropMode, sessionId, tagNumber);
 }
+function updateCavemanDepth(db, sessionId, tagNumber, depth) {
+  db.prepare("UPDATE tags SET caveman_depth = ? WHERE session_id = ? AND tag_number = ?").run(depth, sessionId, tagNumber);
+}
 var getOwnerScopedToolTagNumbersStatements = new WeakMap;
 function getMaxTagNumberBySession(db, sessionId) {
   const row = getMaxTagNumberBySessionStatement(db).get(sessionId);
@@ -33132,6 +33172,18 @@ function getTagsBySession(db, sessionId) {
 var getActiveTagsBySessionStatements = new WeakMap;
 var getDroppedTagsBySessionStatements = new WeakMap;
 var getMaxDroppedTagNumberStatements = new WeakMap;
+function getActiveTagsBySessionStatement(db) {
+  let stmt = getActiveTagsBySessionStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'active' ORDER BY tag_number ASC, id ASC`);
+    getActiveTagsBySessionStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getActiveTagsBySession(db, sessionId) {
+  const rows = getActiveTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
+  return rows.map(toTagEntry);
+}
 var getToolTagNumberByOwnerStatements = new WeakMap;
 var getNullOwnerToolTagStatements = new WeakMap;
 var adoptNullOwnerToolTagStatements = new WeakMap;
@@ -38033,6 +38085,1025 @@ function applyFlushedStatuses(sessionId, db, targets, preloadedTags) {
   }
   return didMutateMessage;
 }
+// ../plugin/src/features/magic-context/overflow-detection.ts
+var OVERFLOW_PATTERNS = [
+  /prompt is too long/i,
+  /input is too long for requested model/i,
+  /exceeds the context window/i,
+  /input token count.*exceeds the maximum/i,
+  /maximum prompt length is \d+/i,
+  /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i,
+  /maximum model length is \d+/i,
+  /exceeds the limit of \d+/i,
+  /exceeds the available context size/i,
+  /greater than the context length/i,
+  /context window exceeds limit/i,
+  /exceeded model token limit/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /request entity too large/i,
+  /context length is only \d+ tokens/i,
+  /input length.*exceeds.*context length/i,
+  /prompt too long; exceeded (?:max )?context length/i,
+  /too large for model with \d+ maximum context length/i,
+  /model_context_window_exceeded/i,
+  /context size has been exceeded/i
+];
+var LIMIT_EXTRACTION_PATTERNS = [
+  { pattern: /maximum prompt length is (\d+)/i, provenance: "prompt_only" },
+  {
+    pattern: /maximum context length is (\d+) tokens?/i,
+    provenance: "combined"
+  },
+  { pattern: /maximum model length is (\d+)/i, provenance: "combined" },
+  { pattern: /context length is only (\d+) tokens?/i, provenance: "combined" },
+  { pattern: /exceeds the limit of (\d+)/i, provenance: "unknown" },
+  {
+    pattern: /too large for model with (\d+) maximum context length/i,
+    provenance: "combined"
+  },
+  { pattern: /context size[^0-9]{0,40}(\d{4,})\s*tokens?/i, provenance: "combined" },
+  { pattern: /exceeds? the context length of (\d+)/i, provenance: "combined" },
+  {
+    pattern: />\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b/i,
+    provenance: "prompt_only"
+  },
+  { pattern: /max(?:imum)?.*context.*?(\d+)/i, provenance: "unknown" }
+];
+var MIN_PLAUSIBLE_LIMIT = 1024;
+var MAX_PLAUSIBLE_LIMIT = 1e7;
+function extractErrorMessage(error51) {
+  if (!error51)
+    return "";
+  if (typeof error51 === "string")
+    return error51;
+  if (typeof error51 === "object") {
+    const obj = error51;
+    const nested = obj.error;
+    if (nested && typeof nested.message === "string" && nested.message.length > 0) {
+      return nested.message;
+    }
+  }
+  if (error51 instanceof Error)
+    return error51.message;
+  if (typeof error51 === "object") {
+    const obj = error51;
+    if (typeof obj.message === "string")
+      return obj.message;
+    if (typeof obj.responseBody === "string")
+      return obj.responseBody;
+    try {
+      return JSON.stringify(error51);
+    } catch {
+      return String(error51);
+    }
+  }
+  return String(error51);
+}
+function detectOverflow(error51) {
+  const message = extractErrorMessage(error51);
+  if (!message) {
+    return { isOverflow: false };
+  }
+  const hasStatus413 = /\b413\b/.test(message) && /(entity|payload|context|prompt)/i.test(message);
+  let matched;
+  for (const pattern of OVERFLOW_PATTERNS) {
+    if (pattern.test(message)) {
+      matched = pattern;
+      break;
+    }
+  }
+  if (!matched && !hasStatus413) {
+    return { isOverflow: false };
+  }
+  const reportedLimit = parseReportedLimit(message);
+  return {
+    isOverflow: true,
+    reportedLimit: reportedLimit?.value,
+    reportedLimitProvenance: reportedLimit?.provenance,
+    matchedPattern: matched?.source
+  };
+}
+function parseReportedLimit(message) {
+  if (!message)
+    return;
+  for (const { pattern, provenance } of LIMIT_EXTRACTION_PATTERNS) {
+    const match = message.match(pattern);
+    if (!match)
+      continue;
+    const raw = match[1];
+    if (!raw)
+      continue;
+    const value = Number.parseInt(raw, 10);
+    if (!Number.isFinite(value))
+      continue;
+    if (value < MIN_PLAUSIBLE_LIMIT || value > MAX_PLAUSIBLE_LIMIT)
+      continue;
+    return { value, provenance };
+  }
+  return;
+}
+
+// ../plugin/src/shared/resolve-fallbacks.ts
+function resolveFallbackChain(userFallbacks) {
+  const userList = normalizeUserFallbacks(userFallbacks);
+  return dedupe(userList.filter(isValidModelSpec));
+}
+function normalizeUserFallbacks(userFallbacks) {
+  if (!userFallbacks)
+    return [];
+  if (typeof userFallbacks === "string") {
+    const trimmed = userFallbacks.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  return userFallbacks.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+function isValidModelSpec(spec) {
+  const slash = spec.indexOf("/");
+  return slash > 0 && slash < spec.length - 1;
+}
+function dedupe(list) {
+  const seen = new Set;
+  const out = [];
+  for (const item of list) {
+    if (seen.has(item))
+      continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+function parseProviderModel(spec) {
+  const slash = spec.indexOf("/");
+  if (slash < 1 || slash >= spec.length - 1)
+    return null;
+  return {
+    providerID: spec.slice(0, slash).trim(),
+    modelID: spec.slice(slash + 1).trim()
+  };
+}
+function modelBodyField(spec) {
+  if (!spec)
+    return {};
+  const parsed = parseProviderModel(spec);
+  return parsed ? { model: parsed } : {};
+}
+
+// ../plugin/src/shared/model-suggestion-retry.ts
+var ABORT_CALL_TIMEOUT_MS = 3000;
+function copyPromptArgs(args, body) {
+  return { ...args, body: { ...body } };
+}
+function extractMessage(error51) {
+  if (typeof error51 === "string")
+    return error51;
+  if (error51 instanceof Error)
+    return error51.message;
+  if (typeof error51 === "object" && error51 !== null) {
+    const obj = error51;
+    if (typeof obj.message === "string")
+      return obj.message;
+  }
+  try {
+    return JSON.stringify(error51);
+  } catch (_error) {
+    return String(error51);
+  }
+}
+function parseModelSuggestion(error51) {
+  if (!error51)
+    return null;
+  if (typeof error51 === "object" && error51 !== null) {
+    const errObj = error51;
+    if (errObj.name === "ProviderModelNotFoundError" && typeof errObj.data === "object" && errObj.data !== null) {
+      const data = errObj.data;
+      const suggestions = data.suggestions;
+      if (Array.isArray(suggestions) && typeof suggestions[0] === "string") {
+        return {
+          providerID: String(data.providerID ?? ""),
+          modelID: String(data.modelID ?? ""),
+          suggestion: suggestions[0]
+        };
+      }
+    }
+    for (const key of ["data", "error", "cause"]) {
+      const nested = errObj[key];
+      if (nested && typeof nested === "object") {
+        const result = parseModelSuggestion(nested);
+        if (result)
+          return result;
+      }
+    }
+  }
+  const message = extractMessage(error51);
+  const modelMatch = message.match(/model not found:\s*([^/\s]+)\s*\/\s*([^.,\s]+)/i);
+  const suggestionMatch = message.match(/did you mean:\s*([^,?]+)/i);
+  if (!modelMatch || !suggestionMatch) {
+    return null;
+  }
+  return {
+    providerID: modelMatch[1].trim(),
+    modelID: modelMatch[2].trim(),
+    suggestion: suggestionMatch[1].trim()
+  };
+}
+async function promptWithTimeout(client, args, timeoutMs, signal) {
+  if (signal?.aborted) {
+    throw new Error("prompt aborted by external signal");
+  }
+  const controller = new AbortController;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  signal?.addEventListener("abort", onExternalAbort);
+  try {
+    await client.session.prompt({
+      ...args,
+      signal: controller.signal
+    });
+  } catch (error51) {
+    if (signal?.aborted) {
+      await abortChildRun(client, args.path.id);
+      throw new Error("prompt aborted by external signal");
+    }
+    if (controller.signal.aborted) {
+      await abortChildRun(client, args.path.id);
+      throw new Error(`prompt timed out after ${timeoutMs}ms`);
+    }
+    throw error51;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", onExternalAbort);
+  }
+}
+async function abortChildRun(client, sessionId) {
+  try {
+    await Promise.race([
+      client.session.abort({ path: { id: sessionId } }),
+      new Promise((resolve2) => setTimeout(resolve2, ABORT_CALL_TIMEOUT_MS))
+    ]);
+  } catch (error51) {
+    log(`[model-retry] child session abort failed for ${sessionId}: ${String(error51)}`);
+  }
+}
+function isNonRetryable(error51, externalSignal) {
+  if (externalSignal?.aborted)
+    return true;
+  if (error51 instanceof Error) {
+    if (error51.name === "AbortError")
+      return true;
+    if (error51.message === "prompt aborted by external signal")
+      return true;
+    if (/^prompt timed out after \d+ms$/.test(error51.message))
+      return true;
+  }
+  if (detectOverflow(error51).isOverflow)
+    return true;
+  return false;
+}
+function shortErr(error51) {
+  if (error51 instanceof Error) {
+    return error51.name && error51.name !== "Error" ? `${error51.name}: ${error51.message}` : error51.message;
+  }
+  return extractMessage(error51);
+}
+async function attemptOnce(client, args, timeoutMs, signal, callContext, label) {
+  const originalBody = { ...args.body };
+  const attemptArgs = copyPromptArgs(args, originalBody);
+  try {
+    await promptWithTimeout(client, attemptArgs, timeoutMs, signal);
+    return;
+  } catch (error51) {
+    if (isNonRetryable(error51, signal))
+      throw error51;
+    const suggestion = parseModelSuggestion(error51);
+    if (!suggestion || !originalBody.model) {
+      throw error51;
+    }
+    log(`[${callContext}] ${label}: model not found, retrying with suggestion`, {
+      original: `${suggestion.providerID}/${suggestion.modelID}`,
+      suggested: suggestion.suggestion
+    });
+    await promptWithTimeout(client, copyPromptArgs(args, {
+      ...originalBody,
+      model: {
+        providerID: suggestion.providerID,
+        modelID: suggestion.suggestion
+      }
+    }), timeoutMs, signal);
+  }
+}
+async function promptSyncWithModelSuggestionRetry(client, args, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 300000;
+  const callContext = options.callContext ?? "subagent";
+  const fallbacks = options.fallbackModels ?? [];
+  const baseBody = { ...args.body };
+  const baseArgs = copyPromptArgs(args, baseBody);
+  const explicitPrimaryLabel = baseBody.model?.providerID && baseBody.model.modelID ? `${baseBody.model.providerID}/${baseBody.model.modelID}` : "primary";
+  let lastError = null;
+  try {
+    await attemptOnce(client, baseArgs, timeoutMs, options.signal, callContext, explicitPrimaryLabel);
+    return;
+  } catch (error51) {
+    lastError = error51;
+    if (isNonRetryable(error51, options.signal))
+      throw error51;
+    if (fallbacks.length === 0) {
+      throw error51;
+    }
+    log(`[${callContext}] primary (${explicitPrimaryLabel}) failed: ${shortErr(error51)}; trying ${fallbacks.length} fallback(s)`);
+  }
+  for (let i = 0;i < fallbacks.length; i += 1) {
+    const parsed = parseProviderModel(fallbacks[i]);
+    if (!parsed) {
+      log(`[${callContext}] skipping invalid fallback spec: ${fallbacks[i]}`);
+      continue;
+    }
+    const label = `${parsed.providerID}/${parsed.modelID}`;
+    const attemptArgs = copyPromptArgs(baseArgs, {
+      ...baseBody,
+      model: parsed
+    });
+    try {
+      await attemptOnce(client, attemptArgs, timeoutMs, options.signal, callContext, label);
+      log(`[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`);
+      return;
+    } catch (error51) {
+      lastError = error51;
+      if (isNonRetryable(error51, options.signal))
+        throw error51;
+      const remaining = fallbacks.length - i - 1;
+      if (remaining > 0) {
+        log(`[${callContext}] ${label} failed: ${shortErr(error51)}; ${remaining} fallback(s) left`);
+      }
+    }
+  }
+  log(`[${callContext}] all models exhausted; tried: ${[explicitPrimaryLabel, ...fallbacks].join(", ")}; last error: ${shortErr(lastError)}`);
+  throw lastError ?? new Error("All fallback models failed");
+}
+async function attemptAndValidate(client, args, timeoutMs, signal, callContext, attempt, options) {
+  await attemptOnce(client, args, timeoutMs, signal, callContext, attempt.label);
+  const output = await options.fetchOutput(args, attempt);
+  const validated = await options.validateOutput(output, attempt);
+  return { output, validated, attempt };
+}
+async function promptSyncWithValidatedOutputRetry(client, args, options) {
+  const timeoutMs = options.timeoutMs ?? 300000;
+  const callContext = options.callContext ?? "subagent";
+  const fallbacks = options.fallbackModels ?? [];
+  const baseBody = { ...args.body };
+  const baseArgs = copyPromptArgs(args, baseBody);
+  const explicitPrimaryLabel = baseBody.model?.providerID && baseBody.model.modelID ? `${baseBody.model.providerID}/${baseBody.model.modelID}` : "primary";
+  const totalAttempts = fallbacks.length + 1;
+  let firstError = null;
+  let lastError = null;
+  try {
+    return await attemptAndValidate(client, baseArgs, timeoutMs, options.signal, callContext, {
+      label: explicitPrimaryLabel,
+      attemptIndex: 0,
+      isFallback: false,
+      totalAttempts,
+      model: baseBody.model
+    }, options);
+  } catch (error51) {
+    firstError = error51;
+    lastError = error51;
+    if (isNonRetryable(error51, options.signal))
+      throw error51;
+    if (fallbacks.length === 0) {
+      throw error51;
+    }
+    log(`[${callContext}] primary (${explicitPrimaryLabel}) failed validation/prompt: ${shortErr(error51)}; trying ${fallbacks.length} fallback(s)`);
+  }
+  for (let i = 0;i < fallbacks.length; i += 1) {
+    const parsed = parseProviderModel(fallbacks[i]);
+    if (!parsed) {
+      log(`[${callContext}] skipping invalid fallback spec: ${fallbacks[i]}`);
+      continue;
+    }
+    const label = `${parsed.providerID}/${parsed.modelID}`;
+    const attemptArgs = copyPromptArgs(baseArgs, {
+      ...baseBody,
+      model: parsed
+    });
+    const attempt = {
+      label,
+      attemptIndex: i + 1,
+      isFallback: true,
+      totalAttempts,
+      model: parsed
+    };
+    try {
+      const result = await attemptAndValidate(client, attemptArgs, timeoutMs, options.signal, callContext, attempt, options);
+      log(`[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`);
+      return result;
+    } catch (error51) {
+      if (firstError === null)
+        firstError = error51;
+      lastError = error51;
+      if (isNonRetryable(error51, options.signal))
+        throw error51;
+      const remaining = fallbacks.length - i - 1;
+      if (remaining > 0) {
+        log(`[${callContext}] ${label} failed validation/prompt: ${shortErr(error51)}; ${remaining} fallback(s) left`);
+      }
+    }
+  }
+  log(`[${callContext}] all models exhausted; tried: ${[explicitPrimaryLabel, ...fallbacks].join(", ")}; original error: ${shortErr(firstError)}; last error: ${shortErr(lastError)}`);
+  throw firstError ?? lastError ?? new Error("All fallback models failed validation");
+}
+// ../plugin/src/shared/normalize-sdk-response.ts
+function normalizeSDKResponse(response, fallback, options) {
+  if (response === null || response === undefined) {
+    return fallback;
+  }
+  if (Array.isArray(response)) {
+    return response;
+  }
+  if (typeof response === "object" && "data" in response) {
+    const data = response.data;
+    if (data !== null && data !== undefined) {
+      return data;
+    }
+    if (options?.preferResponseOnMissingData === true) {
+      return response;
+    }
+    return fallback;
+  }
+  if (options?.preferResponseOnMissingData === true) {
+    return response;
+  }
+  return fallback;
+}
+// ../plugin/src/hooks/magic-context/caveman-cleanup.ts
+var DEPTH_UNTOUCHED = 0;
+var DEPTH_LITE = 1;
+var DEPTH_FULL = 2;
+var DEPTH_ULTRA = 3;
+var DEPTH_TO_LEVEL = {
+  [DEPTH_LITE]: "lite",
+  [DEPTH_FULL]: "full",
+  [DEPTH_ULTRA]: "ultra"
+};
+function computeTargetDepth(positionIndex, totalEligible) {
+  if (totalEligible <= 0)
+    return DEPTH_UNTOUCHED;
+  const fraction = positionIndex / totalEligible;
+  if (fraction < 0.2)
+    return DEPTH_ULTRA;
+  if (fraction < 0.4)
+    return DEPTH_FULL;
+  if (fraction < 0.6)
+    return DEPTH_LITE;
+  return DEPTH_UNTOUCHED;
+}
+function applyCavemanCleanup(sessionId, db, targets, tags, config2) {
+  const result = {
+    compressedToLite: 0,
+    compressedToFull: 0,
+    compressedToUltra: 0,
+    mutatedTextTags: 0
+  };
+  if (!config2.enabled)
+    return result;
+  const maxTag = tags.reduce((max, t) => Math.max(max, t.tagNumber), 0);
+  const protectedCutoff = maxTag - config2.protectedTags;
+  const eligible = tags.filter((tag) => tag.type === "message" && tag.status === "active" && tag.tagNumber <= protectedCutoff && tag.byteSize >= config2.minChars).sort((a, b) => a.tagNumber - b.tagNumber);
+  if (eligible.length === 0)
+    return result;
+  const tagsNeedingCompression = eligible.filter((tag, index) => {
+    const target = targets.get(tag.tagNumber);
+    if (!target?.getContent || !target.setContent)
+      return false;
+    const targetDepth = computeTargetDepth(index, eligible.length);
+    return targetDepth > tag.cavemanDepth;
+  });
+  if (tagsNeedingCompression.length === 0)
+    return result;
+  const originalByTag = getSourceContents(db, sessionId, tagsNeedingCompression.map((t) => t.tagNumber));
+  const positionByTag = new Map;
+  for (let i = 0;i < eligible.length; i += 1) {
+    positionByTag.set(eligible[i].tagNumber, i);
+  }
+  db.transaction(() => {
+    for (const tag of tagsNeedingCompression) {
+      const originalText = originalByTag.get(tag.tagNumber);
+      if (typeof originalText !== "string" || originalText.length === 0)
+        continue;
+      const positionIndex = positionByTag.get(tag.tagNumber) ?? 0;
+      const targetDepth = computeTargetDepth(positionIndex, eligible.length);
+      if (targetDepth <= tag.cavemanDepth)
+        continue;
+      const level = DEPTH_TO_LEVEL[targetDepth];
+      if (!level)
+        continue;
+      const compressed = cavemanCompress(originalText, level);
+      if (compressed.length === 0)
+        continue;
+      const target = targets.get(tag.tagNumber);
+      if (!target)
+        continue;
+      const didMutate = target.setContent(compressed);
+      if (didMutate)
+        result.mutatedTextTags += 1;
+      updateCavemanDepth(db, sessionId, tag.tagNumber, targetDepth);
+      if (targetDepth === DEPTH_LITE)
+        result.compressedToLite += 1;
+      else if (targetDepth === DEPTH_FULL)
+        result.compressedToFull += 1;
+      else if (targetDepth === DEPTH_ULTRA)
+        result.compressedToUltra += 1;
+    }
+  })();
+  const total = result.compressedToLite + result.compressedToFull + result.compressedToUltra;
+  if (total > 0) {
+    sessionLog(sessionId, `caveman cleanup: compressed ${total} text tags (lite=${result.compressedToLite}, full=${result.compressedToFull}, ultra=${result.compressedToUltra})`);
+  }
+  return result;
+}
+
+// ../plugin/src/hooks/magic-context/ctx-reduce-nudge.ts
+var TOKENS_PER_BYTE = 0.25;
+var CHANNEL1_FLOOR_TOKENS = 1e4;
+var CHANNEL1_REFIRE_FLOOR_TOKENS = 1e4;
+function channel1RefireTokens(workingWindowTokens) {
+  const scaled = Math.round(0.05 * Math.max(0, workingWindowTokens));
+  return Math.max(CHANNEL1_REFIRE_FLOOR_TOKENS, scaled);
+}
+var S_GENTLE = 0.2;
+var S_FIRM = 0.4;
+var S_URGENT = 0.65;
+var CHANNEL1_PRESSURE_FLOOR = 0.8;
+var LEVEL_RANK = { gentle: 1, firm: 2, urgent: 3 };
+function decideChannel1(input) {
+  const { undroppedTokens, workingWindowTokens, hasRecentReduce } = input;
+  const pressure = Math.min(1, Math.max(0, input.pressure));
+  const resetCycle = hasRecentReduce || undroppedTokens < input.lastNudgeUndropped;
+  const lastNudge = resetCycle ? 0 : input.lastNudgeUndropped;
+  const lastLevel = resetCycle ? "" : input.lastNudgeLevel;
+  const quiet = () => ({
+    fire: false,
+    level: "gentle",
+    undroppedTokens,
+    nextLastNudge: lastNudge,
+    nextLastNudgeLevel: lastLevel
+  });
+  if (hasRecentReduce)
+    return quiet();
+  if (undroppedTokens < CHANNEL1_FLOOR_TOKENS)
+    return quiet();
+  if (pressure < CHANNEL1_PRESSURE_FLOOR)
+    return quiet();
+  const denom = Math.max(input.estimatedInputTokens, 1);
+  const severity = Math.min(1, undroppedTokens / denom);
+  if (severity < S_GENTLE)
+    return quiet();
+  let level;
+  if (severity >= S_URGENT)
+    level = "urgent";
+  else if (severity >= S_FIRM)
+    level = "firm";
+  else
+    level = "gentle";
+  if (lastLevel === "") {
+    if (undroppedTokens < lastNudge + channel1RefireTokens(workingWindowTokens)) {
+      return quiet();
+    }
+  } else if (LEVEL_RANK[level] <= LEVEL_RANK[lastLevel]) {
+    return quiet();
+  }
+  return {
+    fire: true,
+    level,
+    undroppedTokens,
+    nextLastNudge: undroppedTokens,
+    nextLastNudgeLevel: level
+  };
+}
+function approxThousands(tokens) {
+  return `${Math.round(tokens / 1000)}k`;
+}
+function formatOldestReclaimableHint(hint) {
+  if (!hint || hint.length === 0)
+    return "";
+  const rendered = hint.slice(0, 4).map((tag) => `§${tag.tagNumber}§ ${tag.toolName ?? "tool"}`).join(" · ");
+  return rendered.length > 0 ? `
+oldest reclaimable: ${rendered}.` : "";
+}
+var CHANNEL2_USABLE_FRACTION = 1 / 3;
+var CHANNEL2_MIN_RECLAIMABLE = 1e4;
+function shouldTriggerChannel2(input) {
+  if (input.reclaimableTokens < CHANNEL2_MIN_RECLAIMABLE)
+    return false;
+  if (input.usableTokens <= 0)
+    return true;
+  return input.reclaimableTokens >= input.usableTokens * CHANNEL2_USABLE_FRACTION;
+}
+function buildChannel2Reminder(undroppedTokens, hint) {
+  const amount = approxThousands(undroppedTokens);
+  const hintText = formatOldestReclaimableHint(hint);
+  return `<system-reminder>
+` + `Routine context housekeeping is near: a large span of this session will be comparted soon, ` + `and ~${amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce ` + `first so the archived span is the part that matters.${hintText}
+` + `</system-reminder>`;
+}
+function buildChannel1Reminder(level, undroppedTokens, hint) {
+  const amount = approxThousands(undroppedTokens);
+  const hintText = formatOldestReclaimableHint(hint);
+  let body;
+  switch (level) {
+    case "gentle":
+      body = `You have ~${amount} tokens of tool output you have not reduced. ` + `When you are done with earlier outputs, dropping them with ctx_reduce keeps context lean.`;
+      break;
+    case "firm":
+      body = `~${amount} tokens of unreduced tool output has built up. ` + `At your next natural stopping point, consider dropping what you have already processed with ctx_reduce.`;
+      break;
+    case "urgent":
+      body = `~${amount} tokens of unreduced tool output remain, and a large span of this session will be comparted before long. ` + `Consider dropping spent outputs with ctx_reduce so the archived span is the part that matters.`;
+      break;
+  }
+  return `
+
+<system-reminder>
+${body}${hintText}
+</system-reminder>`;
+}
+
+// ../plugin/src/hooks/magic-context/emergency-drop.ts
+var TARGET_FRACTION = 0.3;
+var TIER_RECENCY_RESERVE = 0.2;
+var EMERGENCY_REARM_MIN_TOKENS = 2000;
+var T1_TOOLS = new Set(["read", "todowrite", "task", "aft_outline", "aft_zoom"]);
+var T2_TOOLS = new Set(["edit", "write", "apply_patch", "grep", "glob", "aft_search"]);
+function normalizeToolName(toolName) {
+  if (!toolName)
+    return "";
+  let name = toolName.toLowerCase();
+  if (name.startsWith("mcp_"))
+    name = name.slice(4);
+  return name;
+}
+function resolveToolTier(toolName) {
+  const name = normalizeToolName(toolName);
+  if (T1_TOOLS.has(name))
+    return 1;
+  if (T2_TOOLS.has(name))
+    return 2;
+  return 3;
+}
+function tagReclaimBytes(tag) {
+  return tag.byteSize + tag.inputByteSize + tag.reasoningByteSize;
+}
+function estimateEmergencyDropReclaimTokens(tag) {
+  return Math.round(tagReclaimBytes(tag) * TOKENS_PER_BYTE);
+}
+function planEmergencyDrop(input) {
+  const {
+    tags,
+    floorTags,
+    maxTag,
+    protectedTags,
+    currentTotalInputTokens,
+    ceilingTokens,
+    priorInputSample,
+    hasPriorDrop
+  } = input;
+  const noop = (reason) => ({
+    shouldDrop: false,
+    tagNumbers: [],
+    reclaimTokens: 0,
+    reason
+  });
+  if (!Number.isFinite(ceilingTokens) || ceilingTokens <= 0) {
+    return noop("unknown-ceiling");
+  }
+  if (!Number.isFinite(currentTotalInputTokens) || currentTotalInputTokens <= 0) {
+    return noop("unknown-usage");
+  }
+  if (hasPriorDrop && currentTotalInputTokens === priorInputSample) {
+    return noop("same-input-sample (awaiting fresh usage after prior drop)");
+  }
+  let tailTokens = 0;
+  for (const tag of floorTags) {
+    if (tag.status !== "active")
+      continue;
+    tailTokens += estimateEmergencyDropReclaimTokens(tag);
+  }
+  const fixedFloor = Math.max(currentTotalInputTokens - tailTokens, 0);
+  const workingSpan = Math.max(ceilingTokens - fixedFloor, 0);
+  const target = fixedFloor + TARGET_FRACTION * workingSpan;
+  const reclaimTokens = Math.round(currentTotalInputTokens - target);
+  if (reclaimTokens <= EMERGENCY_REARM_MIN_TOKENS) {
+    return noop(`reclaim<=min (${reclaimTokens} <= ${EMERGENCY_REARM_MIN_TOKENS})`);
+  }
+  const protectedCutoff = maxTag - protectedTags;
+  const tierActive = { 1: [], 2: [] };
+  for (const tag of tags) {
+    if (tag.status !== "active" || tag.type !== "tool")
+      continue;
+    const tier2 = resolveToolTier(tag.toolName);
+    if (tier2 === 1 || tier2 === 2)
+      tierActive[tier2].push(tag.tagNumber);
+  }
+  const reserved = new Set;
+  for (const tier2 of [1, 2]) {
+    const nums = tierActive[tier2];
+    if (nums.length === 0)
+      continue;
+    nums.sort((a, b) => b - a);
+    const reserveCount = Math.ceil(TIER_RECENCY_RESERVE * nums.length);
+    for (let i = 0;i < reserveCount && i < nums.length; i++) {
+      reserved.add(nums[i]);
+    }
+  }
+  const byTier = { 1: [], 2: [], 3: [] };
+  for (const tag of tags) {
+    if (tag.status !== "active" || tag.type !== "tool")
+      continue;
+    if (tag.tagNumber > protectedCutoff)
+      continue;
+    const tier2 = resolveToolTier(tag.toolName);
+    if ((tier2 === 1 || tier2 === 2) && reserved.has(tag.tagNumber))
+      continue;
+    byTier[tier2].push(tag);
+  }
+  const selected = [];
+  let reclaimed = 0;
+  outer:
+    for (const tier2 of [3, 2, 1]) {
+      const group = byTier[tier2];
+      group.sort((a, b) => a.tagNumber - b.tagNumber);
+      for (const tag of group) {
+        selected.push(tag.tagNumber);
+        reclaimed += estimateEmergencyDropReclaimTokens(tag);
+        if (reclaimed >= reclaimTokens)
+          break outer;
+      }
+    }
+  if (selected.length === 0) {
+    return noop("no-candidates");
+  }
+  return {
+    shouldDrop: true,
+    tagNumbers: selected,
+    reclaimTokens,
+    reason: `tiered drop: ${selected.length} tags, reclaim≈${reclaimed}/${reclaimTokens} tokens (floor≈${fixedFloor}, ceiling=${Math.round(ceilingTokens)})`
+  };
+}
+
+// ../plugin/src/hooks/magic-context/system-injection-stripper.ts
+var SYSTEM_INJECTION_MARKERS = [
+  "<!-- OMO_INTERNAL_INITIATOR -->",
+  "[SYSTEM DIRECTIVE: MAGIC-CONTEXT",
+  "[SYSTEM DIRECTIVE: OH-MY-OPENCODE",
+  "[Category+Skill Reminder]",
+  "[EDIT ERROR - IMMEDIATE ACTION REQUIRED]",
+  "[task CALL FAILED - IMMEDIATE RETRY REQUIRED]",
+  "[EMERGENCY CONTEXT WINDOW WARNING]",
+  "Unstable background agent appears idle",
+  "**THE SUBAGENT JUST CLAIMED THIS TASK IS DONE."
+];
+var SYSTEM_REMINDER_REGEX = /<system-reminder>[\s\S]*?<\/system-reminder>/gi;
+var OMO_MARKER_REGEX = /<!-- OMO_INTERNAL_INITIATOR -->/g;
+function stripSystemInjection(text) {
+  let hasInjection = false;
+  for (const marker of SYSTEM_INJECTION_MARKERS) {
+    if (text.includes(marker)) {
+      hasInjection = true;
+      break;
+    }
+  }
+  if (SYSTEM_REMINDER_REGEX.test(text))
+    hasInjection = true;
+  SYSTEM_REMINDER_REGEX.lastIndex = 0;
+  if (!hasInjection)
+    return null;
+  let cleaned = text;
+  cleaned = cleaned.replace(SYSTEM_REMINDER_REGEX, "");
+  cleaned = cleaned.replace(OMO_MARKER_REGEX, "");
+  cleaned = cleaned.replace(/\[SYSTEM DIRECTIVE: OH-MY-(?:OPENCODE|CLAUDE)[^\]]*\][\s\S]*?(?=\n\n(?!\s*[-*])|$)/g, "");
+  for (const marker of SYSTEM_INJECTION_MARKERS) {
+    if (marker.startsWith("<!-- ") || marker.startsWith("[SYSTEM DIRECTIVE"))
+      continue;
+    const idx = cleaned.indexOf(marker);
+    if (idx === -1)
+      continue;
+    const blockEnd = cleaned.indexOf(`
+
+`, idx + marker.length);
+    cleaned = blockEnd !== -1 ? cleaned.slice(0, idx) + cleaned.slice(blockEnd) : cleaned.slice(0, idx);
+  }
+  return cleaned.trim();
+}
+
+// ../plugin/src/hooks/magic-context/heuristic-cleanup.ts
+var DEDUP_SAFE_TOOLS = new Set([
+  "mcp_grep",
+  "mcp_read",
+  "mcp_glob",
+  "mcp_ast_grep_search",
+  "mcp_lsp_diagnostics",
+  "mcp_lsp_symbols",
+  "mcp_lsp_find_references",
+  "mcp_lsp_goto_definition",
+  "mcp_lsp_prepare_rename"
+]);
+function applyHeuristicCleanup(sessionId, db, targets, messageTagNumbers, config2, preloadedTags) {
+  const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
+  const maxTag = getMaxTagNumberBySession(db, sessionId);
+  const protectedCutoff = maxTag - config2.protectedTags;
+  let droppedTools = 0;
+  let emergencyDroppedTools = 0;
+  let emergencyReclaimedTokens = 0;
+  let deduplicatedTools = 0;
+  let droppedInjections = 0;
+  if (config2.emergency) {
+    const emergency = config2.emergency;
+    const priorInputSample = getEmergencyInputSample(db, sessionId);
+    const droppableTags = tags.filter((t) => t.status === "active" && t.type === "tool" && targets.get(t.tagNumber)?.canDrop?.());
+    const activeTags = tags.filter((t) => t.status === "active");
+    const plan = planEmergencyDrop({
+      tags: droppableTags,
+      floorTags: activeTags,
+      maxTag,
+      protectedTags: config2.protectedTags,
+      currentTotalInputTokens: emergency.currentTotalInputTokens,
+      ceilingTokens: emergency.ceilingTokens,
+      priorInputSample,
+      hasPriorDrop: priorInputSample > 0
+    });
+    if (plan.shouldDrop) {
+      const toDrop = new Set(plan.tagNumbers);
+      const newestEmergencyTags = new Set(droppableTags.slice().sort((left, right) => right.tagNumber - left.tagNumber).slice(0, 20).map((tag) => tag.tagNumber));
+      db.transaction(() => {
+        for (const tag of tags) {
+          if (!toDrop.has(tag.tagNumber))
+            continue;
+          if (tag.status !== "active" || tag.type !== "tool")
+            continue;
+          const target = targets.get(tag.tagNumber);
+          const recent = newestEmergencyTags.has(tag.tagNumber);
+          const result = recent ? target?.truncate?.() ?? target?.drop?.() ?? "absent" : target?.drop?.() ?? "absent";
+          if (result === "removed" || result === "truncated") {
+            updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
+            updateTagDropMode(db, sessionId, tag.tagNumber, recent ? "truncated" : "full");
+            droppedTools++;
+            emergencyDroppedTools++;
+            emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(tag);
+          }
+        }
+      })();
+      sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
+    } else {
+      sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
+    }
+    setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
+  }
+  db.transaction(() => {
+    for (const tag of tags) {
+      if (tag.status !== "active")
+        continue;
+      if (tag.tagNumber > protectedCutoff)
+        continue;
+      if (tag.type !== "message")
+        continue;
+      const target = targets.get(tag.tagNumber);
+      if (!target)
+        continue;
+      const content = target.getContent?.();
+      if (!content)
+        continue;
+      const stripped = stripSystemInjection(content);
+      if (stripped === null)
+        continue;
+      const strippedSource = stripTagPrefix(stripped);
+      if (strippedSource.trim().length === 0) {
+        const dropResult = target.drop?.() ?? "absent";
+        const didReplace = dropResult === "absent" ? target.setContent(`[dropped §${tag.tagNumber}§]`) : false;
+        if (dropResult === "removed" || dropResult === "absent") {
+          replaceSourceContent(db, sessionId, tag.tagNumber, "");
+          updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
+          if (dropResult === "removed" || didReplace) {
+            droppedInjections++;
+          }
+        }
+      } else {
+        const didSet = target.setContent(stripped);
+        if (didSet) {
+          replaceSourceContent(db, sessionId, tag.tagNumber, strippedSource);
+          droppedInjections++;
+        }
+      }
+    }
+  })();
+  const allMessages = Array.from(messageTagNumbers.keys());
+  const toolFingerprints = buildToolFingerprints(allMessages);
+  if (toolFingerprints.size > 0) {
+    const tagsByCompositeKey = new Map;
+    for (const tag of tags) {
+      if (tag.type === "tool" && tag.status === "active" && tag.messageId) {
+        const key = tag.toolOwnerMessageId ? `${tag.toolOwnerMessageId}\x00${tag.messageId}` : tag.messageId;
+        tagsByCompositeKey.set(key, tag);
+      }
+    }
+    const fingerprintGroups = new Map;
+    for (const [compositeKey, fingerprint] of toolFingerprints) {
+      const tag = tagsByCompositeKey.get(compositeKey);
+      if (!tag || tag.tagNumber > protectedCutoff)
+        continue;
+      const group = fingerprintGroups.get(fingerprint) ?? [];
+      group.push(tag);
+      fingerprintGroups.set(fingerprint, group);
+    }
+    db.transaction(() => {
+      for (const [, group] of fingerprintGroups) {
+        if (group.length <= 1)
+          continue;
+        group.sort((a, b) => a.tagNumber - b.tagNumber);
+        for (let i = 0;i < group.length - 1; i++) {
+          const tag = group[i];
+          const target = targets.get(tag.tagNumber);
+          const result = target?.drop?.() ?? "absent";
+          if (result === "incomplete")
+            continue;
+          updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+          updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
+          if (result === "removed" || result === "truncated") {
+            deduplicatedTools++;
+          }
+        }
+      }
+    })();
+  }
+  if (droppedTools > 0 || deduplicatedTools > 0 || droppedInjections > 0) {
+    sessionLog(sessionId, `heuristic cleanup: dropped ${droppedTools} tool tags, deduplicated ${deduplicatedTools} tool calls, dropped ${droppedInjections} system injections`);
+  }
+  let compressedTextTags = 0;
+  let mutatedTextTags = 0;
+  if (config2.caveman?.enabled) {
+    const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
+      enabled: true,
+      minChars: config2.caveman.minChars,
+      protectedTags: config2.protectedTags
+    });
+    compressedTextTags = cavemanResult.compressedToLite + cavemanResult.compressedToFull + cavemanResult.compressedToUltra;
+    mutatedTextTags = cavemanResult.mutatedTextTags;
+  }
+  return {
+    droppedTools,
+    deduplicatedTools,
+    droppedInjections,
+    emergencyDroppedTools,
+    emergencyReclaimedTokens,
+    compressedTextTags,
+    mutatedTextTags
+  };
+}
+function extractToolInfo(part) {
+  if (part.type === "tool" && typeof part.tool === "string" && DEDUP_SAFE_TOOLS.has(part.tool)) {
+    const state = typeof part.state === "object" && part.state !== null ? part.state : {};
+    return { toolName: part.tool, args: state.input ?? {} };
+  }
+  if (part.type === "tool-invocation" && typeof part.toolName === "string" && DEDUP_SAFE_TOOLS.has(part.toolName)) {
+    return { toolName: part.toolName, args: part.args ?? {} };
+  }
+  if (part.type === "tool_use" && typeof part.name === "string" && DEDUP_SAFE_TOOLS.has(part.name)) {
+    return { toolName: part.name, args: part.input ?? {} };
+  }
+  return null;
+}
+function buildToolFingerprints(messages) {
+  const fingerprints2 = new Map;
+  for (const message of messages) {
+    if (message.info.role !== "assistant")
+      continue;
+    const ownerMsgId = typeof message.info.id === "string" ? message.info.id : null;
+    if (!ownerMsgId)
+      continue;
+    for (const part of message.parts) {
+      const record2 = part;
+      const info = extractToolInfo(record2);
+      if (!info)
+        continue;
+      const callId = extractCallId(record2);
+      if (!callId)
+        continue;
+      try {
+        const fingerprint = `${ownerMsgId}:${info.toolName}:${JSON.stringify(info.args)}`;
+        const compositeKey = `${ownerMsgId}\x00${callId}`;
+        fingerprints2.set(compositeKey, fingerprint);
+      } catch {}
+    }
+  }
+  return fingerprints2;
+}
+function extractCallId(part) {
+  if (part.type === "tool" && typeof part.callID === "string")
+    return part.callID;
+  if (part.type === "tool-invocation" && typeof part.callID === "string")
+    return part.callID;
+  if (part.type === "tool_use" && typeof part.id === "string")
+    return part.id;
+  return null;
+}
 
 // ../plugin/src/features/magic-context/tagger.ts
 var TOOL_COMPOSITE_KEY_SEP = "\x00";
@@ -39875,6 +40946,21 @@ function deriveMutationPlan(view, ctx) {
     const preloadedPendingOps = getPendingOps(db, sessionId);
     applyPendingOperations(sessionId, db, recordingTargets, protectedTags, preloadedTags, preloadedPendingOps);
     applyFlushedStatuses(sessionId, db, recordingTargets, preloadedTags);
+    const cleanupCfg = ctx.heuristicCleanup;
+    if (cleanupCfg !== undefined) {
+      try {
+        const messageTagNumbers = new Map;
+        for (const [tagId, target] of recordingTargets) {
+          const message = target.message;
+          if (message !== undefined)
+            messageTagNumbers.set(message, tagId);
+        }
+        applyHeuristicCleanup(sessionId, db, recordingTargets, messageTagNumbers, {
+          protectedTags,
+          caveman: cleanupCfg.caveman
+        }, preloadedTags);
+      } catch {}
+    }
     planReasoningReplay(view, byMessageId, recordingTargets, db);
     const baseline = baselineNodeIndices(view);
     for (const message of transcript.messages) {
@@ -44426,111 +45512,6 @@ function createMagicSummarizeHook(deps) {
   };
 }
 
-// ../plugin/src/hooks/magic-context/ctx-reduce-nudge.ts
-var CHANNEL1_FLOOR_TOKENS = 1e4;
-var CHANNEL1_REFIRE_FLOOR_TOKENS = 1e4;
-function channel1RefireTokens(workingWindowTokens) {
-  const scaled = Math.round(0.05 * Math.max(0, workingWindowTokens));
-  return Math.max(CHANNEL1_REFIRE_FLOOR_TOKENS, scaled);
-}
-var S_GENTLE = 0.2;
-var S_FIRM = 0.4;
-var S_URGENT = 0.65;
-var CHANNEL1_PRESSURE_FLOOR = 0.8;
-var LEVEL_RANK = { gentle: 1, firm: 2, urgent: 3 };
-function decideChannel1(input) {
-  const { undroppedTokens, workingWindowTokens, hasRecentReduce } = input;
-  const pressure = Math.min(1, Math.max(0, input.pressure));
-  const resetCycle = hasRecentReduce || undroppedTokens < input.lastNudgeUndropped;
-  const lastNudge = resetCycle ? 0 : input.lastNudgeUndropped;
-  const lastLevel = resetCycle ? "" : input.lastNudgeLevel;
-  const quiet = () => ({
-    fire: false,
-    level: "gentle",
-    undroppedTokens,
-    nextLastNudge: lastNudge,
-    nextLastNudgeLevel: lastLevel
-  });
-  if (hasRecentReduce)
-    return quiet();
-  if (undroppedTokens < CHANNEL1_FLOOR_TOKENS)
-    return quiet();
-  if (pressure < CHANNEL1_PRESSURE_FLOOR)
-    return quiet();
-  const denom = Math.max(input.estimatedInputTokens, 1);
-  const severity = Math.min(1, undroppedTokens / denom);
-  if (severity < S_GENTLE)
-    return quiet();
-  let level;
-  if (severity >= S_URGENT)
-    level = "urgent";
-  else if (severity >= S_FIRM)
-    level = "firm";
-  else
-    level = "gentle";
-  if (lastLevel === "") {
-    if (undroppedTokens < lastNudge + channel1RefireTokens(workingWindowTokens)) {
-      return quiet();
-    }
-  } else if (LEVEL_RANK[level] <= LEVEL_RANK[lastLevel]) {
-    return quiet();
-  }
-  return {
-    fire: true,
-    level,
-    undroppedTokens,
-    nextLastNudge: undroppedTokens,
-    nextLastNudgeLevel: level
-  };
-}
-function approxThousands(tokens) {
-  return `${Math.round(tokens / 1000)}k`;
-}
-function formatOldestReclaimableHint(hint) {
-  if (!hint || hint.length === 0)
-    return "";
-  const rendered = hint.slice(0, 4).map((tag) => `§${tag.tagNumber}§ ${tag.toolName ?? "tool"}`).join(" · ");
-  return rendered.length > 0 ? `
-oldest reclaimable: ${rendered}.` : "";
-}
-var CHANNEL2_USABLE_FRACTION = 1 / 3;
-var CHANNEL2_MIN_RECLAIMABLE = 1e4;
-function shouldTriggerChannel2(input) {
-  if (input.reclaimableTokens < CHANNEL2_MIN_RECLAIMABLE)
-    return false;
-  if (input.usableTokens <= 0)
-    return true;
-  return input.reclaimableTokens >= input.usableTokens * CHANNEL2_USABLE_FRACTION;
-}
-function buildChannel2Reminder(undroppedTokens, hint) {
-  const amount = approxThousands(undroppedTokens);
-  const hintText = formatOldestReclaimableHint(hint);
-  return `<system-reminder>
-` + `Routine context housekeeping is near: a large span of this session will be comparted soon, ` + `and ~${amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce ` + `first so the archived span is the part that matters.${hintText}
-` + `</system-reminder>`;
-}
-function buildChannel1Reminder(level, undroppedTokens, hint) {
-  const amount = approxThousands(undroppedTokens);
-  const hintText = formatOldestReclaimableHint(hint);
-  let body;
-  switch (level) {
-    case "gentle":
-      body = `You have ~${amount} tokens of tool output you have not reduced. ` + `When you are done with earlier outputs, dropping them with ctx_reduce keeps context lean.`;
-      break;
-    case "firm":
-      body = `~${amount} tokens of unreduced tool output has built up. ` + `At your next natural stopping point, consider dropping what you have already processed with ctx_reduce.`;
-      break;
-    case "urgent":
-      body = `~${amount} tokens of unreduced tool output remain, and a large span of this session will be comparted before long. ` + `Consider dropping spent outputs with ctx_reduce so the archived span is the part that matters.`;
-      break;
-  }
-  return `
-
-<system-reminder>
-${body}${hintText}
-</system-reminder>`;
-}
-
 // src/agent/nudge.ts
 function scanSessionMetrics(agent) {
   let lastInputTokens = 0;
@@ -45813,7 +46794,8 @@ async function runContextPlaneStep(state, deps, payload, next) {
       });
       const plan = deriveMutationPlan(view, {
         db,
-        protectedTags: deps.config?.protectedTags ?? 20
+        protectedTags: deps.config?.protectedTags ?? 20,
+        heuristicCleanup: deps.heuristicCleanup
       });
       if (plan !== null) {
         const hostView = {
@@ -45841,51 +46823,6 @@ async function runContextPlaneStep(state, deps, payload, next) {
 function registerContextPlane(ctx, deps) {
   const state = createContextPlaneState();
   return registerPreStepGate(ctx, (payload, next) => runContextPlaneStep(state, deps, payload, next));
-}
-
-// ../plugin/src/shared/resolve-fallbacks.ts
-function resolveFallbackChain(userFallbacks) {
-  const userList = normalizeUserFallbacks(userFallbacks);
-  return dedupe(userList.filter(isValidModelSpec));
-}
-function normalizeUserFallbacks(userFallbacks) {
-  if (!userFallbacks)
-    return [];
-  if (typeof userFallbacks === "string") {
-    const trimmed = userFallbacks.trim();
-    return trimmed ? [trimmed] : [];
-  }
-  return userFallbacks.map((s) => s.trim()).filter((s) => s.length > 0);
-}
-function isValidModelSpec(spec) {
-  const slash = spec.indexOf("/");
-  return slash > 0 && slash < spec.length - 1;
-}
-function dedupe(list) {
-  const seen = new Set;
-  const out = [];
-  for (const item of list) {
-    if (seen.has(item))
-      continue;
-    seen.add(item);
-    out.push(item);
-  }
-  return out;
-}
-function parseProviderModel(spec) {
-  const slash = spec.indexOf("/");
-  if (slash < 1 || slash >= spec.length - 1)
-    return null;
-  return {
-    providerID: spec.slice(0, slash).trim(),
-    modelID: spec.slice(slash + 1).trim()
-  };
-}
-function modelBodyField(spec) {
-  if (!spec)
-    return {};
-  const parsed = parseProviderModel(spec);
-  return parsed ? { model: parsed } : {};
 }
 
 // ../plugin/src/features/magic-context/dreamer/task-config.ts
@@ -46196,410 +47133,7 @@ async function createChildSessionWithFence(args) {
     query: { directory: args.directory }
   });
 }
-// ../plugin/src/features/magic-context/overflow-detection.ts
-var OVERFLOW_PATTERNS = [
-  /prompt is too long/i,
-  /input is too long for requested model/i,
-  /exceeds the context window/i,
-  /input token count.*exceeds the maximum/i,
-  /maximum prompt length is \d+/i,
-  /reduce the length of the messages/i,
-  /maximum context length is \d+ tokens/i,
-  /maximum model length is \d+/i,
-  /exceeds the limit of \d+/i,
-  /exceeds the available context size/i,
-  /greater than the context length/i,
-  /context window exceeds limit/i,
-  /exceeded model token limit/i,
-  /context[_ ]length[_ ]exceeded/i,
-  /request entity too large/i,
-  /context length is only \d+ tokens/i,
-  /input length.*exceeds.*context length/i,
-  /prompt too long; exceeded (?:max )?context length/i,
-  /too large for model with \d+ maximum context length/i,
-  /model_context_window_exceeded/i,
-  /context size has been exceeded/i
-];
-var LIMIT_EXTRACTION_PATTERNS = [
-  { pattern: /maximum prompt length is (\d+)/i, provenance: "prompt_only" },
-  {
-    pattern: /maximum context length is (\d+) tokens?/i,
-    provenance: "combined"
-  },
-  { pattern: /maximum model length is (\d+)/i, provenance: "combined" },
-  { pattern: /context length is only (\d+) tokens?/i, provenance: "combined" },
-  { pattern: /exceeds the limit of (\d+)/i, provenance: "unknown" },
-  {
-    pattern: /too large for model with (\d+) maximum context length/i,
-    provenance: "combined"
-  },
-  { pattern: /context size[^0-9]{0,40}(\d{4,})\s*tokens?/i, provenance: "combined" },
-  { pattern: /exceeds? the context length of (\d+)/i, provenance: "combined" },
-  {
-    pattern: />\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b/i,
-    provenance: "prompt_only"
-  },
-  { pattern: /max(?:imum)?.*context.*?(\d+)/i, provenance: "unknown" }
-];
-var MIN_PLAUSIBLE_LIMIT = 1024;
-var MAX_PLAUSIBLE_LIMIT = 1e7;
-function extractErrorMessage(error51) {
-  if (!error51)
-    return "";
-  if (typeof error51 === "string")
-    return error51;
-  if (typeof error51 === "object") {
-    const obj = error51;
-    const nested = obj.error;
-    if (nested && typeof nested.message === "string" && nested.message.length > 0) {
-      return nested.message;
-    }
-  }
-  if (error51 instanceof Error)
-    return error51.message;
-  if (typeof error51 === "object") {
-    const obj = error51;
-    if (typeof obj.message === "string")
-      return obj.message;
-    if (typeof obj.responseBody === "string")
-      return obj.responseBody;
-    try {
-      return JSON.stringify(error51);
-    } catch {
-      return String(error51);
-    }
-  }
-  return String(error51);
-}
-function detectOverflow(error51) {
-  const message = extractErrorMessage(error51);
-  if (!message) {
-    return { isOverflow: false };
-  }
-  const hasStatus413 = /\b413\b/.test(message) && /(entity|payload|context|prompt)/i.test(message);
-  let matched;
-  for (const pattern of OVERFLOW_PATTERNS) {
-    if (pattern.test(message)) {
-      matched = pattern;
-      break;
-    }
-  }
-  if (!matched && !hasStatus413) {
-    return { isOverflow: false };
-  }
-  const reportedLimit = parseReportedLimit(message);
-  return {
-    isOverflow: true,
-    reportedLimit: reportedLimit?.value,
-    reportedLimitProvenance: reportedLimit?.provenance,
-    matchedPattern: matched?.source
-  };
-}
-function parseReportedLimit(message) {
-  if (!message)
-    return;
-  for (const { pattern, provenance } of LIMIT_EXTRACTION_PATTERNS) {
-    const match = message.match(pattern);
-    if (!match)
-      continue;
-    const raw = match[1];
-    if (!raw)
-      continue;
-    const value = Number.parseInt(raw, 10);
-    if (!Number.isFinite(value))
-      continue;
-    if (value < MIN_PLAUSIBLE_LIMIT || value > MAX_PLAUSIBLE_LIMIT)
-      continue;
-    return { value, provenance };
-  }
-  return;
-}
 
-// ../plugin/src/shared/model-suggestion-retry.ts
-var ABORT_CALL_TIMEOUT_MS = 3000;
-function copyPromptArgs(args, body) {
-  return { ...args, body: { ...body } };
-}
-function extractMessage(error51) {
-  if (typeof error51 === "string")
-    return error51;
-  if (error51 instanceof Error)
-    return error51.message;
-  if (typeof error51 === "object" && error51 !== null) {
-    const obj = error51;
-    if (typeof obj.message === "string")
-      return obj.message;
-  }
-  try {
-    return JSON.stringify(error51);
-  } catch (_error) {
-    return String(error51);
-  }
-}
-function parseModelSuggestion(error51) {
-  if (!error51)
-    return null;
-  if (typeof error51 === "object" && error51 !== null) {
-    const errObj = error51;
-    if (errObj.name === "ProviderModelNotFoundError" && typeof errObj.data === "object" && errObj.data !== null) {
-      const data = errObj.data;
-      const suggestions = data.suggestions;
-      if (Array.isArray(suggestions) && typeof suggestions[0] === "string") {
-        return {
-          providerID: String(data.providerID ?? ""),
-          modelID: String(data.modelID ?? ""),
-          suggestion: suggestions[0]
-        };
-      }
-    }
-    for (const key of ["data", "error", "cause"]) {
-      const nested = errObj[key];
-      if (nested && typeof nested === "object") {
-        const result = parseModelSuggestion(nested);
-        if (result)
-          return result;
-      }
-    }
-  }
-  const message = extractMessage(error51);
-  const modelMatch = message.match(/model not found:\s*([^/\s]+)\s*\/\s*([^.,\s]+)/i);
-  const suggestionMatch = message.match(/did you mean:\s*([^,?]+)/i);
-  if (!modelMatch || !suggestionMatch) {
-    return null;
-  }
-  return {
-    providerID: modelMatch[1].trim(),
-    modelID: modelMatch[2].trim(),
-    suggestion: suggestionMatch[1].trim()
-  };
-}
-async function promptWithTimeout(client, args, timeoutMs, signal) {
-  if (signal?.aborted) {
-    throw new Error("prompt aborted by external signal");
-  }
-  const controller = new AbortController;
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  const onExternalAbort = () => controller.abort();
-  signal?.addEventListener("abort", onExternalAbort);
-  try {
-    await client.session.prompt({
-      ...args,
-      signal: controller.signal
-    });
-  } catch (error51) {
-    if (signal?.aborted) {
-      await abortChildRun(client, args.path.id);
-      throw new Error("prompt aborted by external signal");
-    }
-    if (controller.signal.aborted) {
-      await abortChildRun(client, args.path.id);
-      throw new Error(`prompt timed out after ${timeoutMs}ms`);
-    }
-    throw error51;
-  } finally {
-    clearTimeout(timeout);
-    signal?.removeEventListener("abort", onExternalAbort);
-  }
-}
-async function abortChildRun(client, sessionId) {
-  try {
-    await Promise.race([
-      client.session.abort({ path: { id: sessionId } }),
-      new Promise((resolve2) => setTimeout(resolve2, ABORT_CALL_TIMEOUT_MS))
-    ]);
-  } catch (error51) {
-    log(`[model-retry] child session abort failed for ${sessionId}: ${String(error51)}`);
-  }
-}
-function isNonRetryable(error51, externalSignal) {
-  if (externalSignal?.aborted)
-    return true;
-  if (error51 instanceof Error) {
-    if (error51.name === "AbortError")
-      return true;
-    if (error51.message === "prompt aborted by external signal")
-      return true;
-    if (/^prompt timed out after \d+ms$/.test(error51.message))
-      return true;
-  }
-  if (detectOverflow(error51).isOverflow)
-    return true;
-  return false;
-}
-function shortErr(error51) {
-  if (error51 instanceof Error) {
-    return error51.name && error51.name !== "Error" ? `${error51.name}: ${error51.message}` : error51.message;
-  }
-  return extractMessage(error51);
-}
-async function attemptOnce(client, args, timeoutMs, signal, callContext, label) {
-  const originalBody = { ...args.body };
-  const attemptArgs = copyPromptArgs(args, originalBody);
-  try {
-    await promptWithTimeout(client, attemptArgs, timeoutMs, signal);
-    return;
-  } catch (error51) {
-    if (isNonRetryable(error51, signal))
-      throw error51;
-    const suggestion = parseModelSuggestion(error51);
-    if (!suggestion || !originalBody.model) {
-      throw error51;
-    }
-    log(`[${callContext}] ${label}: model not found, retrying with suggestion`, {
-      original: `${suggestion.providerID}/${suggestion.modelID}`,
-      suggested: suggestion.suggestion
-    });
-    await promptWithTimeout(client, copyPromptArgs(args, {
-      ...originalBody,
-      model: {
-        providerID: suggestion.providerID,
-        modelID: suggestion.suggestion
-      }
-    }), timeoutMs, signal);
-  }
-}
-async function promptSyncWithModelSuggestionRetry(client, args, options = {}) {
-  const timeoutMs = options.timeoutMs ?? 300000;
-  const callContext = options.callContext ?? "subagent";
-  const fallbacks = options.fallbackModels ?? [];
-  const baseBody = { ...args.body };
-  const baseArgs = copyPromptArgs(args, baseBody);
-  const explicitPrimaryLabel = baseBody.model?.providerID && baseBody.model.modelID ? `${baseBody.model.providerID}/${baseBody.model.modelID}` : "primary";
-  let lastError = null;
-  try {
-    await attemptOnce(client, baseArgs, timeoutMs, options.signal, callContext, explicitPrimaryLabel);
-    return;
-  } catch (error51) {
-    lastError = error51;
-    if (isNonRetryable(error51, options.signal))
-      throw error51;
-    if (fallbacks.length === 0) {
-      throw error51;
-    }
-    log(`[${callContext}] primary (${explicitPrimaryLabel}) failed: ${shortErr(error51)}; trying ${fallbacks.length} fallback(s)`);
-  }
-  for (let i = 0;i < fallbacks.length; i += 1) {
-    const parsed = parseProviderModel(fallbacks[i]);
-    if (!parsed) {
-      log(`[${callContext}] skipping invalid fallback spec: ${fallbacks[i]}`);
-      continue;
-    }
-    const label = `${parsed.providerID}/${parsed.modelID}`;
-    const attemptArgs = copyPromptArgs(baseArgs, {
-      ...baseBody,
-      model: parsed
-    });
-    try {
-      await attemptOnce(client, attemptArgs, timeoutMs, options.signal, callContext, label);
-      log(`[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`);
-      return;
-    } catch (error51) {
-      lastError = error51;
-      if (isNonRetryable(error51, options.signal))
-        throw error51;
-      const remaining = fallbacks.length - i - 1;
-      if (remaining > 0) {
-        log(`[${callContext}] ${label} failed: ${shortErr(error51)}; ${remaining} fallback(s) left`);
-      }
-    }
-  }
-  log(`[${callContext}] all models exhausted; tried: ${[explicitPrimaryLabel, ...fallbacks].join(", ")}; last error: ${shortErr(lastError)}`);
-  throw lastError ?? new Error("All fallback models failed");
-}
-async function attemptAndValidate(client, args, timeoutMs, signal, callContext, attempt, options) {
-  await attemptOnce(client, args, timeoutMs, signal, callContext, attempt.label);
-  const output = await options.fetchOutput(args, attempt);
-  const validated = await options.validateOutput(output, attempt);
-  return { output, validated, attempt };
-}
-async function promptSyncWithValidatedOutputRetry(client, args, options) {
-  const timeoutMs = options.timeoutMs ?? 300000;
-  const callContext = options.callContext ?? "subagent";
-  const fallbacks = options.fallbackModels ?? [];
-  const baseBody = { ...args.body };
-  const baseArgs = copyPromptArgs(args, baseBody);
-  const explicitPrimaryLabel = baseBody.model?.providerID && baseBody.model.modelID ? `${baseBody.model.providerID}/${baseBody.model.modelID}` : "primary";
-  const totalAttempts = fallbacks.length + 1;
-  let firstError = null;
-  let lastError = null;
-  try {
-    return await attemptAndValidate(client, baseArgs, timeoutMs, options.signal, callContext, {
-      label: explicitPrimaryLabel,
-      attemptIndex: 0,
-      isFallback: false,
-      totalAttempts,
-      model: baseBody.model
-    }, options);
-  } catch (error51) {
-    firstError = error51;
-    lastError = error51;
-    if (isNonRetryable(error51, options.signal))
-      throw error51;
-    if (fallbacks.length === 0) {
-      throw error51;
-    }
-    log(`[${callContext}] primary (${explicitPrimaryLabel}) failed validation/prompt: ${shortErr(error51)}; trying ${fallbacks.length} fallback(s)`);
-  }
-  for (let i = 0;i < fallbacks.length; i += 1) {
-    const parsed = parseProviderModel(fallbacks[i]);
-    if (!parsed) {
-      log(`[${callContext}] skipping invalid fallback spec: ${fallbacks[i]}`);
-      continue;
-    }
-    const label = `${parsed.providerID}/${parsed.modelID}`;
-    const attemptArgs = copyPromptArgs(baseArgs, {
-      ...baseBody,
-      model: parsed
-    });
-    const attempt = {
-      label,
-      attemptIndex: i + 1,
-      isFallback: true,
-      totalAttempts,
-      model: parsed
-    };
-    try {
-      const result = await attemptAndValidate(client, attemptArgs, timeoutMs, options.signal, callContext, attempt, options);
-      log(`[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`);
-      return result;
-    } catch (error51) {
-      if (firstError === null)
-        firstError = error51;
-      lastError = error51;
-      if (isNonRetryable(error51, options.signal))
-        throw error51;
-      const remaining = fallbacks.length - i - 1;
-      if (remaining > 0) {
-        log(`[${callContext}] ${label} failed validation/prompt: ${shortErr(error51)}; ${remaining} fallback(s) left`);
-      }
-    }
-  }
-  log(`[${callContext}] all models exhausted; tried: ${[explicitPrimaryLabel, ...fallbacks].join(", ")}; original error: ${shortErr(firstError)}; last error: ${shortErr(lastError)}`);
-  throw firstError ?? lastError ?? new Error("All fallback models failed validation");
-}
-// ../plugin/src/shared/normalize-sdk-response.ts
-function normalizeSDKResponse(response, fallback, options) {
-  if (response === null || response === undefined) {
-    return fallback;
-  }
-  if (Array.isArray(response)) {
-    return response;
-  }
-  if (typeof response === "object" && "data" in response) {
-    const data = response.data;
-    if (data !== null && data !== undefined) {
-      return data;
-    }
-    if (options?.preferResponseOnMissingData === true) {
-      return response;
-    }
-    return fallback;
-  }
-  if (options?.preferResponseOnMissingData === true) {
-    return response;
-  }
-  return fallback;
-}
 // ../plugin/src/shared/assistant-message-extractor.ts
 function asSessionMessage(value) {
   if (!isRecord(value))
@@ -57811,7 +58345,19 @@ function bridgeMagicConfig(config2, directory) {
     },
     context: {
       ...config2.context,
-      protectedTags: config2.context?.protectedTags ?? cfg.protected_tags
+      protectedTags: config2.context?.protectedTags ?? cfg.protected_tags,
+      heuristicCleanup: config2.context?.heuristicCleanup ?? (() => {
+        const caveman = cfg.caveman_text_compression;
+        if (typeof caveman !== "object" || caveman === null)
+          return;
+        const raw = caveman;
+        return {
+          caveman: {
+            enabled: raw.enabled === true,
+            minChars: typeof raw.min_chars === "number" && raw.min_chars > 0 ? raw.min_chars : 500
+          }
+        };
+      })()
     },
     historian: {
       ...config2.historian,

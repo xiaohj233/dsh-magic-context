@@ -42,6 +42,7 @@ import {
   applyFlushedStatuses,
   applyPendingOperations,
 } from "@magic-context/core/hooks/magic-context/apply-operations";
+import { applyHeuristicCleanup } from "@magic-context/core/hooks/magic-context/heuristic-cleanup";
 import type {
   MessageLike,
   TagTarget,
@@ -165,6 +166,12 @@ export interface PlanContext {
   readonly protectedTags?: number;
   /** Injectable clock; reserved for later stages (decay/nudge). Unused by this slice. */
   readonly now?: () => number;
+  /** Heuristic cleanup config (Pi/OpenCode parity): routine dedup + optional
+   *  caveman text compression. Emergency tier runs only on force passes and is
+   *  intentionally not wired here. */
+  readonly heuristicCleanup?: {
+    readonly caveman?: { readonly enabled: boolean; readonly minChars: number };
+  };
 }
 
 /* ────────────────────────────── event accessors ───────────────────────────── */
@@ -1275,6 +1282,33 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
       preloadedPendingOps,
     );
     applyFlushedStatuses(sessionId, db, recordingTargets, preloadedTags);
+
+    // Heuristic cleanup (Pi/OpenCode parity): routine dedup + optional caveman
+    // text compression. Mutations go through the recording targets → dirty →
+    // ops, so the surface CAS pipeline handles them exactly like drops.
+    const cleanupCfg = ctx.heuristicCleanup;
+    if (cleanupCfg !== undefined) {
+      try {
+        const messageTagNumbers = new Map<MessageLike, number>();
+        for (const [tagId, target] of recordingTargets) {
+          const message = target.message;
+          if (message !== undefined) messageTagNumbers.set(message, tagId);
+        }
+        applyHeuristicCleanup(
+          sessionId,
+          db,
+          recordingTargets,
+          messageTagNumbers,
+          {
+            protectedTags,
+            caveman: cleanupCfg.caveman,
+          },
+          preloadedTags,
+        );
+      } catch {
+        // Cleanup must never break the pre-step chain (fail-open).
+      }
+    }
 
     planReasoningReplay(view, byMessageId, recordingTargets, db);
 

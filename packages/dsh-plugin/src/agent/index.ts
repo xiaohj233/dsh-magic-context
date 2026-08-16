@@ -173,6 +173,22 @@ export function bridgeMagicConfig(
     context: {
       ...config.context,
       protectedTags: config.context?.protectedTags ?? cfg.protected_tags,
+      heuristicCleanup:
+        config.context?.heuristicCleanup ??
+        (() => {
+          const caveman = cfg.caveman_text_compression;
+          if (typeof caveman !== "object" || caveman === null) return undefined;
+          const raw = caveman as { enabled?: unknown; min_chars?: unknown };
+          return {
+            caveman: {
+              enabled: raw.enabled === true,
+              minChars:
+                typeof raw.min_chars === "number" && raw.min_chars > 0
+                  ? raw.min_chars
+                  : 500,
+            },
+          };
+        })(),
     },
     historian: {
       ...config.historian,

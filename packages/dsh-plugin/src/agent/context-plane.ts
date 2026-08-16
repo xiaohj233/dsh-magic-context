@@ -54,6 +54,8 @@ export interface ContextPlaneConfig {
   enabled?: boolean;
   /** Protected-tag tail for drop selection (default 20). */
   protectedTags?: number;
+  /** Heuristic cleanup options (routed from the shared config). */
+  heuristicCleanup?: { readonly caveman?: { readonly enabled: boolean; readonly minChars: number } };
 }
 
 /** Historian background-pass plane (Phase 4): trigger + fire. */
@@ -78,6 +80,8 @@ export interface ContextPressureSample {
 export interface ContextPlaneDeps {
   readonly host: ContextPlaneHostView;
   readonly config?: ContextPlaneConfig;
+  /** Heuristic cleanup config (routed from the shared config by the integrator). */
+  readonly heuristicCleanup?: { readonly caveman?: { readonly enabled: boolean; readonly minChars: number } };
   /** Historian plane: fire the background compartment pass (fire-and-forget). */
   readonly historian?: {
     readonly config?: ContextPlaneHistorianConfig;
@@ -299,6 +303,7 @@ export async function runContextPlaneStep(
       const plan = deriveMutationPlan(view, {
         db,
         protectedTags: deps.config?.protectedTags ?? 20,
+        heuristicCleanup: deps.heuristicCleanup,
       } satisfies PlanContext);
       if (plan !== null) {
         const hostView: CoordinatorHostView = {
