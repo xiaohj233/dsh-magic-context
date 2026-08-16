@@ -36,6 +36,7 @@ import {
 import { checkDshCompartmentTrigger } from "./historian";
 import { transcriptRawMessageProvider } from "./historian-wiring";
 import { isMagicChildSession } from "./worker";
+import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
@@ -145,11 +146,22 @@ function maybeFireHistorian(
     if (typeof contextWindow !== "number" || contextWindow <= 0) return;
     const percentage = Math.round(((sample.projectedTokens ?? 0) / contextWindow) * 100);
     const config = historian.config ?? {};
+    const executeThresholdPercentage = config.executeThresholdPercentage ?? 65;
+    // The shared trigger refuses to fire with a zero budget; the DSH adapter
+    // derives it exactly like Pi does (deriveTriggerBudget over the context
+    // window × threshold), instead of leaving triggerBudgetTokens at 0 (which
+    // previously made the historian unreachable — it never fired on DSH).
+    const contextLimit =
+      typeof config.contextLimit === "number" && config.contextLimit > 0
+        ? config.contextLimit
+        : contextWindow;
     const fires = checkDshCompartmentTrigger(
       {
-        executeThresholdPercentage: config.executeThresholdPercentage ?? 65,
-        triggerBudget: config.triggerBudgetTokens ?? 0,
-        contextLimit: config.contextLimit ?? 0,
+        executeThresholdPercentage,
+        triggerBudget:
+          config.triggerBudgetTokens ??
+          deriveTriggerBudget(contextLimit, executeThresholdPercentage),
+        contextLimit,
       },
       { lastContextPercentage: percentage },
     );

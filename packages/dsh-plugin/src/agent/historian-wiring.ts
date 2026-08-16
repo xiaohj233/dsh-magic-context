@@ -55,6 +55,14 @@ export function currentModel(ctx: Context): string {
  * Read the current context pressure for the historian trigger (Phase 4):
  * `ctx.sessionProjections.snapshot(session).values.contextPressure` — the
  * tokenMeter fold units the host composes (last-wins per commit).
+ *
+ * Fallback (DSH 0.1.0-rc.6 environments where the token-meter projection
+ * units never register — observed on the headless profile AND the live web:
+ * `snapshot().values` comes back empty): scan the session event log for the
+ * last `request/context` window and the accumulated `assistant/message`
+ * usage, mirroring the token-meter's `pressureFrom` semantics
+ * (input + cacheRead + cacheWrite). This restores the historian pressure
+ * trigger where the projection path yields nothing.
  */
 export function readContextPressure(ctx: Context): (agent: Agent) => { projectedTokens?: number; contextWindow?: number } | undefined {
   return (agent: Agent) => {
@@ -64,7 +72,34 @@ export function readContextPressure(ctx: Context): (agent: Agent) => { projected
     const pressure = projections?.snapshot?.(agent.session)?.values?.contextPressure as
       | { projectedTokens?: number; contextWindow?: number }
       | undefined;
-    return pressure;
+    if (pressure !== undefined) return pressure;
+    // Fallback: derive the pressure from the session's own event log.
+    try {
+      const events = (agent.session as { events?: readonly unknown[] }).events ?? [];
+      let contextWindow: number | undefined;
+      let projectedTokens = 0;
+      for (const event of events) {
+        if (event === null || typeof event !== "object") continue;
+        const e = event as { type?: unknown; data?: unknown };
+        if (e.type === "request/context") {
+          const cw = (e.data as { contextWindow?: unknown } | undefined)?.contextWindow;
+          if (typeof cw === "number" && cw > 0) contextWindow = cw;
+          continue;
+        }
+        if (e.type === "assistant/message") {
+          const usage = (e.data as { usage?: unknown } | undefined)?.usage as
+            | { inputTokens?: unknown; cacheReadTokens?: unknown; cacheWriteTokens?: unknown }
+            | undefined;
+          if (usage === undefined || typeof usage !== "object") continue;
+          const add = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+          projectedTokens += add(usage.inputTokens) + add(usage.cacheReadTokens) + add(usage.cacheWriteTokens);
+        }
+      }
+      if (typeof contextWindow !== "number" || contextWindow <= 0) return undefined;
+      return { projectedTokens, contextWindow };
+    } catch {
+      return undefined;
+    }
   };
 }
 
