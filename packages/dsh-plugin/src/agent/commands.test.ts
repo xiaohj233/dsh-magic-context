@@ -267,3 +267,24 @@ describe("LLM-dependent commands (guard / not-wired messages)", () => {
     }
   });
 });
+
+describe("compaction-off command gates (Pi parity)", () => {
+  it("/ctx-flush gates on compaction-off; /ctx-status stays informational", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      registerCtxCommands(ctx, { ...baseOpts(db), compactionOff: true });
+      const flush = findCommand(registered, "ctx-flush");
+      const status = findCommand(registered, "ctx-status");
+      const agent = makeFakeAgent(SESSION_ID, "/tmp/dsh-proj");
+      const flushOut = await flush.handler({ agent, rawInput: "", signal: new AbortController().signal });
+      // Pi parity: flush 在 compaction-off 下不可用；status 是信息命令不 gate。
+      expect(flushOut.text).toContain("compaction-off");
+      const statusOut = await status.handler({ agent, rawInput: "", signal: new AbortController().signal });
+      expect(statusOut.text).toContain("## Magic Status");
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+});
