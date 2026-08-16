@@ -13,14 +13,10 @@ import {
   extractTexts,
   extractToolCallSummaries,
   formatBlock,
-  getDataDir,
   getErrorMessage,
-  getHarness,
-  getMagicContextStorageDir,
   getMemoryCategoryOrder,
   hasMeaningfulUserText,
   isUserHomeDirectory,
-  log,
   mergeCommitHashes,
   normalizeStoredProjectPath,
   normalizeText,
@@ -29,17 +25,24 @@ import {
   resolveStoredPathWorkspaceIdentity,
   resolveWorkspaceIdentitySet,
   resolveWorkspaceShareCategories,
-  sessionLog,
-  setHarness,
   shouldEnforcePrivateStoragePermissions,
   sourceNameForMemory,
   stableStringify,
-  storedPathBelongsToIdentity
-} from "./agent-b1nh9r9q.js";
+  storedPathBelongsToIdentity,
+  withPrivilegedWriter
+} from "./agent-hb5apgm1.js";
+import {
+  getDataDir,
+  getHarness,
+  getMagicContextStorageDir,
+  log,
+  sessionLog,
+  setHarness
+} from "./agent-amr6x35h.js";
 import {
   __export,
   __require
-} from "./agent-a05ws7rb.js";
+} from "./agent-wckvcay0.js";
 
 // src/agent/tools.ts
 import {
@@ -72,6 +75,20 @@ var DSH_TO_CANONICAL_PROVIDER = {
 var CANONICAL_TO_DSH_PROVIDER = {
   [CANONICAL_DEEPSEEK_PROVIDER]: DSH_DEEPSEEK_PROVIDER
 };
+function remapProviderPrefix(ref, map) {
+  if (typeof ref !== "string")
+    return ref;
+  const slash = ref.indexOf("/");
+  if (slash <= 0)
+    return ref;
+  const provider = ref.slice(0, slash);
+  if (!Object.hasOwn(map, provider))
+    return ref;
+  return `${map[provider]}${ref.slice(slash)}`;
+}
+function dshModelRefToCanonical(ref) {
+  return remapProviderPrefix(ref, DSH_TO_CANONICAL_PROVIDER);
+}
 // ../plugin/src/features/magic-context/compartment-lease.ts
 var COMPARTMENT_LEASE_TTL_MS = 5 * 60 * 1000;
 var COMPARTMENT_LEASE_RENEWAL_MS = 60 * 1000;
@@ -91,6 +108,14 @@ function acquireCompartmentLease(db, sessionId, holderId) {
   }
   return { sessionId, holderId, acquiredAt, expiresAt };
 }
+function renewCompartmentLease(db, sessionId, holderId) {
+  const now = Date.now();
+  const expiresAt = now + COMPARTMENT_LEASE_TTL_MS;
+  const result = db.prepare(`UPDATE compartment_state_lease
+             SET expires_at = ?, acquired_at = ?
+             WHERE session_id = ? AND holder_id = ? AND expires_at > ?`).run(expiresAt, now, sessionId, holderId, now);
+  return result.changes === 1;
+}
 function releaseCompartmentLease(db, sessionId, holderId) {
   db.prepare("DELETE FROM compartment_state_lease WHERE session_id = ? AND holder_id = ?").run(sessionId, holderId);
 }
@@ -104,6 +129,23 @@ var incrementDepthStatements = new WeakMap;
 var totalDepthStatements = new WeakMap;
 var maxDepthStatements = new WeakMap;
 var clearDepthStatements = new WeakMap;
+function getClearDepthStatement(db) {
+  let stmt = clearDepthStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM compression_depth WHERE session_id = ?");
+    clearDepthStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function clearCompressionDepth(db, sessionId) {
+  getClearDepthStatement(db).run(sessionId);
+}
+function clearCompressionDepthRange(db, sessionId, startOrdinal, endOrdinal) {
+  if (endOrdinal < startOrdinal) {
+    return;
+  }
+  db.prepare("DELETE FROM compression_depth WHERE session_id = ? AND message_ordinal BETWEEN ? AND ?").run(sessionId, startOrdinal, endOrdinal);
+}
 
 // ../plugin/src/features/magic-context/storage-meta-shared.ts
 import { Buffer as Buffer2 } from "node:buffer";
@@ -414,6 +456,46 @@ function persistCachedM0(db, sessionId, payload) {
             cached_m0_project_identity = ?
          WHERE session_id = ?`).run(Buffer2.from(payload.m0Bytes), payload.muralDataUrl ?? null, payload.muralHash ?? null, payload.projectMemoryEpoch, payload.workspaceFingerprint ?? null, payload.projectUserProfileVersion, payload.maxCompartmentSeq, payload.maxMemoryId, payload.maxMutationId, payload.maxMemoryMutationId ?? null, payload.m1Bytes ? Buffer2.from(payload.m1Bytes) : null, payload.projectDocsHash, payload.materializedAt, payload.sessionFactsVersion, payload.upgradeState, payload.systemHash ?? "", payload.modelKey ?? "", payload.projectIdentity ?? null, sessionId);
 }
+function clearCachedM0M1(db, sessionId) {
+  ensureSessionMetaRow(db, sessionId);
+  const existingColumns = new Set(db.prepare("PRAGMA table_info(session_meta)").all().map((column) => column.name));
+  const clears = [
+    ["cached_m0_bytes", null],
+    ["cached_m0_mural_data_url", null],
+    ["cached_m0_mural_hash", null],
+    ["cached_m1_bytes", null],
+    ["cached_m0_project_memory_epoch", null],
+    ["cached_m0_workspace_fingerprint", null],
+    ["cached_m0_project_user_profile_version", null],
+    ["cached_m0_max_compartment_seq", null],
+    ["cached_m0_max_memory_id", null],
+    ["cached_m0_max_mutation_id", null],
+    ["cached_m0_max_memory_mutation_id", null],
+    ["cached_m0_project_docs_hash", null],
+    ["cached_m0_materialized_at", null],
+    ["cached_m0_session_facts_version", null],
+    ["cached_m0_upgrade_state", null],
+    ["cached_m0_system_hash", null],
+    ["cached_m0_tool_set_hash", null],
+    ["cached_m0_model_key", null],
+    ["cached_m0_project_identity", null],
+    ["cached_m0_last_baseline_end_message_id", null],
+    ["memory_block_cache", ""],
+    ["memory_block_count", 0],
+    ["memory_block_ids", ""]
+  ];
+  const setClauses = [];
+  const values = [];
+  for (const [column, value] of clears) {
+    if (!existingColumns.has(column))
+      continue;
+    setClauses.push(`${column} = ?`);
+    values.push(value);
+  }
+  if (setClauses.length === 0)
+    return;
+  db.prepare(`UPDATE session_meta SET ${setClauses.join(", ")} WHERE session_id = ?`).run(...values, sessionId);
+}
 
 // ../plugin/src/features/magic-context/compartment-storage.ts
 var insertCompartmentStatements = new WeakMap;
@@ -531,6 +613,88 @@ function buildCompartmentBlock(compartments, facts, memoryBlock, dateRanges) {
   }
   return lines.join(`
 `).trimEnd();
+}
+function saveRecompStagingPass(db, sessionId, passNumber, compartments, facts) {
+  const now = Date.now();
+  db.transaction(() => {
+    db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
+    const compartmentStmt = db.prepare("INSERT OR REPLACE INTO recomp_compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, pass_number, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const c of compartments) {
+      compartmentStmt.run(sessionId, c.sequence, c.startMessage, c.endMessage, c.startMessageId, c.endMessageId, c.title, c.content, c.p1 ?? null, c.p2 ?? null, c.p3 ?? null, c.p4 ?? null, typeof c.importance === "number" ? c.importance : 50, c.episodeType ?? null, passNumber, now, getHarness());
+    }
+    const factStmt = db.prepare("INSERT INTO recomp_facts (session_id, category, content, pass_number, created_at, harness) VALUES (?, ?, ?, ?, ?, ?)");
+    for (const f of facts) {
+      factStmt.run(sessionId, f.category, f.content, passNumber, now, getHarness());
+    }
+  })();
+}
+function getRecompStaging(db, sessionId) {
+  const compartmentRows = db.prepare("SELECT * FROM recomp_compartments WHERE session_id = ? ORDER BY sequence ASC").all(sessionId).filter(isRecompCompartmentRow);
+  if (compartmentRows.length === 0)
+    return null;
+  const compartments = compartmentRows.map((row) => ({
+    sequence: row.sequence,
+    startMessage: row.start_message,
+    endMessage: row.end_message,
+    startMessageId: row.start_message_id,
+    endMessageId: row.end_message_id,
+    title: row.title,
+    content: row.content,
+    p1: row.p1 ?? null,
+    p2: row.p2 ?? null,
+    p3: row.p3 ?? null,
+    p4: row.p4 ?? null,
+    importance: typeof row.importance === "number" ? row.importance : 50,
+    episodeType: row.episode_type ?? null
+  }));
+  const factRows = db.prepare("SELECT category, content FROM recomp_facts WHERE session_id = ?").all(sessionId).filter(isRecompFactRow);
+  const maxPass = compartmentRows.reduce((m, r) => Math.max(m, r.pass_number), 0);
+  const lastEnd = compartmentRows[compartmentRows.length - 1]?.end_message ?? 0;
+  return {
+    compartments,
+    facts: factRows,
+    passCount: maxPass,
+    lastEndMessage: lastEnd
+  };
+}
+function clearRecompStaging(db, sessionId) {
+  db.transaction(() => {
+    db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
+    db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
+    try {
+      db.prepare("UPDATE session_meta SET recomp_partial_range_start = 0, recomp_partial_range_end = 0 WHERE session_id = ?").run(sessionId);
+    } catch {}
+  })();
+}
+function getRecompPartialRange(db, sessionId) {
+  try {
+    const row = db.prepare("SELECT recomp_partial_range_start AS start, recomp_partial_range_end AS end FROM session_meta WHERE session_id = ?").get(sessionId);
+    const start = typeof row?.start === "number" ? row.start : 0;
+    const end = typeof row?.end === "number" ? row.end : 0;
+    if (start <= 0 || end <= 0)
+      return null;
+    return { start, end };
+  } catch {
+    return null;
+  }
+}
+function setRecompPartialRange(db, sessionId, range) {
+  const start = range ? range.start : 0;
+  const end = range ? range.end : 0;
+  db.prepare("INSERT OR IGNORE INTO session_meta (session_id) VALUES (?)").run(sessionId);
+  db.prepare("UPDATE session_meta SET recomp_partial_range_start = ?, recomp_partial_range_end = ? WHERE session_id = ?").run(start, end, sessionId);
+}
+function isRecompCompartmentRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "number" && typeof candidate.session_id === "string" && typeof candidate.sequence === "number" && typeof candidate.start_message === "number" && typeof candidate.end_message === "number" && typeof candidate.start_message_id === "string" && typeof candidate.end_message_id === "string" && typeof candidate.title === "string" && typeof candidate.content === "string" && isStringOrNullish(candidate.p1) && isStringOrNullish(candidate.p2) && isStringOrNullish(candidate.p3) && isStringOrNullish(candidate.p4) && isNumberOrNullish(candidate.importance) && isStringOrNullish(candidate.episode_type) && typeof candidate.pass_number === "number" && typeof candidate.created_at === "number";
+}
+function isRecompFactRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.category === "string" && typeof candidate.content === "string";
 }
 function escapeXmlAttr(s) {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&apos;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -14845,6 +15009,60 @@ function resolveLanguageName(language) {
 function isValidLanguageCode(language) {
   return resolveLanguageName(language) !== "";
 }
+function buildContentLanguageDirective(language, options = {}) {
+  const target = resolveLanguageName(language);
+  if (!target)
+    return "";
+  const lines = [
+    "## Output language",
+    "",
+    `Write human-readable prose you author in: ${target}.`,
+    "",
+    "Do not translate or rename structural tokens. Copy required output schemas exactly:",
+    "- XML tag names, XML attribute names, JSON keys, tool names, tool-call argument keys, enum values, booleans/null, and required sentinel strings stay in English exactly as shown.",
+    "- Keep code identifiers, file paths, commands, config keys, CLI flags, URLs, commit hashes, model/provider IDs, stack traces, diagnostics, and transcript role markers such as U:, A:, and TC: verbatim.",
+    "- Localize only free-text prose values/content: summaries, memory text, explanations, titles, observations, and answers — unless the prompt says to preserve original wording.",
+    "",
+    "These literal values must remain English when used:",
+    "PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, NAMING;",
+    "causal_incident, trajectory_correction;",
+    "feature, design, docs, release, investigation, bug, refactor, infra;",
+    "memory, observation; true, false; No relevant memories found.",
+    "",
+    "Preserve the required output shape. Do not add commentary outside the requested XML/JSON/tool output."
+  ];
+  if (options.preserveUserQuotes) {
+    lines.push("", `Preserve U: lines and directly quoted user text in their original source language; write the surrounding summary prose in ${target}.`);
+  }
+  if (options.retrospective) {
+    lines.push("", `Write the lesson text in ${target}; paraphrase source text and never quote the user.`);
+  }
+  return lines.join(`
+`);
+}
+function withContentLanguageDirective(systemPrompt, language, options = {}) {
+  const directive = buildContentLanguageDirective(language, options);
+  return directive ? `${systemPrompt}
+
+${directive}` : systemPrompt;
+}
+function buildMigrationLanguageDirective(language) {
+  const target = resolveLanguageName(language);
+  if (!target)
+    return "";
+  return [
+    "## Output language",
+    "",
+    "Preserve each migrated memory's existing language — do NOT translate a memory just because an output language is set. When merging memories written in different languages, use the language of the clearest / source-majority memory; otherwise keep the source phrasing. Only the category re-mapping changes."
+  ].join(`
+`);
+}
+function withMigrationLanguageDirective(systemPrompt, language) {
+  const directive = buildMigrationLanguageDirective(language);
+  return directive ? `${systemPrompt}
+
+${directive}` : systemPrompt;
+}
 function buildPrimaryLanguageDirective(language) {
   const target = resolveLanguageName(language);
   if (!target)
@@ -15388,6 +15606,96 @@ var MagicContextConfigSchema = exports_external.object({
 });
 
 // ../plugin/src/features/magic-context/compartment-chunk-embedding.ts
+import { createHash } from "node:crypto";
+
+// ../plugin/src/features/magic-context/recursive-text-splitter.ts
+var DEFAULT_SEPARATORS = [`
+
+`, `
+`, " ", ""];
+function splitOnSeparator(text, separator) {
+  const splits = separator ? text.split(separator) : text.split("");
+  return splits.filter((s) => s !== "");
+}
+function mergeSplits(splits, separator, chunkSize, lengthFunction) {
+  const docs = [];
+  const currentDoc = [];
+  let total = 0;
+  const joinDocs = (docsToJoin) => {
+    const joined = docsToJoin.join(separator).trim();
+    return joined === "" ? null : joined;
+  };
+  for (const d of splits) {
+    const len = lengthFunction(d);
+    if (total + len + currentDoc.length * separator.length > chunkSize) {
+      if (currentDoc.length > 0) {
+        const doc3 = joinDocs(currentDoc);
+        if (doc3 !== null)
+          docs.push(doc3);
+        while (total > 0 && currentDoc.length > 0) {
+          total -= lengthFunction(currentDoc[0]);
+          currentDoc.shift();
+        }
+      }
+    }
+    currentDoc.push(d);
+    total += len;
+  }
+  const doc2 = joinDocs(currentDoc);
+  if (doc2 !== null)
+    docs.push(doc2);
+  return docs;
+}
+function splitTextRecursive(text, separators, chunkSize, lengthFunction) {
+  const finalChunks = [];
+  let separator = separators[separators.length - 1];
+  let newSeparators;
+  for (let i = 0;i < separators.length; i += 1) {
+    const s = separators[i];
+    if (s === "") {
+      separator = s;
+      break;
+    }
+    if (text.includes(s)) {
+      separator = s;
+      newSeparators = separators.slice(i + 1);
+      break;
+    }
+  }
+  const splits = splitOnSeparator(text, separator);
+  let goodSplits = [];
+  for (const s of splits) {
+    if (lengthFunction(s) < chunkSize) {
+      goodSplits.push(s);
+    } else {
+      if (goodSplits.length) {
+        finalChunks.push(...mergeSplits(goodSplits, separator, chunkSize, lengthFunction));
+        goodSplits = [];
+      }
+      if (!newSeparators) {
+        finalChunks.push(s);
+      } else {
+        finalChunks.push(...splitTextRecursive(s, newSeparators, chunkSize, lengthFunction));
+      }
+    }
+  }
+  if (goodSplits.length) {
+    finalChunks.push(...mergeSplits(goodSplits, separator, chunkSize, lengthFunction));
+  }
+  return finalChunks;
+}
+function recursiveCharacterSplit(text, options) {
+  const chunkSize = options.chunkSize;
+  const lengthFunction = options.lengthFunction ?? ((t) => t.length);
+  const separators = options.separators ?? DEFAULT_SEPARATORS;
+  if (text.length === 0)
+    return [];
+  return splitTextRecursive(text, separators, chunkSize, lengthFunction);
+}
+
+// ../plugin/src/features/magic-context/compartment-chunk-embedding.ts
+var DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
+var CHUNK_WINDOW_SAFETY_RATIO = 0.9;
 var loadFtsRowsStatements = new WeakMap;
 var existingHashStatements = new WeakMap;
 var existingHashByProjectStatements = new WeakMap;
@@ -15401,6 +15709,53 @@ var DECODED_SEARCH_POOL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 var decodedSearchPools = new WeakMap;
 var decodedSearchPoolLru = new Map;
 var decodedSearchPoolBytes = 0;
+function getLoadFtsRowsStatement(db) {
+  let stmt = loadFtsRowsStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT message_ordinal AS messageOrdinal, role, content
+             FROM message_history_fts
+             WHERE session_id = ?
+               AND message_ordinal >= ?
+               AND message_ordinal <= ?
+               AND role IN ('user', 'assistant')
+             ORDER BY message_ordinal ASC`);
+    loadFtsRowsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getExistingHashStatement(db, scopedToProject) {
+  const map2 = scopedToProject ? existingHashByProjectStatements : existingHashStatements;
+  let stmt = map2.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT window_index AS windowIndex, chunk_hash AS chunkHash
+             FROM compartment_chunk_embeddings
+             WHERE compartment_id = ?
+               AND model_id = ?
+               ${scopedToProject ? "AND project_path = ?" : ""}
+             ORDER BY window_index ASC`);
+    map2.set(db, stmt);
+  }
+  return stmt;
+}
+function getDeleteByCompartmentStatement(db) {
+  let stmt = deleteByCompartmentStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM compartment_chunk_embeddings WHERE compartment_id = ? AND model_id = ?");
+    deleteByCompartmentStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getInsertEmbeddingStatement(db) {
+  let stmt = insertEmbeddingStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`INSERT INTO compartment_chunk_embeddings (
+                compartment_id, session_id, project_path, harness, window_index,
+                start_ordinal, end_ordinal, chunk_hash, model_id, dims, vector, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    insertEmbeddingStatements.set(db, stmt);
+  }
+  return stmt;
+}
 function getSearchPoolProbeStatement(db) {
   let stmt = searchPoolProbeStatements.get(db);
   if (!stmt) {
@@ -15489,12 +15844,293 @@ function cacheDecodedSearchPool(pool, key, rowCount, maxRowId, rows) {
     removeDecodedSearchPoolEntry(oldest);
   }
 }
+function invalidateDecodedSearchPools(db, predicate) {
+  const pool = decodedSearchPools.get(db);
+  if (!pool)
+    return;
+  for (const [key, entry] of [...pool.entries()]) {
+    const parsed = JSON.parse(key);
+    if (predicate(parsed))
+      removeDecodedSearchPoolEntry(entry);
+  }
+}
+function isFinitePositiveInteger(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+function normalizeCompartmentChunkMaxInputTokens(value) {
+  if (!isFinitePositiveInteger(value)) {
+    return DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS;
+  }
+  return Math.max(1, Math.floor(value));
+}
+function normalizeContent(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function formatOrdinalRange(start, end) {
+  return start === end ? `[${start}]` : `[${start}-${end}]`;
+}
+function rolePrefix(role) {
+  if (role === "user")
+    return "U";
+  if (role === "assistant")
+    return "A";
+  return null;
+}
+function parseOrdinal(value) {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+function parseCanonicalLineRange(line) {
+  const match = /^\[(\d+)(?:-(\d+))?\]\s+[UA]:/.exec(line.trim());
+  if (!match)
+    return null;
+  const start = Number.parseInt(match[1], 10);
+  const end = match[2] ? Number.parseInt(match[2], 10) : start;
+  if (!Number.isFinite(start) || !Number.isFinite(end))
+    return null;
+  return { start, end };
+}
+function hashChunkText(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+function vectorBlob(vector) {
+  return new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength);
+}
 function toFloat32Array(blob) {
   if (blob instanceof Uint8Array) {
     const buffer = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength);
     return new Float32Array(buffer);
   }
   return new Float32Array(blob.slice(0));
+}
+function buildCanonicalChunkTextFromFts(db, sessionId, startOrdinal, endOrdinal) {
+  if (endOrdinal < startOrdinal)
+    return "";
+  const rows = getLoadFtsRowsStatement(db).all(sessionId, startOrdinal, endOrdinal).map((row) => row);
+  const lines = [];
+  let current = null;
+  const flush = () => {
+    if (!current || current.parts.length === 0)
+      return;
+    lines.push(`${formatOrdinalRange(current.start, current.end)} ${current.role}: ${current.parts.join(" / ")}`);
+    current = null;
+  };
+  for (const row of rows) {
+    const ordinal = parseOrdinal(row.messageOrdinal);
+    const prefix = rolePrefix(row.role);
+    const content = typeof row.content === "string" ? normalizeContent(row.content) : "";
+    if (ordinal === null || prefix === null || content.length === 0)
+      continue;
+    if (current && current.role === prefix) {
+      current.end = ordinal;
+      current.parts.push(content);
+      continue;
+    }
+    flush();
+    current = { role: prefix, start: ordinal, end: ordinal, parts: [content] };
+  }
+  flush();
+  return lines.join(`
+`);
+}
+function buildCompartmentSummaryFallbackText(db, compartmentId) {
+  const row = db.prepare("SELECT title, p1, content FROM compartments WHERE id = ?").get(compartmentId);
+  if (!row)
+    return "";
+  const title = typeof row.title === "string" ? row.title.trim() : "";
+  const p1 = typeof row.p1 === "string" ? row.p1.trim() : "";
+  const body = p1.length > 0 ? p1 : typeof row.content === "string" ? row.content.trim() : "";
+  return [title, body].filter((s) => s.length > 0).join(`
+`);
+}
+function canonicalizeInMemoryChunkTextForEmbedding(chunkText, startOrdinal, endOrdinal) {
+  const lines = [];
+  for (const rawLine of chunkText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const match = /^(\[(\d+)(?:-(\d+))?\]\s+[UA]:)\s*(.*)$/.exec(line);
+    if (!match)
+      continue;
+    const lineStart = Number.parseInt(match[2], 10);
+    const lineEnd = match[3] ? Number.parseInt(match[3], 10) : lineStart;
+    if (startOrdinal != null && lineEnd < startOrdinal)
+      continue;
+    if (endOrdinal != null && lineStart > endOrdinal)
+      continue;
+    const rawParts = match[4].split(" / ").map((part) => normalizeContent(part)).filter((part) => part.length > 0);
+    const ordinalSpan = lineEnd - lineStart + 1;
+    const roleLabel = match[1].slice(match[1].indexOf("]") + 2);
+    if (ordinalSpan === rawParts.length) {
+      const retained = rawParts.map((part, index) => ({ ordinal: lineStart + index, part })).filter(({ ordinal, part }) => {
+        if (part.startsWith("TC:"))
+          return false;
+        if (startOrdinal != null && ordinal < startOrdinal)
+          return false;
+        if (endOrdinal != null && ordinal > endOrdinal)
+          return false;
+        return true;
+      });
+      if (retained.length === 0)
+        continue;
+      const retainedStart = retained[0].ordinal;
+      const retainedEnd = retained[retained.length - 1].ordinal;
+      lines.push(`${formatOrdinalRange(retainedStart, retainedEnd)} ${roleLabel} ${retained.map(({ part }) => part).join(" / ")}`);
+      continue;
+    }
+    const parts = rawParts.filter((part) => !part.startsWith("TC:"));
+    if (parts.length === 0)
+      continue;
+    lines.push(`${match[1]} ${parts.join(" / ")}`);
+  }
+  return lines.join(`
+`);
+}
+function chunkCanonicalText(canonicalText, startOrdinal, endOrdinal, maxInputTokens) {
+  const lines = canonicalText.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+  if (lines.length === 0 || endOrdinal < startOrdinal)
+    return [];
+  const normalizedMax = normalizeCompartmentChunkMaxInputTokens(maxInputTokens);
+  const effectiveMax = Math.max(1, Math.floor(normalizedMax * CHUNK_WINDOW_SAFETY_RATIO));
+  const fullText = lines.join(`
+`);
+  if (estimateTokens(fullText) <= effectiveMax) {
+    return [
+      {
+        windowIndex: 0,
+        startOrdinal,
+        endOrdinal,
+        text: fullText,
+        chunkHash: hashChunkText(fullText)
+      }
+    ];
+  }
+  const windows = [];
+  let currentLines = [];
+  let currentStart = null;
+  let currentEnd = null;
+  let currentTokens = 0;
+  const flush = () => {
+    if (currentLines.length === 0 || currentStart === null || currentEnd === null)
+      return;
+    const text = currentLines.join(`
+`);
+    windows.push({
+      windowIndex: windows.length + 1,
+      startOrdinal: currentStart,
+      endOrdinal: currentEnd,
+      text,
+      chunkHash: hashChunkText(text)
+    });
+    currentLines = [];
+    currentStart = null;
+    currentEnd = null;
+    currentTokens = 0;
+  };
+  for (const line of lines) {
+    const range = parseCanonicalLineRange(line);
+    const lineStart = range?.start ?? startOrdinal;
+    const lineEnd = range?.end ?? lineStart;
+    const lineTokens = estimateTokens(line);
+    if (lineTokens > effectiveMax) {
+      flush();
+      for (const slice of splitOversizedLine(line, effectiveMax)) {
+        windows.push({
+          windowIndex: windows.length + 1,
+          startOrdinal: lineStart,
+          endOrdinal: lineEnd,
+          text: slice,
+          chunkHash: hashChunkText(slice)
+        });
+      }
+      continue;
+    }
+    if (currentLines.length > 0 && currentTokens + lineTokens > effectiveMax) {
+      flush();
+    }
+    if (currentLines.length === 0) {
+      currentStart = lineStart;
+    }
+    currentLines.push(line);
+    currentEnd = lineEnd;
+    currentTokens += lineTokens;
+  }
+  flush();
+  return windows;
+}
+function splitOversizedLine(line, effectiveMax) {
+  let slices = [];
+  try {
+    slices = recursiveCharacterSplit(line, {
+      chunkSize: effectiveMax,
+      lengthFunction: estimateTokens
+    });
+  } catch (error51) {
+    log("[magic-context] recursiveCharacterSplit failed; using char-budget fallback:", error51);
+    slices = [];
+  }
+  if (slices.length === 0) {
+    slices = charBudgetSplit(line, effectiveMax);
+  }
+  const safe = [];
+  const pushChecked = (slice) => {
+    if (estimateTokens(slice) > effectiveMax && slice.length > 1) {
+      safe.push(...charBudgetSplit(slice, effectiveMax));
+      return;
+    }
+    safe.push(slice);
+  };
+  for (const slice of slices) {
+    if (estimateTokens(slice) <= effectiveMax) {
+      safe.push(slice);
+    } else {
+      for (const sub of charBudgetSplit(slice, effectiveMax))
+        pushChecked(sub);
+    }
+  }
+  return safe.filter((s) => s.length > 0);
+}
+function charBudgetSplit(text, effectiveMax) {
+  const totalTokens = Math.max(1, estimateTokens(text));
+  const charsPerToken = Math.max(1, Math.floor(text.length / totalTokens));
+  const sliceChars = Math.max(1, effectiveMax * charsPerToken);
+  const out = [];
+  let pos = 0;
+  while (pos < text.length) {
+    let end = Math.min(text.length, pos + sliceChars);
+    let slice = text.slice(pos, end);
+    while (slice.length > 1 && estimateTokens(slice) > effectiveMax) {
+      end = pos + Math.max(1, Math.floor((end - pos) / 2));
+      slice = text.slice(pos, end);
+    }
+    out.push(slice);
+    pos = end;
+  }
+  return out;
+}
+function getExistingChunkHashes(db, compartmentId, modelId, projectPath) {
+  const scoped = typeof projectPath === "string" && projectPath.length > 0;
+  const rows = scoped ? getExistingHashStatement(db, true).all(compartmentId, modelId, projectPath) : getExistingHashStatement(db, false).all(compartmentId, modelId);
+  return new Map(rows.filter((row) => typeof row.windowIndex === "number" && typeof row.chunkHash === "string").map((row) => [row.windowIndex, row.chunkHash]));
+}
+function chunkEmbeddingWindowsAreCurrent(db, compartmentId, modelId, windows, projectPath) {
+  const existing = getExistingChunkHashes(db, compartmentId, modelId, projectPath);
+  if (existing.size !== windows.length)
+    return false;
+  return windows.every((window) => existing.get(window.windowIndex) === window.chunkHash);
+}
+function replaceCompartmentChunkEmbeddings(db, rows) {
+  if (rows.length === 0)
+    return;
+  const compartmentId = rows[0].compartmentId;
+  const modelId = rows[0].modelId;
+  const now = Date.now();
+  db.transaction(() => {
+    getDeleteByCompartmentStatement(db).run(compartmentId, modelId);
+    const insert = getInsertEmbeddingStatement(db);
+    for (const row of rows) {
+      insert.run(row.compartmentId, row.sessionId, row.projectPath, getHarness(), row.window.windowIndex, row.window.startOrdinal, row.window.endOrdinal, row.window.chunkHash, row.modelId, row.vector.length, vectorBlob(row.vector), row.createdAt ?? now);
+    }
+  })();
+  invalidateDecodedSearchPools(db, ([sessionId, projectPath, cachedModelId]) => sessionId === rows[0].sessionId && projectPath === rows[0].projectPath && cachedModelId === modelId);
 }
 function loadCompartmentChunkEmbeddingsForSearch(db, sessionId, projectPath, modelId) {
   if (!modelId) {
@@ -15530,7 +16166,98 @@ function loadCompartmentChunkEmbeddingsForSearch(db, sessionId, projectPath, mod
   cacheDecodedSearchPool(pool, key, rowCount, maxRowId, decodedRows);
   return decodedRows;
 }
+function mapBackfillCandidateRows(rows) {
+  return rows.filter((row) => {
+    if (row === null || typeof row !== "object")
+      return false;
+    const candidate = row;
+    return typeof candidate.id === "number" && typeof candidate.sessionId === "string" && typeof candidate.startMessage === "number" && typeof candidate.endMessage === "number" && typeof candidate.title === "string";
+  }).map((row) => ({
+    id: row.id,
+    sessionId: row.sessionId,
+    startMessage: row.startMessage,
+    endMessage: row.endMessage,
+    title: row.title
+  }));
+}
 var sessionBackfillCandidateStatements = new WeakMap;
+function loadUnembeddedSessionChunkCandidates(db, projectPath, sessionId, modelId, limit, excludeIds) {
+  if (excludeIds && excludeIds.length > 0) {
+    const placeholders = excludeIds.map(() => "?").join(", ");
+    const stmt2 = db.prepare(`SELECT c.id AS id,
+                    c.session_id AS sessionId,
+                    c.start_message AS startMessage,
+                    c.end_message AS endMessage,
+                    c.title AS title
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL
+               AND c.id NOT IN (${placeholders})
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings current
+                   WHERE current.compartment_id = c.id
+                     AND current.project_path = ?
+                     AND current.model_id = ?
+               )
+             ORDER BY c.start_message ASC, c.id ASC
+             LIMIT ?`);
+    const rows2 = stmt2.all(projectPath, sessionId, ...excludeIds, projectPath, modelId, Math.max(1, limit));
+    return mapBackfillCandidateRows(rows2);
+  }
+  let stmt = sessionBackfillCandidateStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT c.id AS id,
+                    c.session_id AS sessionId,
+                    c.start_message AS startMessage,
+                    c.end_message AS endMessage,
+                    c.title AS title
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings current
+                   WHERE current.compartment_id = c.id
+                     AND current.project_path = ?
+                     AND current.model_id = ?
+               )
+             ORDER BY c.start_message ASC, c.id ASC
+             LIMIT ?`);
+    sessionBackfillCandidateStatements.set(db, stmt);
+  }
+  const rows = stmt.all(projectPath, sessionId, projectPath, modelId, Math.max(1, limit));
+  return mapBackfillCandidateRows(rows);
+}
+function countUnembeddedSessionCompartments(db, projectPath, sessionId, modelId) {
+  const row = db.prepare(`SELECT COUNT(*) AS n
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings current
+                   WHERE current.compartment_id = c.id
+                     AND current.project_path = ?
+                     AND current.model_id = ?
+               )`).get(projectPath, sessionId, projectPath, modelId);
+  return typeof row?.n === "number" ? row.n : 0;
+}
 function countSessionCompartmentEmbedCoverage(db, projectPath, sessionId, modelId) {
   const row = db.prepare(`SELECT
                COUNT(*) AS total,
@@ -15572,7 +16299,7 @@ function cosineSimilarity(a, b) {
 }
 
 // ../plugin/src/features/magic-context/memory/embedding-synapse.ts
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 
 // ../../node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/client.js
 import { promises as fs2 } from "node:fs";
@@ -17785,7 +18512,7 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 function sha256(value) {
-  return createHash("sha256").update(value).digest("hex");
+  return createHash2("sha256").update(value).digest("hex");
 }
 function stableJson(value) {
   if (Array.isArray(value))
@@ -18213,13 +18940,13 @@ class SynapseEmbeddingProvider {
 }
 
 // ../plugin/src/features/magic-context/memory/normalize-hash.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 function normalizeMemoryContent(content) {
   return content.toLowerCase().replace(/\s+/g, " ").trim();
 }
 function computeNormalizedHash(content) {
   const normalized = normalizeMemoryContent(content);
-  return createHash2("md5").update(normalized).digest("hex");
+  return createHash3("md5").update(normalized).digest("hex");
 }
 
 // ../plugin/src/features/magic-context/memory/embedding-identity.ts
@@ -18967,11 +19694,26 @@ class OpenAICompatibleEmbeddingProvider {
   }
 }
 
+// ../plugin/src/features/magic-context/project-embedding-registry.ts
+import { createHash as createHash5, randomUUID } from "node:crypto";
+
 // ../plugin/src/features/magic-context/git-commits/storage-git-commit-embeddings.ts
 var saveStatements = new WeakMap;
 var loadProjectStatements = new WeakMap;
 var loadUnembeddedStatements = new WeakMap;
 var countEmbeddedStatements = new WeakMap;
+function getSaveStatement(db) {
+  let stmt = saveStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`INSERT INTO git_commit_embeddings (sha, embedding, model_id, created_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(sha, model_id) DO UPDATE SET
+                  embedding = excluded.embedding,
+                  created_at = excluded.created_at`);
+    saveStatements.set(db, stmt);
+  }
+  return stmt;
+}
 function getLoadProjectStatement(db) {
   let stmt = loadProjectStatements.get(db);
   if (!stmt) {
@@ -18991,6 +19733,10 @@ function getCountEmbeddedStatement(db) {
     countEmbeddedStatements.set(db, stmt);
   }
   return stmt;
+}
+function saveCommitEmbedding(db, sha, embedding, modelId) {
+  const bytes = new Uint8Array(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+  getSaveStatement(db).run(sha, bytes, modelId, Date.now());
 }
 function loadProjectCommitEmbeddings(db, projectPath, modelId) {
   const rows = getLoadProjectStatement(db).all(projectPath, modelId);
@@ -19030,6 +19776,107 @@ var GIT_SWEEP_COOLDOWN_MS = 10 * 60 * 1000;
 var GIT_SWEEP_LEASE_TTL_MS = 5 * 60 * 1000;
 var GIT_SWEEP_NON_INDEXABLE_REPROBE_MS = 24 * 60 * 60 * 1000;
 var GIT_SWEEP_LEASE_RENEWAL_MS = 60 * 1000;
+function runImmediate(db, body) {
+  db.exec("BEGIN IMMEDIATE");
+  let committed = false;
+  try {
+    const result = body();
+    db.exec("COMMIT");
+    committed = true;
+    return result;
+  } finally {
+    if (!committed) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
+function rowToState(row) {
+  return {
+    projectPath: row.project_path,
+    leaseHolder: row.lease_holder,
+    leaseExpiresAt: row.lease_expires_at,
+    lastSweptAt: row.last_swept_at
+  };
+}
+function getGitSweepCoordinatorState(db, projectPath) {
+  const row = db.prepare(`SELECT project_path, lease_holder, lease_expires_at, last_swept_at
+             FROM git_sweep_coordinator
+             WHERE project_path = ?`).get(projectPath);
+  return row ? rowToState(row) : null;
+}
+function acquireGitSweepLease(db, projectPath, holderId, options = {}) {
+  const cooldownMs = options.cooldownMs ?? GIT_SWEEP_COOLDOWN_MS;
+  const leaseTtlMs = options.leaseTtlMs ?? GIT_SWEEP_LEASE_TTL_MS;
+  return runImmediate(db, () => {
+    const now = Date.now();
+    const row = getGitSweepCoordinatorState(db, projectPath);
+    if (row?.leaseHolder && row.leaseExpiresAt !== null && row.leaseExpiresAt > now) {
+      return {
+        acquired: false,
+        projectPath,
+        reason: "lease_active",
+        leaseHolder: row.leaseHolder,
+        leaseExpiresAt: row.leaseExpiresAt,
+        lastSweptAt: row.lastSweptAt,
+        nextAllowedAt: null
+      };
+    }
+    if (!options.ignoreCooldown && row?.lastSweptAt !== null && row?.lastSweptAt !== undefined) {
+      const nextAllowedAt = row.lastSweptAt + cooldownMs;
+      if (nextAllowedAt > now) {
+        return {
+          acquired: false,
+          projectPath,
+          reason: "cooldown_active",
+          leaseHolder: row.leaseHolder,
+          leaseExpiresAt: row.leaseExpiresAt,
+          lastSweptAt: row.lastSweptAt,
+          nextAllowedAt
+        };
+      }
+    }
+    const leaseExpiresAt = now + leaseTtlMs;
+    db.prepare(`INSERT INTO git_sweep_coordinator (
+                 project_path,
+                 lease_holder,
+                 lease_expires_at,
+                 last_swept_at
+             ) VALUES (?, ?, ?, NULL)
+             ON CONFLICT(project_path) DO UPDATE SET
+                 lease_holder = excluded.lease_holder,
+                 lease_expires_at = excluded.lease_expires_at`).run(projectPath, holderId, leaseExpiresAt);
+    return {
+      acquired: true,
+      projectPath,
+      holderId,
+      acquiredAt: now,
+      leaseExpiresAt
+    };
+  });
+}
+function renewGitSweepLease(db, projectPath, holderId, leaseTtlMs = GIT_SWEEP_LEASE_TTL_MS) {
+  return runImmediate(db, () => {
+    const now = Date.now();
+    const leaseExpiresAt = now + leaseTtlMs;
+    const result = db.prepare(`UPDATE git_sweep_coordinator
+                 SET lease_expires_at = ?
+                 WHERE project_path = ?
+                   AND lease_holder = ?
+                   AND lease_expires_at > ?`).run(leaseExpiresAt, projectPath, holderId, now);
+    return result.changes === 1;
+  });
+}
+function releaseGitSweepLease(db, projectPath, holderId) {
+  runImmediate(db, () => {
+    db.prepare(`UPDATE git_sweep_coordinator
+             SET lease_holder = NULL,
+                 lease_expires_at = NULL
+             WHERE project_path = ?
+               AND lease_holder = ?`).run(projectPath, holderId);
+  });
+}
 
 // ../plugin/src/features/magic-context/memory/storage-memory-embeddings.ts
 var saveEmbeddingStatements = new WeakMap;
@@ -19215,10 +20062,10 @@ function recordSessionProjectIdentity(db, sessionId, projectPath) {
 }
 
 // ../plugin/src/features/magic-context/storage-embedding-measurements.ts
-import { createHash as createHash3 } from "node:crypto";
+import { createHash as createHash4 } from "node:crypto";
 function normalizedQueryHash(query) {
   const normalized = query.trim().replace(/\s+/g, " ").toLowerCase();
-  return createHash3("sha256").update(normalized).digest("hex");
+  return createHash4("sha256").update(normalized).digest("hex");
 }
 var MEASUREMENT_CORPUS_SESSION_ROW_CAP = 2000;
 function recordEmbeddingMeasurement(db, input) {
@@ -19247,16 +20094,38 @@ function recordEmbeddingMeasurement(db, input) {
   }
   return result.changes > 0;
 }
+function beginSynapseBatchLedger(db, input) {
+  const now = Date.now();
+  db.prepare(`INSERT INTO synapse_batch_ledger
+            (session_id, project_path, scope, manifest_json, request_key, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+         ON CONFLICT(session_id, request_key) DO UPDATE SET
+            manifest_json = excluded.manifest_json,
+            updated_at = excluded.updated_at`).run(input.sessionId, input.projectPath, input.scope, JSON.stringify(input.manifest), input.requestKey, now, now);
+}
+function finishSynapseBatchLedger(db, sessionId, requestKey, status) {
+  db.prepare("UPDATE synapse_batch_ledger SET status = ?, updated_at = ? WHERE session_id = ? AND request_key = ?").run(status, Date.now(), sessionId, requestKey);
+}
 var SYNAPSE_BATCH_LEDGER_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
 // ../plugin/src/features/magic-context/project-embedding-registry.ts
 var OFF_PROVIDER_IDENTITY = "embedding-provider:off";
 var SWEEP_MAX_WALL_CLOCK_MS = 10 * 60 * 1000;
+var CHUNK_DRAIN_BATCH_SIZE = 8;
 var EMBEDDING_IDENTITY_GC_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
+var MAX_WINDOWS_PER_EMBED_CALL = 2;
 var SESSION_EMBED_LEASE_RENEWAL_MS = 60 * 1000;
+var EMBED_SLICE_RETRY_ATTEMPTS = 3;
+var EMBED_SLICE_RETRY_BASE_MS = 250;
+var EMBED_SLOW_FAILURE_NO_RETRY_MS = 1e4;
+var MAX_CONSECUTIVE_FAILED_BATCHES = 3;
 var projectRegistrations = new Map;
 var shadowRegistrations = new Map;
+var shadowQueue = [];
+var shadowWorker = null;
+var SHADOW_MAX_ITEMS_PER_TICK = 64;
 var SHADOW_MAX_BYTES_PER_TICK = 512 * 1024;
+var SHADOW_MAX_WALL_CLOCK_MS = 2000;
 var pendingShadowBackfills = new Map;
 var shadowBackfillLastIds = new Map;
 var shadowBackfillStopReasons = new Map;
@@ -19314,6 +20183,9 @@ function createProvider(config2, context) {
   }
   throw new Error("Unknown embedding provider");
 }
+function contentSha256(value) {
+  return createHash5("sha256").update(value).digest("hex");
+}
 function snapshotFor(registration) {
   const providerIsOn = registration.providerIdentity !== OFF_PROVIDER_IDENTITY;
   const enabled = !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
@@ -19333,6 +20205,15 @@ function snapshotFor(registration) {
     model: registration.observationMode || !providerIsOn ? "off" : configuredModel ? configuredModel : registration.modelId,
     provider: registration.observationMode || !providerIsOn ? "off" : registration.config.provider ?? "local"
   };
+}
+function startShadowWorker() {
+  if (shadowWorker)
+    return;
+  shadowWorker = runShadowWorker().finally(() => {
+    shadowWorker = null;
+    if (shadowQueue.length > 0 || hasPendingShadowBackfill())
+      startShadowWorker();
+  });
 }
 function getShadowEmbeddingMeasurementCohort(projectIdentity) {
   const registration = shadowRegistrations.get(projectIdentity);
@@ -19371,10 +20252,263 @@ async function embedShadowTextForProject(projectIdentity, text, signal) {
     return null;
   }
 }
+function enqueueShadowEmbeddingItems(projectIdentity, scope, ids) {
+  if (ids.length === 0 || !shadowRegistrations.has(projectIdentity))
+    return;
+  shadowQueue.push({ projectIdentity, scope, ids: [...ids] });
+  startShadowWorker();
+}
+function shadowBackfillMissingBase(scope, primaryModelId, shadowModelId, projectIdentity) {
+  if (scope === "memory") {
+    return {
+      sql: `SELECT m.id AS id
+                  FROM memories m
+                  JOIN memory_embeddings mp ON mp.memory_id = m.id AND mp.model_id = ?
+                  LEFT JOIN memory_embeddings ms ON ms.memory_id = m.id AND ms.model_id = ?
+                  WHERE m.project_path = ? AND m.status = 'active' AND ms.memory_id IS NULL`,
+      params: [primaryModelId, shadowModelId, projectIdentity],
+      orderBy: " ORDER BY m.id"
+    };
+  }
+  if (scope === "commit") {
+    return {
+      sql: `SELECT gc.sha AS id
+                  FROM git_commits gc
+                  JOIN git_commit_embeddings gp ON gp.sha = gc.sha AND gp.model_id = ?
+                  LEFT JOIN git_commit_embeddings gs ON gs.sha = gc.sha AND gs.model_id = ?
+                  WHERE gc.project_path = ? AND gs.sha IS NULL`,
+      params: [primaryModelId, shadowModelId, projectIdentity],
+      orderBy: " ORDER BY gc.committed_at DESC, gc.sha"
+    };
+  }
+  return {
+    sql: `SELECT DISTINCT cp.compartment_id AS id
+              FROM compartment_chunk_embeddings cp
+              WHERE cp.project_path = ? AND cp.model_id = ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM compartment_chunk_embeddings cs
+                    WHERE cs.compartment_id = cp.compartment_id AND cs.model_id = ?
+                )`,
+    params: [projectIdentity, primaryModelId, shadowModelId],
+    orderBy: " ORDER BY cp.compartment_id"
+  };
+}
+function shadowBackfillMissingIds(db, projectIdentity, scope, primaryModelId, shadowModelId, limit) {
+  const { sql, params, orderBy } = shadowBackfillMissingBase(scope, primaryModelId, shadowModelId, projectIdentity);
+  const rows = db.prepare(`${sql}${orderBy} LIMIT ?`).all(...params, limit);
+  return rows.map((row) => String(row.id));
+}
+function shadowModelIdForScope(registration, scope) {
+  return scope === "chunk" ? registration.chunkModelId : registration.modelId;
+}
+function hasPendingShadowBackfill(projectIdentity) {
+  if (projectIdentity === undefined)
+    return pendingShadowBackfills.size > 0;
+  const scopes = pendingShadowBackfills.get(projectIdentity);
+  return scopes !== undefined && scopes.size > 0;
+}
+function pumpShadowBackfill() {
+  for (const [projectIdentity, scopes] of pendingShadowBackfills) {
+    const db = dbForShadowQueue.get(projectIdentity);
+    const shadow = shadowRegistrations.get(projectIdentity);
+    const primary = projectRegistrations.get(projectIdentity);
+    if (!db || !shadow || !primary) {
+      pendingShadowBackfills.delete(projectIdentity);
+      continue;
+    }
+    for (const scope of [...scopes]) {
+      const primaryModelId = shadowModelIdForScope(primary, scope);
+      const shadowModelId = shadowModelIdForScope(shadow, scope);
+      const stallKey = `${projectIdentity}:${scope}`;
+      if (primaryModelId === "off" || shadowModelId === "off") {
+        scopes.delete(scope);
+        shadowBackfillLastIds.delete(stallKey);
+        continue;
+      }
+      const ids = shadowBackfillMissingIds(db, projectIdentity, scope, primaryModelId, shadowModelId, SHADOW_MAX_ITEMS_PER_TICK);
+      if (ids.length === 0) {
+        shadowBackfillStopReasons.set(stallKey, "drained");
+        scopes.delete(scope);
+        shadowBackfillLastIds.delete(stallKey);
+        continue;
+      }
+      const signature = ids.join(",");
+      if (shadowBackfillLastIds.get(stallKey) === signature) {
+        shadowBackfillStopReasons.set(stallKey, "stalled_no_progress");
+        log(`[shadow] backfill scope ${scope} for ${projectIdentity} retired without progress — ` + `the last batch produced no writes (provider failure or timeout is the usual cause); ` + `${ids.length}+ items remain and retry on the next registration or manual --shadow run`);
+        scopes.delete(scope);
+        shadowBackfillLastIds.delete(stallKey);
+        continue;
+      }
+      shadowBackfillLastIds.set(stallKey, signature);
+      shadowQueue.push({ projectIdentity, scope, ids });
+    }
+    if (scopes.size === 0)
+      pendingShadowBackfills.delete(projectIdentity);
+  }
+}
+async function embedShadowItems(registration, items, db, scope) {
+  const raw = registration.config;
+  const fingerprint = typeof raw.synapse_fingerprint === "string" ? raw.synapse_fingerprint : "";
+  const tableEpoch = typeof raw.synapse_table_epoch === "number" ? raw.synapse_table_epoch : 0;
+  const requestKey = getSynapseBatchRequestKey({
+    model: typeof raw.model === "string" ? raw.model : SYNAPSE_DEFAULT_MODEL,
+    fingerprint,
+    tableEpoch,
+    items
+  });
+  beginSynapseBatchLedger(db, {
+    sessionId: `shadow:${registration.projectIdentity}`,
+    projectPath: registration.projectIdentity,
+    scope,
+    manifest: items.map(({ id, contentSha256: contentSha2562 }) => ({ id, contentSha256: contentSha2562 })),
+    requestKey
+  });
+  try {
+    if (registration.provider.embedItems) {
+      const vectors2 = await registration.provider.embedItems(items);
+      finishSynapseBatchLedger(db, `shadow:${registration.projectIdentity}`, requestKey, vectors2.size === items.length ? "complete" : "partial");
+      return vectors2;
+    }
+    const positional = await registration.provider.embedBatch(items.map((item) => item.text));
+    const vectors = new Map(items.flatMap((item, index) => {
+      const vector = positional[index];
+      return vector ? [[item.id, vector]] : [];
+    }));
+    finishSynapseBatchLedger(db, `shadow:${registration.projectIdentity}`, requestKey, vectors.size === items.length ? "complete" : "partial");
+    return vectors;
+  } catch (error51) {
+    finishSynapseBatchLedger(db, `shadow:${registration.projectIdentity}`, requestKey, "failed");
+    throw error51;
+  }
+}
+async function processShadowQueueItem(item) {
+  const registration = shadowRegistrations.get(item.projectIdentity);
+  if (!registration)
+    return;
+  const boundedIds = item.ids.slice(0, SHADOW_MAX_ITEMS_PER_TICK);
+  if (item.scope === "memory") {
+    const db2 = dbForShadowQueue.get(item.projectIdentity);
+    if (!db2)
+      return;
+    const placeholders2 = boundedIds.map(() => "?").join(",");
+    const rows = db2.prepare(`SELECT id, content, normalized_hash FROM memories
+                 WHERE project_path = ? AND id IN (${placeholders2}) AND status = 'active'`).all(item.projectIdentity, ...boundedIds.map((id) => Number(id)));
+    const vectors2 = await embedShadowItems(registration, rows.map((row) => ({
+      id: `memory:${row.id}`,
+      text: row.content,
+      contentSha256: contentSha256(row.content)
+    })), db2, "memory");
+    db2.transaction(() => {
+      for (const row of rows) {
+        const vector = vectors2.get(`memory:${row.id}`);
+        if (vector)
+          saveEmbeddingIfHashMatches(db2, row.id, vector, registration.modelId, row.normalized_hash);
+      }
+    })();
+    return;
+  }
+  if (item.scope === "commit") {
+    const db2 = dbForShadowQueue.get(item.projectIdentity);
+    if (!db2)
+      return;
+    const placeholders2 = boundedIds.map(() => "?").join(",");
+    const rows = db2.prepare(`SELECT sha, message FROM git_commits WHERE project_path = ? AND sha IN (${placeholders2})`).all(item.projectIdentity, ...boundedIds);
+    const vectors2 = await embedShadowItems(registration, rows.map((row) => ({
+      id: `commit:${row.sha}`,
+      text: row.message,
+      contentSha256: contentSha256(row.message)
+    })), db2, "commit");
+    db2.transaction(() => {
+      for (const row of rows) {
+        const vector = vectors2.get(`commit:${row.sha}`);
+        if (vector)
+          saveCommitEmbedding(db2, row.sha, vector, registration.modelId);
+      }
+    })();
+    return;
+  }
+  const db = dbForShadowQueue.get(item.projectIdentity);
+  if (!db)
+    return;
+  const placeholders = boundedIds.map(() => "?").join(",");
+  const candidates = db.prepare(`SELECT id, session_id, start_message, end_message
+         FROM compartments WHERE id IN (${placeholders})`).all(...boundedIds.map((id) => Number(id)));
+  const prepared = candidates.flatMap((candidate) => {
+    const text = buildCanonicalChunkTextFromFts(db, candidate.session_id, candidate.start_message, candidate.end_message) || buildCompartmentSummaryFallbackText(db, candidate.id);
+    if (!text)
+      return [];
+    const windows = chunkCanonicalText(text, candidate.start_message, candidate.end_message, SYNAPSE_MAX_INPUT_TOKENS);
+    return windows.length > 0 ? [{ candidate, windows }] : [];
+  });
+  const items = prepared.flatMap((item2) => item2.windows.map((window) => ({
+    id: `chunk:${item2.candidate.id}:${window.windowIndex}`,
+    text: window.text,
+    contentSha256: contentSha256(window.text)
+  })));
+  const vectors = await embedShadowItems(registration, items, db, "chunk");
+  for (const item2 of prepared) {
+    const rows = item2.windows.flatMap((window) => {
+      const vector = vectors.get(`chunk:${item2.candidate.id}:${window.windowIndex}`);
+      return vector ? [
+        {
+          compartmentId: item2.candidate.id,
+          sessionId: item2.candidate.session_id,
+          projectPath: registration.projectIdentity,
+          window,
+          modelId: registration.chunkModelId,
+          vector
+        }
+      ] : [];
+    });
+    if (rows.length === item2.windows.length)
+      replaceCompartmentChunkEmbeddings(db, rows);
+  }
+}
 var dbForShadowQueue = new Map;
+async function runShadowWorker() {
+  const startedAt = Date.now();
+  let processed = 0;
+  let processedBytes = 0;
+  for (;; ) {
+    if (shadowQueue.length === 0) {
+      pumpShadowBackfill();
+      if (shadowQueue.length === 0)
+        break;
+    }
+    if (processed >= SHADOW_MAX_ITEMS_PER_TICK || Date.now() - startedAt >= SHADOW_MAX_WALL_CLOCK_MS) {
+      break;
+    }
+    const item = shadowQueue.shift();
+    if (!item)
+      break;
+    const itemBytes = item.ids.reduce((total, id) => total + id.length, 0);
+    if (processed > 0 && processedBytes + itemBytes > SHADOW_MAX_BYTES_PER_TICK) {
+      shadowQueue.unshift(item);
+      break;
+    }
+    try {
+      await processShadowQueueItem(item);
+    } catch (error51) {
+      log("[magic-context] Synapse shadow write failed:", error51);
+    }
+    processed += item.ids.length;
+    processedBytes += itemBytes;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
 function getProjectEmbeddingSnapshot(projectIdentity) {
   const registration = projectRegistrations.get(projectIdentity);
   return registration ? snapshotFor(registration) : null;
+}
+function getProjectChunkEmbeddingModelId(projectIdentity) {
+  const registration = projectRegistrations.get(projectIdentity);
+  return registration && !registration.observationMode ? registration.chunkModelId : "off";
+}
+function getProjectEmbeddingMaxInputTokens(projectIdentity) {
+  const registration = projectRegistrations.get(projectIdentity);
+  const configMax = registration?.config && "max_input_tokens" in registration.config ? registration.config.max_input_tokens : undefined;
+  return normalizeCompartmentChunkMaxInputTokens(registration?.provider?.maxInputTokens ?? configMax);
 }
 function getOrCreateProjectProvider(registration) {
   if (registration.providerIdentity === OFF_PROVIDER_IDENTITY || registration.observationMode) {
@@ -19430,6 +20564,271 @@ async function embedBatchForProject(projectIdentity, texts, signal, purpose = "p
     return null;
   }
   return { vectors, modelId, generation };
+}
+async function embedItemsForProject(projectIdentity, items, signal, db, sessionId = projectIdentity) {
+  const registration = projectRegistrations.get(projectIdentity);
+  if (!registration || registration.observationMode || items.length === 0)
+    return null;
+  const generation = registration.generation;
+  const modelId = registration.modelId;
+  const runtimeFingerprint = registration.runtimeFingerprint;
+  const provider = getOrCreateProjectProvider(registration);
+  if (!provider)
+    return null;
+  const rawConfig = registration.config;
+  const fingerprint = typeof rawConfig.synapse_fingerprint === "string" ? rawConfig.synapse_fingerprint : "";
+  const tableEpoch = typeof rawConfig.synapse_table_epoch === "number" ? rawConfig.synapse_table_epoch : undefined;
+  const isSynapse = registration.providerIdentity.startsWith("synapse:v1:") && fingerprint && tableEpoch !== undefined;
+  const ledgerKey = isSynapse ? getSynapseBatchRequestKey({
+    model: typeof rawConfig.model === "string" ? rawConfig.model : registration.modelId,
+    fingerprint,
+    tableEpoch,
+    items
+  }) : null;
+  if (db && ledgerKey) {
+    beginSynapseBatchLedger(db, {
+      sessionId,
+      projectPath: projectIdentity,
+      scope: items[0].id.split(":", 1)[0],
+      manifest: items.map(({ id, contentSha256: contentSha2562 }) => ({ id, contentSha256: contentSha2562 })),
+      requestKey: ledgerKey
+    });
+  }
+  let vectors;
+  try {
+    if (provider.embedItems) {
+      vectors = await provider.embedItems(items, signal);
+    } else {
+      const positional = await provider.embedBatch(items.map((item) => item.text), signal, "passage");
+      vectors = new Map(items.flatMap((item, index) => {
+        const vector = positional[index];
+        return vector ? [[item.id, vector]] : [];
+      }));
+    }
+  } catch (error51) {
+    if (db && ledgerKey)
+      finishSynapseBatchLedger(db, sessionId, ledgerKey, "failed");
+    throw error51;
+  }
+  if (db && ledgerKey) {
+    finishSynapseBatchLedger(db, sessionId, ledgerKey, vectors.size === items.length ? "complete" : "partial");
+  }
+  const current = projectRegistrations.get(projectIdentity);
+  if (!current || current.generation !== generation || current.runtimeFingerprint !== runtimeFingerprint) {
+    return null;
+  }
+  return { vectors, modelId, generation };
+}
+async function embedItemsWindowBounded(projectIdentity, items, signal, db) {
+  if (items.length <= MAX_WINDOWS_PER_EMBED_CALL) {
+    return embedItemsForProject(projectIdentity, items, signal, db, projectIdentity);
+  }
+  const vectors = new Map;
+  let modelId = null;
+  let generation = null;
+  for (let start = 0;start < items.length; start += MAX_WINDOWS_PER_EMBED_CALL) {
+    const result = await embedItemsForProject(projectIdentity, items.slice(start, start + MAX_WINDOWS_PER_EMBED_CALL), signal, db, projectIdentity);
+    if (!result)
+      return null;
+    if (modelId === null) {
+      modelId = result.modelId;
+      generation = result.generation;
+    } else if (modelId !== result.modelId || generation !== result.generation) {
+      return null;
+    }
+    for (const [id, vector] of result.vectors)
+      vectors.set(id, vector);
+  }
+  return modelId === null || generation === null ? null : { vectors, modelId, generation };
+}
+async function embedCandidateChunkBatch(db, projectIdentity, modelId, candidates, signal) {
+  const noWork = [];
+  const failed = [];
+  if (candidates.length === 0)
+    return { embedded: 0, noWork, failed };
+  const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
+  const prepared = [];
+  for (const candidate of candidates) {
+    const canonicalText = buildCanonicalChunkTextFromFts(db, candidate.sessionId, candidate.startMessage, candidate.endMessage) || buildCompartmentSummaryFallbackText(db, candidate.id);
+    if (canonicalText.length === 0) {
+      noWork.push(candidate.id);
+      continue;
+    }
+    const windows = chunkCanonicalText(canonicalText, candidate.startMessage, candidate.endMessage, maxInputTokens);
+    if (windows.length === 0 || chunkEmbeddingWindowsAreCurrent(db, candidate.id, modelId, windows, projectIdentity)) {
+      noWork.push(candidate.id);
+      continue;
+    }
+    prepared.push({ candidate, windows });
+  }
+  if (prepared.length === 0)
+    return { embedded: 0, noWork, failed };
+  let embedded = 0;
+  let i = 0;
+  while (i < prepared.length) {
+    if (signal?.aborted)
+      break;
+    const slice = [];
+    let windowCount = 0;
+    do {
+      const item = prepared[i];
+      slice.push(item);
+      windowCount += item.windows.length;
+      i += 1;
+    } while (i < prepared.length && windowCount + prepared[i].windows.length <= MAX_WINDOWS_PER_EMBED_CALL);
+    const items = slice.flatMap((item) => item.windows.map((window) => ({
+      id: `chunk:${item.candidate.id}:${window.windowIndex}`,
+      text: window.text,
+      contentSha256: contentSha256(window.text)
+    })));
+    const persistedIds = new Set;
+    for (let attempt = 0;attempt < EMBED_SLICE_RETRY_ATTEMPTS; attempt++) {
+      if (signal?.aborted)
+        break;
+      let result = null;
+      const attemptStart = Date.now();
+      try {
+        result = await embedItemsWindowBounded(projectIdentity, items, signal, db);
+      } catch (error51) {
+        log("[magic-context] failed to proactively embed compartment chunks:", error51);
+      }
+      if (signal?.aborted)
+        break;
+      if (result) {
+        for (const item of slice) {
+          if (persistedIds.has(item.candidate.id))
+            continue;
+          const vectors = item.windows.map((window) => result.vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`));
+          if (vectors.length !== item.windows.length || vectors.some((v) => !v)) {
+            continue;
+          }
+          const rows = item.windows.map((window, index) => ({
+            compartmentId: item.candidate.id,
+            sessionId: item.candidate.sessionId,
+            projectPath: projectIdentity,
+            window,
+            modelId,
+            vector: vectors[index]
+          }));
+          replaceCompartmentChunkEmbeddings(db, rows);
+          persistedIds.add(item.candidate.id);
+          enqueueShadowEmbeddingItems(projectIdentity, "chunk", [
+            String(item.candidate.id)
+          ]);
+        }
+      }
+      if (persistedIds.size === slice.length)
+        break;
+      if (persistedIds.size > 0)
+        break;
+      if (Date.now() - attemptStart >= EMBED_SLOW_FAILURE_NO_RETRY_MS)
+        break;
+      if (attempt < EMBED_SLICE_RETRY_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, EMBED_SLICE_RETRY_BASE_MS * 2 ** attempt));
+      }
+    }
+    embedded += persistedIds.size;
+    if (!signal?.aborted) {
+      for (const item of slice) {
+        if (!persistedIds.has(item.candidate.id))
+          failed.push(item.candidate.id);
+      }
+    }
+  }
+  return { embedded, noWork, failed };
+}
+async function embedSessionCompartmentChunks(db, projectIdentity, sessionId, options) {
+  const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+  if (!snapshot?.enabled || snapshot.chunkModelId === "off") {
+    return { status: "disabled", embedded: 0, total: 0 };
+  }
+  recordSessionProjectIdentity(db, sessionId, projectIdentity);
+  const total = countUnembeddedSessionCompartments(db, projectIdentity, sessionId, snapshot.chunkModelId);
+  if (total === 0)
+    return { status: "nothing", embedded: 0, total: 0 };
+  const holderId = `session-embed-${randomUUID()}`;
+  const lease = acquireGitSweepLease(db, projectIdentity, holderId, { ignoreCooldown: true });
+  if (!lease.acquired)
+    return { status: "busy", embedded: 0, total };
+  let leaseLost = false;
+  const drainAbort = new AbortController;
+  const forwardCallerAbort = () => drainAbort.abort();
+  if (options?.signal?.aborted)
+    drainAbort.abort();
+  else
+    options?.signal?.addEventListener("abort", forwardCallerAbort, { once: true });
+  const renewal = setInterval(() => {
+    try {
+      if (!renewGitSweepLease(db, projectIdentity, holderId)) {
+        leaseLost = true;
+        drainAbort.abort();
+      }
+    } catch {}
+  }, SESSION_EMBED_LEASE_RENEWAL_MS);
+  renewal.unref?.();
+  const batchSize = Math.max(1, options?.batchSize ?? CHUNK_DRAIN_BATCH_SIZE);
+  const skipIds = [];
+  const failedIds = [];
+  let embedded = 0;
+  let aborted2 = false;
+  let providerDown = false;
+  let consecutiveFailedBatches = 0;
+  try {
+    options?.onProgress?.({ embedded, total });
+    for (;; ) {
+      if (leaseLost || drainAbort.signal.aborted) {
+        aborted2 = true;
+        break;
+      }
+      const candidates = loadUnembeddedSessionChunkCandidates(db, projectIdentity, sessionId, snapshot.chunkModelId, batchSize, [...skipIds, ...failedIds]);
+      if (candidates.length === 0)
+        break;
+      const {
+        embedded: n,
+        noWork,
+        failed
+      } = await embedCandidateChunkBatch(db, projectIdentity, snapshot.chunkModelId, candidates, drainAbort.signal);
+      if (leaseLost || !renewGitSweepLease(db, projectIdentity, holderId)) {
+        leaseLost = true;
+        drainAbort.abort();
+        aborted2 = true;
+        break;
+      }
+      for (const id of noWork)
+        skipIds.push(id);
+      for (const id of failed)
+        failedIds.push(id);
+      if (n === 0 && noWork.length === 0) {
+        consecutiveFailedBatches += 1;
+        if (consecutiveFailedBatches >= MAX_CONSECUTIVE_FAILED_BATCHES) {
+          providerDown = true;
+          break;
+        }
+      } else {
+        consecutiveFailedBatches = 0;
+      }
+      embedded += n;
+      options?.onProgress?.({ embedded: Math.min(embedded, total), total });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  } finally {
+    clearInterval(renewal);
+    options?.signal?.removeEventListener("abort", forwardCallerAbort);
+    try {
+      releaseGitSweepLease(db, projectIdentity, holderId);
+    } catch (error51) {
+      log("[magic-context] embed drain: lease release failed (will TTL-expire):", error51);
+    }
+  }
+  if (aborted2)
+    return { status: "aborted", embedded, total, failed: failedIds.length };
+  if (providerDown || failedIds.length > 0) {
+    const remaining = Math.max(0, countUnembeddedSessionCompartments(db, projectIdentity, sessionId, snapshot.chunkModelId) - skipIds.length);
+    if (remaining > 0) {
+      return { status: "stalled", embedded, total, remaining, failed: failedIds.length };
+    }
+  }
+  return { status: "done", embedded, total, failed: failedIds.length };
 }
 function getEmbeddingCoverageStatus(db, projectIdentity, sessionId) {
   const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
@@ -19563,9 +20962,9 @@ async function ensureMemoryEmbeddings(args) {
   return args.existingEmbeddings;
 }
 // ../plugin/src/features/magic-context/mural/storage-mural-cues.ts
-import { createHash as createHash4 } from "node:crypto";
+import { createHash as createHash6 } from "node:crypto";
 function computeCueContentHash(content) {
-  return createHash4("sha256").update(content).digest("hex");
+  return createHash6("sha256").update(content).digest("hex");
 }
 var muralCueColumnCache = new WeakMap;
 var muralCueRejectionColumnCache = new WeakMap;
@@ -19605,6 +21004,38 @@ function getMuralCueState(db, memoryIds) {
     });
   }
   return out;
+}
+function memoryNeedsCue(state, currentContent) {
+  if (!state || state.cue === null || state.hash === null)
+    return true;
+  return state.hash !== computeCueContentHash(currentContent);
+}
+function setMuralCue(db, projectPath, id, cue, contentHash) {
+  if (!hasMuralCueColumns(db))
+    return;
+  withPrivilegedWriter(db, () => {
+    const owned = db.prepare("SELECT 1 FROM memories WHERE id = ? AND project_path = ?").get(id, projectPath);
+    if (!owned) {
+      throw new Error(`Memory ${id} does not belong to project ${projectPath}`);
+    }
+    const rejectionReset = hasMuralCueRejectionCountColumn(db) ? ", mural_cue_rejection_count = 0" : "";
+    db.prepare(`UPDATE memories SET mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ?${rejectionReset} WHERE id = ? AND project_path = ?`).run(cue, contentHash, Date.now(), id, projectPath);
+  });
+}
+function recordMuralCueRejection(db, projectPath, id, contentHash) {
+  if (!hasMuralCueColumns(db) || !hasMuralCueRejectionCountColumn(db))
+    return 0;
+  let count = 0;
+  withPrivilegedWriter(db, () => {
+    const owned = db.prepare("SELECT 1 FROM memories WHERE id = ? AND project_path = ?").get(id, projectPath);
+    if (!owned) {
+      throw new Error(`Memory ${id} does not belong to project ${projectPath}`);
+    }
+    const row = db.prepare("SELECT mural_cue_hash, mural_cue_rejection_count FROM memories WHERE id = ?").get(id);
+    count = row?.mural_cue_hash === contentHash ? (row.mural_cue_rejection_count ?? 0) + 1 : 1;
+    db.prepare("UPDATE memories SET mural_cue = NULL, mural_cue_hash = ?, mural_cue_at = ?, mural_cue_rejection_count = ? WHERE id = ? AND project_path = ?").run(contentHash, Date.now(), count, id, projectPath);
+  });
+  return count;
 }
 
 // ../plugin/src/features/magic-context/memory/visibility.ts
@@ -19733,6 +21164,17 @@ function hasMemoryClassifiedAtColumn(db) {
   memoryClassifiedAtColumnCache.set(db, hasColumn);
   return hasColumn;
 }
+function getUnclassifiedMemoryIds(db, memoryIds) {
+  if (!hasMemoryClassifiedAtColumn(db))
+    return [...memoryIds];
+  const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
+  if (ids.length === 0)
+    return [];
+  const ph = ids.map(() => "?").join(", ");
+  const rows = db.prepare(`SELECT id FROM memories WHERE id IN (${ph}) AND classified_at IS NOT NULL`).all(...ids);
+  const classified = new Set(rows.map((r) => r.id));
+  return ids.filter((id) => !classified.has(id));
+}
 function getMemorySelectColumns(db, tableName = "memories") {
   return Object.entries(COLUMN_MAP).map(([property, column]) => {
     if (property === "importance" && !hasMemoryImportanceColumn(db)) {
@@ -19776,6 +21218,12 @@ function isNullableString(value) {
 }
 function isNullableNumber(value) {
   return value === null || typeof value === "number";
+}
+function isMemoryCountByStatusRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const candidate = row;
+  return typeof candidate.id === "number" && isMemoryStatus(candidate.status) && isNullableNumber(candidate.superseded_by_memory_id);
 }
 function isMemoryRow(row) {
   if (row === null || typeof row !== "object")
@@ -19865,6 +21313,14 @@ function getMemoriesByProjectStatement(db, statuses) {
   }
   return stmt;
 }
+function getActiveMemoriesNoExpiryStatement(db) {
+  let stmt = activeMemoriesNoExpiryStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status = 'active' ORDER BY category ASC, updated_at DESC, id ASC`);
+    activeMemoriesNoExpiryStatements.set(db, stmt);
+  }
+  return stmt;
+}
 function getUpdateMemorySeenCountStatement(db) {
   let stmt = updateMemorySeenCountStatements.get(db);
   if (!stmt) {
@@ -19918,6 +21374,30 @@ function getMergeMemoryStatsStatement(db) {
   if (!stmt) {
     stmt = db.prepare("UPDATE memories SET seen_count = ?, retrieval_count = ?, merged_from = ?, status = ?, updated_at = ? WHERE id = ?");
     mergeMemoryStatsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getDeleteMemoryStatement(db) {
+  let stmt = deleteMemoryStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM memories WHERE id = ?");
+    deleteMemoryStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getDeleteMemoryEmbeddingStatement(db) {
+  let stmt = deleteMemoryEmbeddingStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?");
+    deleteMemoryEmbeddingStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getMemoryCountsByStatusStatement(db) {
+  let stmt = getMemoryCountsByStatusStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("SELECT id, status, superseded_by_memory_id FROM memories WHERE project_path = ?");
+    getMemoryCountsByStatusStatements.set(db, stmt);
   }
   return stmt;
 }
@@ -20096,6 +21576,10 @@ function getMaxMemoryIdForProjects(db, projectPaths, ownIdentities, shareCategor
                 AND (expires_at IS NULL OR expires_at > ?)${sharingFilter.clause}`).get(...identities, expiryCutoff, ...sharingFilter.params);
   return typeof row?.max_id === "number" ? row.max_id : 0;
 }
+function getAllActiveMemoriesForMigration(db, projectPath) {
+  const rows = getActiveMemoriesNoExpiryStatement(db).all(projectPath).filter(isMemoryRow);
+  return rows.map(toMemory);
+}
 function getMemoryById(db, id) {
   const result = getMemoryByIdStatement(db).get(id);
   if (!isMemoryRow(result)) {
@@ -20164,6 +21648,57 @@ function updateMemoryContent(db, id, content, normalizedHash) {
     invalidateMemory(memory.projectPath, id);
   }
 }
+function normalizeImportance(value) {
+  if (!Number.isFinite(value))
+    return 50;
+  return Math.max(1, Math.min(100, Math.round(value)));
+}
+function setMemoryClassification(db, id, classification) {
+  const hasImportance = classification.importance !== undefined;
+  const hasScope = classification.scope !== undefined;
+  const hasShareable = classification.shareable !== undefined;
+  if (!hasImportance && !hasScope && !hasShareable) {
+    throw new Error("setMemoryClassification requires at least one supplied field");
+  }
+  const memory = assertTsMemoryIdWriteAllowed(db, id);
+  if (!memory)
+    return false;
+  const assignments = [];
+  const values = [];
+  if (hasImportance) {
+    const next = normalizeImportance(classification.importance);
+    if (memory.importance !== next) {
+      assignments.push("importance = ?");
+      values.push(next);
+    }
+  }
+  if (hasScope) {
+    const next = classification.scope;
+    if (!isMemoryScope(next)) {
+      throw new Error(`invalid memory scope: ${String(next)}`);
+    }
+    if (memory.scope !== next) {
+      assignments.push("scope = ?");
+      values.push(next);
+    }
+  }
+  if (hasShareable) {
+    const next = classification.shareable ? 1 : 0;
+    if ((memory.shareable ? 1 : 0) !== next) {
+      assignments.push("shareable = ?");
+      values.push(next);
+    }
+  }
+  const fieldChanged = assignments.length > 0;
+  if (hasMemoryClassifiedAtColumn(db)) {
+    assignments.push("classified_at = ?");
+    values.push(Date.now());
+  }
+  if (assignments.length === 0)
+    return false;
+  db.prepare(`UPDATE memories SET ${assignments.join(", ")} WHERE id = ?`).run(...values, id);
+  return fieldChanged;
+}
 function supersededMemory(db, id, supersededById) {
   assertTsMemoryIdWriteAllowed(db, id);
   getSupersededMemoryStatement(db).run(supersededById, Date.now(), id);
@@ -20183,6 +21718,47 @@ function archiveMemory(db, id, reason) {
     return;
   }
   getUpdateArchivedMemoryStatement(db).run(mergeMetadataJson(memory.metadataJson, { archive_reason: trimmedReason }), Date.now(), id);
+}
+function deleteMemory(db, id) {
+  const memory = assertTsMemoryIdWriteAllowed(db, id);
+  db.transaction(() => {
+    getDeleteMemoryEmbeddingStatement(db).run(id);
+    getDeleteMemoryStatement(db).run(id);
+  })();
+  if (memory) {
+    invalidateMemory(memory.projectPath, id);
+  }
+}
+function getMemoryCountsByStatus(db, projectPath) {
+  const rows = getMemoryCountsByStatusStatement(db).all(projectPath).filter(isMemoryCountByStatusRow);
+  const counts = {
+    total: rows.length,
+    active: 0,
+    permanent: 0,
+    archived: 0,
+    merged: 0,
+    ids: [],
+    archivedIds: [],
+    mergedIds: []
+  };
+  for (const row of rows) {
+    counts.ids.push(row.id);
+    if (typeof row.superseded_by_memory_id === "number") {
+      counts.merged += 1;
+      counts.mergedIds.push(row.id);
+    } else if (row.status === "active") {
+      counts.active += 1;
+    } else if (row.status === "permanent") {
+      counts.permanent += 1;
+    } else {
+      counts.archived += 1;
+      counts.archivedIds.push(row.id);
+    }
+  }
+  counts.ids.sort((left, right) => left - right);
+  counts.archivedIds.sort((left, right) => left - right);
+  counts.mergedIds.sort((left, right) => left - right);
+  return counts;
 }
 
 // ../plugin/src/features/magic-context/memory/promotion.ts
@@ -20220,6 +21796,27 @@ function promoteSessionFactsDurable(db, sessionId, projectPath, facts) {
     refs.push({ memoryId: memory.id, content: memory.content });
   }
   return refs;
+}
+async function embedPromotedFacts(db, sessionId, projectPath, refs) {
+  for (const ref of refs) {
+    await embedAndStoreMemory(db, sessionId, projectPath, ref.memoryId, ref.content);
+  }
+}
+async function embedAndStoreMemory(db, sessionId, projectPath, memoryId, content) {
+  try {
+    const hashBeforeEmbed = getMemoryById(db, memoryId)?.normalizedHash;
+    if (!hashBeforeEmbed) {
+      return;
+    }
+    const result = await embedTextForProject(projectPath, content);
+    if (result) {
+      db.transaction(() => {
+        saveEmbeddingIfHashMatches(db, memoryId, result.vector, result.modelId, hashBeforeEmbed);
+      })();
+    }
+  } catch (error51) {
+    sessionLog(sessionId, `memory embedding failed for memory ${memoryId}:`, error51);
+  }
 }
 // ../plugin/src/features/magic-context/memory/storage-memory-fts.ts
 var DEFAULT_SEARCH_LIMIT = 10;
@@ -20294,18 +21891,274 @@ function searchMemoriesFTSUnion(db, projectPaths, query, limit = DEFAULT_SEARCH_
   const rows = sharingFilter.active ? db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${identities.map(() => "?").join(", ")}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ?${sharingFilter.clause} ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`).all(...identities, Date.now(), sanitized, ...sharingFilter.params, limit).filter(isMemoryRow) : getUnionSearchStatement(db, identities.length).all(...identities, Date.now(), sanitized, limit).filter(isMemoryRow);
   return rows.map(toMemory);
 }
+// ../plugin/src/features/magic-context/memory/storage-memory-verifications.ts
+var MEMORY_VERIFICATION_SENTINEL = "";
+function placeholders(values) {
+  return values.map(() => "?").join(", ");
+}
+function uniqueSortedFiles(files) {
+  return Array.from(new Set(files.filter((file2) => file2 !== MEMORY_VERIFICATION_SENTINEL))).sort();
+}
+function recordMemoryMapping(db, memoryId, normalizedFiles, now) {
+  const realFiles = uniqueSortedFiles(normalizedFiles);
+  const filesToWrite = realFiles.length > 0 ? realFiles : [MEMORY_VERIFICATION_SENTINEL];
+  db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
+  const insert = db.prepare("INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, 0, ?)");
+  for (const file2 of filesToWrite) {
+    insert.run(memoryId, file2, now);
+  }
+  return filesToWrite.length;
+}
+function recordMemoryVerifications(db, memoryId, normalizedFiles, now) {
+  const realFiles = uniqueSortedFiles(normalizedFiles);
+  const filesToWrite = realFiles.length > 0 ? realFiles : [MEMORY_VERIFICATION_SENTINEL];
+  db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
+  const insert = db.prepare("INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, ?, ?)");
+  for (const file2 of filesToWrite) {
+    insert.run(memoryId, file2, now, now);
+  }
+  return filesToWrite.length;
+}
+function getUnmappedMemoryIds(db, memoryIds) {
+  const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
+  if (ids.length === 0)
+    return [];
+  const rows = db.prepare(`SELECT DISTINCT memory_id FROM memory_verifications WHERE memory_id IN (${placeholders(ids)})`).all(...ids);
+  const mapped = new Set(rows.map((r) => r.memory_id));
+  return ids.filter((id) => !mapped.has(id));
+}
+function clearMemoryVerifications(db, memoryId) {
+  db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
+}
+function getMemoryVerifications(db, memoryIds) {
+  const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
+  const result = new Map;
+  if (ids.length === 0)
+    return result;
+  const rows = db.prepare(`SELECT memory_id, file_path, verified_at, mapped_at
+               FROM memory_verifications
+              WHERE memory_id IN (${placeholders(ids)})
+              ORDER BY memory_id, file_path`).all(...ids);
+  for (const row of rows) {
+    const existing = result.get(row.memory_id) ?? {
+      files: [],
+      hasSentinel: false,
+      verifiedAt: 0,
+      mappedAt: 0
+    };
+    if (row.file_path === MEMORY_VERIFICATION_SENTINEL) {
+      existing.hasSentinel = true;
+    } else if (!existing.files.includes(row.file_path)) {
+      existing.files.push(row.file_path);
+    }
+    existing.verifiedAt = Math.max(existing.verifiedAt, row.verified_at);
+    existing.mappedAt = Math.max(existing.mappedAt, row.mapped_at ?? 0);
+    result.set(row.memory_id, existing);
+  }
+  for (const state of result.values()) {
+    state.files.sort();
+  }
+  return result;
+}
 // ../plugin/src/features/magic-context/memory/verification-paths.ts
 import { execFile } from "node:child_process";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import path from "node:path";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
+var GIT_TIMEOUT_MS = 1e4;
+var defaultExecFileForVerificationPaths = async (file2, args, options) => await execFileAsync(file2, [...args], options);
+var execFileForVerificationPaths = defaultExecFileForVerificationPaths;
+async function runGit(cwd, args) {
+  try {
+    const result = await execFileForVerificationPaths("git", args, {
+      cwd,
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024,
+      encoding: "utf8"
+    });
+    return String(result.stdout);
+  } catch {
+    return null;
+  }
+}
+function toPosixPath(value) {
+  return value.split(path.sep).join("/");
+}
+function isWithin(root, candidate) {
+  const rel = path.relative(root, candidate);
+  return rel === "" || !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+function safeRealpath(value) {
+  try {
+    return realpathSync.native(value);
+  } catch {
+    return null;
+  }
+}
+async function resolveGitTopLevel(cwd) {
+  const stdout = await runGit(cwd, ["rev-parse", "--show-toplevel"]);
+  const root = stdout?.trim();
+  return root ? safeRealpath(root) ?? path.resolve(root) : null;
+}
+async function readGitHead(cwd) {
+  const stdout = await runGit(cwd, ["rev-parse", "HEAD"]);
+  const head = stdout?.trim();
+  return head && /^[0-9a-f]{40}$/i.test(head) ? head : null;
+}
+async function readGitChangedFilesSince(cwd, revision) {
+  if (!/^[0-9a-f]{7,40}$/i.test(revision))
+    return null;
+  const gitRoot = await resolveGitTopLevel(cwd);
+  if (!gitRoot)
+    return null;
+  const stdout = await runGit(gitRoot, ["diff", "--name-only", "-z", revision]);
+  if (stdout === null)
+    return null;
+  return new Set(stdout.split("\x00").filter(Boolean));
+}
+async function readGitFileChangeTimesSince(cwd, sinceMs) {
+  const gitRoot = await resolveGitTopLevel(cwd);
+  if (!gitRoot)
+    return null;
+  const sinceSec = Math.max(0, Math.floor(sinceMs / 1000));
+  const stdout = await runGit(gitRoot, [
+    "log",
+    `--since=@${sinceSec}`,
+    "--name-only",
+    "--format=%ct"
+  ]);
+  if (stdout === null)
+    return null;
+  const times = new Map;
+  let currentMs = 0;
+  for (const rawLine of stdout.split(`
+`)) {
+    const line = rawLine.trimEnd();
+    if (line === "")
+      continue;
+    if (/^\d+$/.test(line)) {
+      currentMs = Number.parseInt(line, 10) * 1000;
+      continue;
+    }
+    if (currentMs > 0 && !times.has(line)) {
+      times.set(line, currentMs);
+    }
+  }
+  return times;
+}
+async function gitTrackedPath(gitRoot, repoRelativePath) {
+  const stdout = await runGit(gitRoot, [
+    "ls-files",
+    "-z",
+    "--full-name",
+    "--error-unmatch",
+    "--",
+    repoRelativePath
+  ]);
+  const fallbackStdout = stdout === null ? await runGit(gitRoot, ["ls-files", "-z", "--full-name"]) : null;
+  if (stdout === null && fallbackStdout === null)
+    return null;
+  const matches = (stdout ?? fallbackStdout ?? "").split("\x00").filter(Boolean);
+  if (matches.length === 0)
+    return null;
+  return matches.find((match) => match === repoRelativePath) ?? matches.find((match) => match.toLowerCase() === repoRelativePath.toLowerCase()) ?? (matches.length === 1 ? matches[0] : null);
+}
+function verificationFileExists(baseRoot, filePath) {
+  if (!filePath || filePath === ".")
+    return false;
+  const root = path.resolve(baseRoot);
+  const candidate = path.resolve(root, filePath);
+  return isWithin(root, candidate) && existsSync(candidate);
+}
+async function normalizeVerificationFiles(args) {
+  const cwd = path.resolve(args.cwd);
+  const gitRoot = await resolveGitTopLevel(cwd);
+  const root = gitRoot ?? cwd;
+  const rootReal = safeRealpath(root) ?? root;
+  const warnings = [];
+  const normalized = [];
+  for (const raw of args.files) {
+    const value = typeof raw === "string" ? raw.trim() : "";
+    if (!value) {
+      warnings.push("Skipped blank verification path.");
+      continue;
+    }
+    if (value === ".") {
+      warnings.push('Skipped verification path "." (repo/project root is not a file).');
+      continue;
+    }
+    const candidate = path.resolve(cwd, value);
+    const candidateReal = safeRealpath(candidate);
+    if (candidateReal && !isWithin(rootReal, candidateReal)) {
+      warnings.push(`Skipped verification path "${value}" because it resolves outside the project.`);
+      continue;
+    }
+    if (!candidateReal && !isWithin(path.resolve(root), candidate)) {
+      warnings.push(`Skipped verification path "${value}" because it escapes the project.`);
+      continue;
+    }
+    if (path.resolve(root) === candidate) {
+      warnings.push(`Skipped verification path "${value}" because it is the repo/project root.`);
+      continue;
+    }
+    if (existsSync(candidate)) {
+      try {
+        if (statSync(candidate).isDirectory()) {
+          warnings.push(`Skipped verification path "${value}" because it is a directory.`);
+          continue;
+        }
+      } catch {
+        warnings.push(`Skipped verification path "${value}" because it could not be inspected.`);
+        continue;
+      }
+    }
+    if (gitRoot) {
+      const repoRelative = toPosixPath(path.relative(gitRoot, candidateReal ?? candidate));
+      if (!repoRelative || repoRelative === "." || repoRelative.startsWith("../")) {
+        warnings.push(`Skipped verification path "${value}" because it is not inside the git repo.`);
+        continue;
+      }
+      const tracked = await gitTrackedPath(gitRoot, repoRelative);
+      if (!tracked) {
+        warnings.push(`Skipped verification path "${value}" because it is not a tracked git file.`);
+        continue;
+      }
+      if (candidateReal && tracked !== repoRelative) {
+        const realRelative = toPosixPath(path.relative(gitRoot, candidateReal));
+        if (realRelative !== tracked) {
+          warnings.push(`Skipped verification path "${value}" because it is not a tracked git file.`);
+          continue;
+        }
+      }
+      normalized.push(tracked);
+    } else {
+      if (!existsSync(candidate)) {
+        warnings.push(`Skipped verification path "${value}" because it does not exist.`);
+        continue;
+      }
+      const projectRelative = toPosixPath(path.relative(cwd, candidate));
+      if (!projectRelative || projectRelative === "." || projectRelative.startsWith("../")) {
+        warnings.push(`Skipped verification path "${value}" because it is not inside the project.`);
+        continue;
+      }
+      normalized.push(projectRelative);
+    }
+  }
+  return {
+    files: Array.from(new Set(normalized)).sort(),
+    warnings,
+    gitRoot
+  };
+}
 // ../plugin/src/hooks/magic-context/read-session-db.ts
-import { existsSync } from "node:fs";
+import { existsSync as existsSync2 } from "node:fs";
 import { join as join2 } from "node:path";
 function getOpenCodeDbPath() {
   return join2(getDataDir(), "opencode", "opencode.db");
 }
 function openCodeDbExists() {
-  return existsSync(getOpenCodeDbPath());
+  return existsSync2(getOpenCodeDbPath());
 }
 var cachedReadOnlyDb = null;
 function closeCachedReadOnlyDb() {
@@ -20333,14 +22186,76 @@ function getReadOnlySessionDb() {
 function withReadOnlySessionDb(fn) {
   return fn(getReadOnlySessionDb());
 }
+function getRawSessionMessageCountFromDb(db, sessionId) {
+  const row = db.prepare(`SELECT COUNT(*) as count FROM message WHERE session_id = ?
+             AND NOT (COALESCE(json_extract(data, '$.summary'), 0) = 1
+                      AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')`).get(sessionId);
+  return typeof row?.count === "number" ? row.count : 0;
+}
+function isMidTurn(_deps, sessionId) {
+  try {
+    return withReadOnlySessionDb((db) => isMidTurnFromOpenCodeDb(db, sessionId));
+  } catch (error51) {
+    log("[magic-context] failed to inspect OpenCode mid-turn state:", error51);
+    return false;
+  }
+}
+function isMidTurnFromOpenCodeDb(db, sessionId) {
+  const latestAssistant = db.prepare(`SELECT id,
+                    json_extract(data, '$.finish') as finish,
+                    time_created as timeCreated
+             FROM message
+             WHERE session_id = ?
+               AND json_extract(data, '$.role') = 'assistant'
+             ORDER BY time_created DESC
+             LIMIT 1`).get(sessionId);
+  if (typeof latestAssistant?.id !== "string")
+    return false;
+  if (hasNewerRealUserMessage(db, sessionId, latestAssistant.timeCreated))
+    return false;
+  if (latestAssistant.finish === "tool-calls")
+    return true;
+  const partRows = db.prepare("SELECT data FROM part WHERE session_id = ? AND message_id = ?").all(sessionId, latestAssistant.id);
+  return partRows.some((row) => {
+    if (typeof row.data !== "string" || row.data.length === 0)
+      return false;
+    try {
+      const part = JSON.parse(row.data);
+      return part.type === "tool" && part.providerExecuted !== true;
+    } catch {
+      return false;
+    }
+  });
+}
+function hasNewerRealUserMessage(db, sessionId, latestAssistantTimeCreated) {
+  if (typeof latestAssistantTimeCreated !== "number")
+    return false;
+  const row = db.prepare(`SELECT 1 as one
+             FROM message m
+             WHERE m.session_id = ?
+               AND m.time_created > ?
+               AND json_extract(m.data, '$.role') = 'user'
+               AND NOT (
+                 EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM part p
+                   WHERE p.message_id = m.id
+                     AND COALESCE(json_extract(p.data, '$.synthetic'), 0) NOT IN (1, 'true')
+                     AND json_extract(p.data, '$.metadata.marker.kind') IS NULL
+                     AND COALESCE(json_extract(p.data, '$.ignored'), 0) NOT IN (1, 'true')
+                 )
+               )
+             LIMIT 1`).get(sessionId, latestAssistantTimeCreated);
+  return row?.one === 1;
+}
 function getMessageTimesFromOpenCodeDb(sessionId, messageIds) {
   const result = new Map;
   if (messageIds.length === 0)
     return result;
   try {
     withReadOnlySessionDb((db) => {
-      const placeholders = messageIds.map(() => "?").join(",");
-      const rows = db.prepare(`SELECT id, time_created FROM message WHERE session_id = ? AND id IN (${placeholders})`).all(sessionId, ...messageIds);
+      const placeholders2 = messageIds.map(() => "?").join(",");
+      const rows = db.prepare(`SELECT id, time_created FROM message WHERE session_id = ? AND id IN (${placeholders2})`).all(sessionId, ...messageIds);
       for (const row of rows) {
         if (typeof row.id === "string" && typeof row.time_created === "number") {
           result.set(row.id, row.time_created);
@@ -20452,10 +22367,10 @@ function readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, fin
   }));
   if (messageRows.length === 0)
     return [];
-  const placeholders = messageRows.map(() => "?").join(", ");
+  const placeholders2 = messageRows.map(() => "?").join(", ");
   const partRows = db.prepare(`SELECT message_id, data, time_updated
              FROM part
-             WHERE session_id = ? AND message_id IN (${placeholders})
+             WHERE session_id = ? AND message_id IN (${placeholders2})
              ORDER BY time_created ASC, id ASC`).all(sessionId, ...messageRows.map((row) => row.id)).filter(isRawPartRow);
   const partsByMessageId = new Map;
   for (const part of partRows) {
@@ -20875,6 +22790,26 @@ function buildToolArcs(messages) {
   }
   return arcs.sort((a, b) => a.invOrdinal - b.invOrdinal || (a.resOrdinal ?? Number.MAX_SAFE_INTEGER) - (b.resOrdinal ?? Number.MAX_SAFE_INTEGER));
 }
+function fenceBoundaryForToolArcs(candidate, arcs, lastCompartmentEndOrdinal, recentOpenArcCutoff) {
+  let boundary = candidate;
+  for (const arc of arcs) {
+    if (arc.resOrdinal !== null) {
+      if (completedToolArcCrossesBoundary(arc.invOrdinal, arc.resOrdinal, boundary)) {
+        boundary = arc.resOrdinal + 1;
+      }
+      continue;
+    }
+    if (arc.invOrdinal < recentOpenArcCutoff)
+      continue;
+    if (arc.invOrdinal >= lastCompartmentEndOrdinal + 1 && arc.invOrdinal < boundary) {
+      return arc.invOrdinal;
+    }
+    if (arc.invOrdinal >= boundary) {
+      return arc.invOrdinal;
+    }
+  }
+  return boundary;
+}
 function tokenForMessage(message, options) {
   const key = messageCacheKey(message, options);
   const cached2 = messageEstimateCache.get(key);
@@ -21191,6 +23126,21 @@ function withRawMessageProvider(sessionId, provider2, fn) {
 function cleanUserText(text) {
   return removeSystemReminders(text).replace(OMO_INTERNAL_INITIATOR_MARKER, "").trim();
 }
+function withRawSessionMessageCache(fn) {
+  const outerCache = activeRawMessageCache;
+  if (!outerCache) {
+    activeRawMessageCache = new Map;
+    activeAbsoluteCountCache = new Map;
+  }
+  try {
+    return fn();
+  } finally {
+    if (!outerCache) {
+      activeRawMessageCache = null;
+      activeAbsoluteCountCache = null;
+    }
+  }
+}
 function readRawSessionMessages(sessionId) {
   if (activeRawMessageCache) {
     const cached2 = activeRawMessageCache.get(sessionId);
@@ -21275,6 +23225,17 @@ function readRawSessionMessagesFromSource(sessionId) {
   if (!openCodeDbExists())
     return [];
   return withReadOnlySessionDb((db) => readRawSessionMessagesFromDb(db, sessionId));
+}
+function getRawSessionMessageCount(sessionId) {
+  const provider2 = sessionProviders.get(sessionId);
+  if (provider2) {
+    if (provider2.getMessageCount)
+      return provider2.getMessageCount();
+    return provider2.readMessages().length;
+  }
+  if (!openCodeDbExists())
+    return 0;
+  return withReadOnlySessionDb((db) => getRawSessionMessageCountFromDb(db, sessionId));
 }
 function getRawSessionTagKeysThrough(sessionId, upToMessageIndex) {
   const messages = readRawSessionMessages(sessionId);
@@ -21757,7 +23718,7 @@ function containsProbeVerbatim(text, probes) {
 }
 
 // ../plugin/src/features/magic-context/search-measurement.ts
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash7 } from "node:crypto";
 function resultId(result) {
   switch (result.source) {
     case "memory":
@@ -21844,7 +23805,7 @@ async function recordShadowMeasurement(args) {
   }
 }
 function sha2562(value) {
-  return createHash5("sha256").update(value).digest("hex");
+  return createHash7("sha256").update(value).digest("hex");
 }
 
 // ../plugin/src/features/magic-context/storage-notes.ts
@@ -21935,9 +23896,9 @@ function buildStatusClause(status) {
   if (statuses.length === 0) {
     return null;
   }
-  const placeholders = statuses.map(() => "?").join(", ");
+  const placeholders2 = statuses.map(() => "?").join(", ");
   return {
-    sql: `status IN (${placeholders})`,
+    sql: `status IN (${placeholders2})`,
     params: statuses
   };
 }
@@ -22049,10 +24010,38 @@ function dismissNote(db, noteId, scope) {
   const result = db.prepare("UPDATE notes SET status = 'dismissed', updated_at = ? WHERE id = ? AND status != 'dismissed'").run(Date.now(), noteId);
   return result.changes > 0;
 }
+function markNoteReady(db, noteId, reason) {
+  const now = Date.now();
+  db.prepare("UPDATE notes SET status = 'ready', ready_at = ?, ready_reason = ?, updated_at = ?, last_checked_at = ? WHERE id = ? AND type = 'smart'").run(now, reason ?? null, now, now, noteId);
+}
+function markNoteChecked(db, noteId) {
+  const now = Date.now();
+  db.prepare("UPDATE notes SET last_checked_at = ?, updated_at = ? WHERE id = ? AND type = 'smart'").run(now, now, noteId);
+}
 
 // ../plugin/src/features/magic-context/storage-primers.ts
 var PRIMER_CANDIDATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 var PRIMER_CANDIDATE_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
+function normalizePrimerQuestion(question) {
+  return question.trim().toLowerCase().replace(/[“”]/g, '"').replace(/[’]/g, "'").replace(/\s+/g, " ").replace(/[?.!]+$/g, "").trim();
+}
+function primerOccurrenceKey(candidate) {
+  return [
+    candidate.projectPath,
+    candidate.harness,
+    candidate.sessionId,
+    candidate.sourceStartMessageId,
+    candidate.sourceEndMessageId
+  ].join("\x1F");
+}
+function primerOccurrenceUtcDay(sourceMessageTime) {
+  return new Date(sourceMessageTime).toISOString().slice(0, 10);
+}
+function vectorBlob2(vector) {
+  if (!vector)
+    return null;
+  return new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength);
+}
 function blobToFloat32Array(value) {
   if (!value)
     return null;
@@ -22100,6 +24089,63 @@ function parsePrimerSourceProvenance(raw) {
     return null;
   }
 }
+function loadPrimerSourceProvenance(db, candidateIds) {
+  const ids = [...new Set(candidateIds)].sort((a, b) => a - b);
+  if (ids.length === 0)
+    return [];
+  const placeholders2 = ids.map(() => "?").join(",");
+  const rows = db.prepare(`SELECT id, project_path, harness, session_id,
+                    source_compartment_start, source_compartment_end,
+                    source_start_message_id, source_end_message_id
+               FROM primer_candidates
+              WHERE id IN (${placeholders2})
+              ORDER BY id ASC`).all(...ids);
+  return rows.map((row) => ({
+    candidateId: row.id,
+    projectPath: row.project_path,
+    harness: row.harness,
+    sessionId: row.session_id,
+    sourceCompartmentStart: row.source_compartment_start,
+    sourceCompartmentEnd: row.source_compartment_end,
+    sourceStartMessageId: row.source_start_message_id,
+    sourceEndMessageId: row.source_end_message_id
+  }));
+}
+function serializePrimerSourceProvenance(provenance, sourceCandidateIds) {
+  if (provenance.length === 0 && sourceCandidateIds.length > 0)
+    return null;
+  return JSON.stringify(provenance.map((source) => ({
+    candidate_id: source.candidateId,
+    project_path: source.projectPath,
+    harness: source.harness,
+    session_id: source.sessionId,
+    source_compartment_start: source.sourceCompartmentStart,
+    source_compartment_end: source.sourceCompartmentEnd,
+    source_start_message_id: source.sourceStartMessageId,
+    source_end_message_id: source.sourceEndMessageId
+  })));
+}
+function normalizedCandidateIds(candidateIds) {
+  return [...new Set(candidateIds)].sort((a, b) => a - b);
+}
+function toCandidate(row) {
+  return {
+    id: row.id,
+    projectPath: row.project_path,
+    harness: row.harness,
+    sessionId: row.session_id,
+    question: row.question,
+    normalizedQuestion: row.normalized_question,
+    sourceCompartmentStart: row.source_compartment_start,
+    sourceCompartmentEnd: row.source_compartment_end,
+    sourceStartMessageId: row.source_start_message_id,
+    sourceEndMessageId: row.source_end_message_id,
+    sourceMessageTime: row.source_message_time,
+    questionEmbedding: blobToFloat32Array(row.question_embedding),
+    questionEmbeddingModelId: row.question_embedding_model_id,
+    createdAt: row.created_at
+  };
+}
 function toPrimer(row) {
   const status = row.status === "archived" ? "archived" : "active";
   return {
@@ -22119,6 +24165,62 @@ function toPrimer(row) {
     updatedAt: row.updated_at
   };
 }
+function insertPrimerCandidates(db, candidates) {
+  const ids = [];
+  const stmt = db.prepare(`
+        INSERT INTO primer_candidates (
+            project_path, harness, session_id, question, normalized_question,
+            source_compartment_start, source_compartment_end,
+            source_start_message_id, source_end_message_id, source_message_time,
+            question_embedding, question_embedding_model_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_path, harness, session_id, source_start_message_id, source_end_message_id)
+        DO UPDATE SET
+            question = excluded.question,
+            normalized_question = excluded.normalized_question,
+            source_compartment_start = excluded.source_compartment_start,
+            source_compartment_end = excluded.source_compartment_end,
+            source_message_time = excluded.source_message_time,
+            question_embedding = COALESCE(excluded.question_embedding, primer_candidates.question_embedding),
+            question_embedding_model_id = COALESCE(excluded.question_embedding_model_id, primer_candidates.question_embedding_model_id),
+            created_at = MIN(primer_candidates.created_at, excluded.created_at)
+    `);
+  const select = db.prepare(`
+        SELECT id FROM primer_candidates
+        WHERE project_path = ? AND harness = ? AND session_id = ?
+          AND source_start_message_id = ? AND source_end_message_id = ?
+    `);
+  db.transaction(() => {
+    for (const candidate of candidates) {
+      const question = candidate.question.trim();
+      if (!question)
+        continue;
+      const normalized = candidate.normalizedQuestion ?? normalizePrimerQuestion(question);
+      stmt.run(candidate.projectPath, candidate.harness || "opencode", candidate.sessionId, question, normalized, candidate.sourceCompartmentStart ?? null, candidate.sourceCompartmentEnd ?? null, candidate.sourceStartMessageId, candidate.sourceEndMessageId, candidate.sourceMessageTime, vectorBlob2(candidate.questionEmbedding), candidate.questionEmbeddingModelId ?? null, candidate.createdAt ?? Date.now());
+      const row = select.get(candidate.projectPath, candidate.harness || "opencode", candidate.sessionId, candidate.sourceStartMessageId, candidate.sourceEndMessageId);
+      if (typeof row?.id === "number")
+        ids.push(row.id);
+    }
+  })();
+  return ids;
+}
+function updatePrimerCandidateEmbedding(db, candidateId, vector, modelId) {
+  db.prepare("UPDATE primer_candidates SET question_embedding = ?, question_embedding_model_id = ? WHERE id = ?").run(vectorBlob2(vector), modelId, candidateId);
+}
+function getPrimerCandidatesByIds(db, ids) {
+  if (ids.length === 0)
+    return [];
+  const placeholders2 = ids.map(() => "?").join(",");
+  const rows = db.prepare(`SELECT * FROM primer_candidates WHERE id IN (${placeholders2})`).all(...ids);
+  return rows.map(toCandidate);
+}
+function getPrimerCandidatesForPromotion(db, projectPath, now = Date.now(), ttlMs = PRIMER_CANDIDATE_TTL_MS) {
+  const cutoff = now - ttlMs;
+  const rows = db.prepare(`SELECT * FROM primer_candidates
+             WHERE project_path = ? AND source_message_time >= ?
+             ORDER BY project_path ASC, harness ASC, session_id ASC, source_start_message_id ASC, source_end_message_id ASC, id ASC`).all(projectPath, cutoff);
+  return rows.map(toCandidate);
+}
 function countPrimerCandidatesForProject(db, projectPath) {
   const row = db.prepare("SELECT COUNT(*) AS count FROM primer_candidates WHERE project_path = ?").get(projectPath);
   return row?.count ?? 0;
@@ -22128,6 +24230,48 @@ function getActivePrimers(db, projectPath) {
              WHERE project_path = ? AND status = 'active'
              ORDER BY COALESCE(last_observed_at, created_at) DESC, id ASC`).all(projectPath);
   return rows.map(toPrimer);
+}
+function createPrimer(db, input) {
+  return db.transaction(() => {
+    const now = input.now ?? Date.now();
+    const sourceCandidateIds = normalizedCandidateIds(input.sourceCandidateIds);
+    const sourceProvenance = loadPrimerSourceProvenance(db, sourceCandidateIds);
+    const info = db.prepare(`INSERT INTO primers (
+                    project_path, question, question_embedding, question_embedding_model_id, answer,
+                    status, total_support, last_observed_at, answer_refreshed_at,
+                    source_candidate_ids, source_candidate_provenance, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?, ?)`).run(input.projectPath, input.question, vectorBlob2(input.questionEmbedding), input.questionEmbeddingModelId ?? null, input.answer ?? "", input.totalSupport, input.lastObservedAt, JSON.stringify(sourceCandidateIds), serializePrimerSourceProvenance(sourceProvenance, sourceCandidateIds), now, now);
+    return Number(info.lastInsertRowid);
+  })();
+}
+function updatePrimerSupport(db, input) {
+  db.transaction(() => {
+    const sourceCandidateIds = normalizedCandidateIds(input.sourceCandidateIds);
+    const allowedIds = new Set(sourceCandidateIds);
+    const existingRow = db.prepare("SELECT source_candidate_provenance FROM primers WHERE id = ?").get(input.primerId);
+    const provenanceByCandidateId = new Map;
+    for (const source of parsePrimerSourceProvenance(existingRow?.source_candidate_provenance ?? null) ?? []) {
+      if (allowedIds.has(source.candidateId)) {
+        provenanceByCandidateId.set(source.candidateId, source);
+      }
+    }
+    for (const source of loadPrimerSourceProvenance(db, sourceCandidateIds)) {
+      provenanceByCandidateId.set(source.candidateId, source);
+    }
+    const sourceProvenance = [...provenanceByCandidateId.values()].sort((a, b) => a.candidateId - b.candidateId);
+    db.prepare(`UPDATE primers
+             SET question_embedding = COALESCE(?, question_embedding),
+                 question_embedding_model_id = COALESCE(?, question_embedding_model_id),
+                 total_support = ?,
+                 last_observed_at = ?,
+                 source_candidate_ids = ?,
+                 source_candidate_provenance = ?,
+                 updated_at = ?
+             WHERE id = ?`).run(vectorBlob2(input.questionEmbedding), input.questionEmbeddingModelId ?? null, input.totalSupport, input.lastObservedAt, JSON.stringify(sourceCandidateIds), serializePrimerSourceProvenance(sourceProvenance, sourceCandidateIds), input.now ?? Date.now(), input.primerId);
+  })();
+}
+function updatePrimerAnswer(db, primerId, answer, refreshedAt = Date.now()) {
+  db.prepare("UPDATE primers SET answer = ?, answer_refreshed_at = ?, updated_at = ? WHERE id = ?").run(answer, refreshedAt, refreshedAt, primerId);
 }
 
 // ../plugin/src/features/magic-context/search.ts
@@ -23145,9 +25289,9 @@ async function unifiedSearch(db, sessionId, projectPath, query, options = {}) {
   return results;
 }
 // ../plugin/src/features/magic-context/project-docs-hash.ts
-import { createHash as createHash6 } from "node:crypto";
-import { lstatSync, readFileSync, statSync } from "node:fs";
-import path from "node:path";
+import { createHash as createHash8 } from "node:crypto";
+import { lstatSync, readFileSync, statSync as statSync2 } from "node:fs";
+import path2 from "node:path";
 var PROJECT_DOC_FILES = ["ARCHITECTURE.md", "STRUCTURE.md"];
 var PROJECT_DOCS_DELIMITER = `
 
@@ -23177,7 +25321,7 @@ function fingerprintFile(filePath) {
 }
 function readDirectoryMtimeMs(projectDirectory) {
   try {
-    return statSync(projectDirectory).mtimeMs;
+    return statSync2(projectDirectory).mtimeMs;
   } catch {
     return 0;
   }
@@ -23196,7 +25340,7 @@ function cacheFilesEqual(cachedFiles, currentFiles) {
 function readCurrentFingerprints(projectDirectory) {
   const files = new Map;
   for (const filename of PROJECT_DOC_FILES) {
-    const filePath = path.join(projectDirectory, filename);
+    const filePath = path2.join(projectDirectory, filename);
     files.set(filePath, fingerprintFile(filePath));
   }
   return { directoryMtimeMs: readDirectoryMtimeMs(projectDirectory), files };
@@ -23205,7 +25349,7 @@ function readCanonicalPieces(projectDirectory, files) {
   const hashPieces = [];
   const renderedSections = [];
   for (const filename of PROJECT_DOC_FILES) {
-    const filePath = path.join(projectDirectory, filename);
+    const filePath = path2.join(projectDirectory, filename);
     const fingerprint = files.get(filePath);
     if (!fingerprint?.exists) {
       continue;
@@ -23243,10 +25387,10 @@ function hashCanonicalPieces(hashPieces) {
   if (hashPieces.length === 0) {
     return "";
   }
-  return createHash6("sha256").update(hashPieces.join(PROJECT_DOCS_DELIMITER), "utf8").digest("hex");
+  return createHash8("sha256").update(hashPieces.join(PROJECT_DOCS_DELIMITER), "utf8").digest("hex");
 }
 function readProjectDocsCanonical(projectDirectory) {
-  const canonicalDirectory = path.resolve(projectDirectory);
+  const canonicalDirectory = path2.resolve(projectDirectory);
   const current = readCurrentFingerprints(canonicalDirectory);
   const cached2 = docsCache.get(canonicalDirectory);
   if (cached2 && cacheFilesEqual(cached2.files, current.files)) {
@@ -23277,6 +25421,36 @@ var M0_MUTATION_TYPES = new Set([
   "recomp_boundary_change",
   "compartment_upgrade"
 ]);
+function assertMutationType(mutationType) {
+  if (!M0_MUTATION_TYPES.has(mutationType)) {
+    throw new Error(`Invalid m0 mutation type: ${mutationType}`);
+  }
+}
+function toM0Mutation(row) {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    mutationType: row.mutation_type,
+    targetId: row.target_id,
+    queuedAt: row.queued_at
+  };
+}
+function queueM0Mutation(db, input) {
+  assertMutationType(input.mutationType);
+  const result = db.prepare(`INSERT INTO m0_mutation_log (session_id, mutation_type, target_id, queued_at)
+             VALUES (?, ?, ?, ?)`).run(input.sessionId, input.mutationType, input.targetId ?? null, input.queuedAt ?? Date.now());
+  const row = getM0Mutation(db, Number(result.lastInsertRowid));
+  if (!row) {
+    throw new Error("Failed to load queued m0 mutation");
+  }
+  return row;
+}
+function getM0Mutation(db, id) {
+  const row = db.prepare(`SELECT id, session_id, mutation_type, target_id, queued_at
+             FROM m0_mutation_log
+             WHERE id = ?`).get(id);
+  return row ? toM0Mutation(row) : null;
+}
 function getMaxM0MutationId(db, sessionId) {
   const row = db.prepare("SELECT MAX(id) AS max_id FROM m0_mutation_log WHERE session_id = ?").get(sessionId);
   return row?.max_id ?? null;
@@ -23326,9 +25500,9 @@ function getMemoryMutation(db, id) {
   return row ? toMemoryMutation(row) : null;
 }
 function uniqueProjectPaths2(projectPaths) {
-  return [...new Set(projectPaths.filter((path2) => path2.length > 0))];
+  return [...new Set(projectPaths.filter((path3) => path3.length > 0))];
 }
-function placeholders(values) {
+function placeholders2(values) {
   return values.map(() => "?").join(", ");
 }
 function coalesceMutations(rows) {
@@ -23358,7 +25532,7 @@ function getMemoryMutationsForRenderByIdentitySet(db, projectPaths, afterId, ren
   const cursor = afterId ?? 0;
   const visibilityTargets = db.prepare(`SELECT DISTINCT target_memory_id
                FROM memory_mutation_log
-              WHERE project_path IN (${placeholders(identities)})
+              WHERE project_path IN (${placeholders2(identities)})
                 AND id > ?
                 AND category = ?`).all(...identities, cursor, MEMORY_VISIBILITY_MUTATION_CATEGORY);
   const requestedTargets = new Set(renderedMemoryIds);
@@ -23381,9 +25555,9 @@ function getMemoryMutationsForRenderByIdentitySet(db, projectPaths, afterId, ren
     const batch = db.prepare(`SELECT id, project_path, mutation_type, target_memory_id,
                         superseded_by_id, category, new_content, queued_at
                    FROM memory_mutation_log
-                  WHERE project_path IN (${placeholders(identities)})
+                  WHERE project_path IN (${placeholders2(identities)})
                     AND id > ?
-                    AND target_memory_id IN (${placeholders(frontier)})
+                    AND target_memory_id IN (${placeholders2(frontier)})
                   ORDER BY id ASC`).all(...identities, cursor, ...frontier);
     loaded.push(...batch);
     frontier = coalesceMutations(batch).filter((mutation) => mutation.mutationType === "superseded").flatMap((mutation) => mutation.supersededById === null ? [] : [mutation.supersededById]);
@@ -23439,7 +25613,7 @@ function getMaxMemoryMutationIdForProjects(db, projectPaths) {
     return getMaxMemoryMutationId(db, identities[0]);
   const row = db.prepare(`SELECT MAX(id) AS max_id
                FROM memory_mutation_log
-              WHERE project_path IN (${placeholders(identities)})`).get(...identities);
+              WHERE project_path IN (${placeholders2(identities)})`).get(...identities);
   return row?.max_id ?? null;
 }
 // ../plugin/src/shared/context-limit-provenance.ts
@@ -23499,6 +25673,70 @@ function parseJsonArray(json2, validator) {
     return [];
   }
 }
+function isPersistedHistorianFailureRow(row) {
+  if (row === null || typeof row !== "object")
+    return false;
+  const r = row;
+  return typeof r.historian_failure_count === "number" && (typeof r.historian_last_error === "string" || r.historian_last_error === null) && (typeof r.historian_last_failure_at === "number" || r.historian_last_failure_at === null);
+}
+function getDefaultHistorianFailureState() {
+  return {
+    failureCount: 0,
+    lastError: null,
+    lastFailureAt: null
+  };
+}
+var DEFAULT_PROTECTED_TAIL_META = {
+  priorBoundaryOrdinal: 1,
+  protectedTailPolicyVersion: 0,
+  protectedTailDrainWindowStartedAt: 0,
+  protectedTailDrainTokens: 0,
+  recoveryNoEligibleHeadCount: 0,
+  forceEmergencyBypassWindowStart: 0,
+  forceEmergencyBypassUsed: 0,
+  emergencyDrainActive: 0,
+  historianDrainFailureAt: 0
+};
+function toProtectedTailMeta(row) {
+  if (row === null || typeof row !== "object")
+    return { ...DEFAULT_PROTECTED_TAIL_META };
+  const r = row;
+  const numberOr = (value, fallback) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return {
+    priorBoundaryOrdinal: Math.max(1, numberOr(r.prior_boundary_ordinal, 1)),
+    protectedTailPolicyVersion: numberOr(r.protected_tail_policy_version, 0),
+    protectedTailDrainWindowStartedAt: numberOr(r.protected_tail_drain_window_started_at, 0),
+    protectedTailDrainTokens: numberOr(r.protected_tail_drain_tokens, 0),
+    recoveryNoEligibleHeadCount: numberOr(r.recovery_no_eligible_head_count, 0),
+    forceEmergencyBypassWindowStart: numberOr(r.force_emergency_bypass_window_start, 0),
+    forceEmergencyBypassUsed: numberOr(r.force_emergency_bypass_used, 0),
+    emergencyDrainActive: numberOr(r.emergency_drain_active, 0),
+    historianDrainFailureAt: numberOr(r.historian_drain_failure_at, 0)
+  };
+}
+function loadProtectedTailMeta(db, sessionId) {
+  ensureSessionMetaRow(db, sessionId);
+  const row = db.prepare(`SELECT prior_boundary_ordinal, protected_tail_policy_version,
+                    protected_tail_drain_window_started_at, protected_tail_drain_tokens,
+                    recovery_no_eligible_head_count, force_emergency_bypass_window_start,
+                    force_emergency_bypass_used, emergency_drain_active, historian_drain_failure_at
+             FROM session_meta WHERE session_id = ?`).get(sessionId);
+  return toProtectedTailMeta(row);
+}
+function markProtectedTailPolicyV3Seeded(db, sessionId, priorBoundaryOrdinal) {
+  let seeded = false;
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    const existing = loadProtectedTailMeta(db, sessionId);
+    if (existing.protectedTailPolicyVersion < 3) {
+      db.prepare(`UPDATE session_meta
+                 SET prior_boundary_ordinal = ?, protected_tail_policy_version = 3
+                 WHERE session_id = ? AND protected_tail_policy_version < 3`).run(Math.max(1, Math.floor(priorBoundaryOrdinal)), sessionId);
+      seeded = true;
+    }
+  })();
+  return { ...loadProtectedTailMeta(db, sessionId), seeded };
+}
 function recordProtectedTailPublicationFloor(db, sessionId, floorOrdinal) {
   db.transaction(() => {
     ensureSessionMetaRow(db, sessionId);
@@ -23508,8 +25746,158 @@ function recordProtectedTailPublicationFloor(db, sessionId, floorOrdinal) {
              WHERE session_id = ?`).run(Math.max(1, Math.floor(floorOrdinal)), sessionId);
   })();
 }
+function recordProtectedTailNoEligibleHead(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare(`UPDATE session_meta
+             SET recovery_no_eligible_head_count = COALESCE(recovery_no_eligible_head_count, 0) + 1
+             WHERE session_id = ?`).run(sessionId);
+  })();
+  return loadProtectedTailMeta(db, sessionId).recoveryNoEligibleHeadCount;
+}
 var DRAIN_WINDOW_MS = 10 * 60 * 1000;
 var WRAPUP_IN_PROGRESS_TTL_MS = 5 * 60 * 1000;
+function parseWrapupState(value) {
+  if (typeof value !== "string" || value.trim().length === 0)
+    return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object")
+      return null;
+    if (typeof parsed.holderId !== "string" || parsed.holderId.length === 0)
+      return null;
+    const numberFields = [
+      "acquiredAt",
+      "expiresAt",
+      "messagesToKeep",
+      "anchorRawMessageCount",
+      "targetEligibleEndOrdinal",
+      "lastCompartmentEnd",
+      "chunkIndex",
+      "expectedChunks",
+      "updatedAt"
+    ];
+    for (const field of numberFields) {
+      if (typeof parsed[field] !== "number" || !Number.isFinite(parsed[field]))
+        return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function readRawWrapupState(db, sessionId) {
+  const row = db.prepare("SELECT wrapup_in_progress_state FROM session_meta WHERE session_id = ?").get(sessionId);
+  return parseWrapupState(row?.wrapup_in_progress_state);
+}
+function getWrapupInProgressState(db, sessionId, now = Date.now()) {
+  const state = readRawWrapupState(db, sessionId);
+  if (!state)
+    return null;
+  if (state.expiresAt > now)
+    return state;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+  } catch {
+    return null;
+  }
+  let finished = false;
+  try {
+    const current = readRawWrapupState(db, sessionId);
+    if (current && current.expiresAt <= now) {
+      db.prepare("UPDATE session_meta SET wrapup_in_progress_state = NULL WHERE session_id = ?").run(sessionId);
+    }
+    db.exec("COMMIT");
+    finished = true;
+  } finally {
+    if (!finished) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+  return null;
+}
+function isWrapupInProgress(db, sessionId, now = Date.now()) {
+  return getWrapupInProgressState(db, sessionId, now) !== null;
+}
+function acquireWrapupInProgress(db, sessionId, state, now = Date.now()) {
+  const acquiredAt = now;
+  const next = {
+    ...state,
+    acquiredAt,
+    expiresAt: acquiredAt + WRAPUP_IN_PROGRESS_TTL_MS,
+    updatedAt: acquiredAt
+  };
+  db.exec("BEGIN IMMEDIATE");
+  let finished = false;
+  try {
+    ensureSessionMetaRow(db, sessionId);
+    const current = readRawWrapupState(db, sessionId);
+    if (current && current.expiresAt > now && current.holderId !== state.holderId) {
+      db.exec("COMMIT");
+      finished = true;
+      return { ok: false, state: current };
+    }
+    db.prepare("UPDATE session_meta SET wrapup_in_progress_state = ? WHERE session_id = ?").run(stableStringify(next), sessionId);
+    db.exec("COMMIT");
+    finished = true;
+    return { ok: true, state: next };
+  } finally {
+    if (!finished) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
+function updateWrapupInProgress(db, sessionId, holderId, updates, now = Date.now()) {
+  db.exec("BEGIN IMMEDIATE");
+  let finished = false;
+  try {
+    const current = readRawWrapupState(db, sessionId);
+    if (!current || current.holderId !== holderId || current.expiresAt <= now) {
+      db.exec("ROLLBACK");
+      finished = true;
+      return null;
+    }
+    const next = {
+      ...current,
+      ...updates,
+      holderId,
+      expiresAt: now + WRAPUP_IN_PROGRESS_TTL_MS,
+      updatedAt: now
+    };
+    db.prepare("UPDATE session_meta SET wrapup_in_progress_state = ? WHERE session_id = ?").run(stableStringify(next), sessionId);
+    db.exec("COMMIT");
+    finished = true;
+    return next;
+  } finally {
+    if (!finished) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
+function releaseWrapupInProgress(db, sessionId, holderId) {
+  db.exec("BEGIN IMMEDIATE");
+  let finished = false;
+  try {
+    const current = readRawWrapupState(db, sessionId);
+    if (current?.holderId === holderId) {
+      db.prepare("UPDATE session_meta SET wrapup_in_progress_state = NULL WHERE session_id = ?").run(sessionId);
+    }
+    db.exec("COMMIT");
+    finished = true;
+  } finally {
+    if (!finished) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+    }
+  }
+}
 var COMPACTION_MODE_RECORD_VALUES = new Set([
   "on",
   "off",
@@ -23517,7 +25905,119 @@ var COMPACTION_MODE_RECORD_VALUES = new Set([
   "off_notice_pending",
   "off_cleanup_pending"
 ]);
+function protectedTailWindowBudget(usagePercentage, usable, perRunCap) {
+  if (usagePercentage >= 95)
+    return Math.min(1e6, Math.max(4 * perRunCap, Math.round(0.5 * usable)));
+  if (usagePercentage >= 80)
+    return Math.min(750000, Math.max(3 * perRunCap, Math.round(0.35 * usable)));
+  return Math.min(500000, Math.max(perRunCap, Math.round(0.2 * usable)));
+}
+var EMERGENCY_DRAIN_EXIT_MARGIN = 10;
+var EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE = 55;
+var EMERGENCY_DRAIN_FAILURE_BACKOFF_MS = 60000;
 var EMERGENCY_DRAIN_MAX_LATCH_MS = 30 * 60 * 1000;
+function emergencyDrainExitThreshold(executeThresholdPercentage) {
+  if (!Number.isFinite(executeThresholdPercentage) || executeThresholdPercentage <= 0) {
+    return EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE;
+  }
+  return Math.max(0, executeThresholdPercentage - EMERGENCY_DRAIN_EXIT_MARGIN);
+}
+function reserveProtectedTailDrainTokens(args) {
+  const now = args.now ?? Date.now();
+  const requested = Math.max(0, Math.floor(args.trueRawTokens));
+  if (requested === 0) {
+    return { ok: true, reservedTokens: 0, overQuotaBypass: false, reservation: null };
+  }
+  let result = {
+    ok: false,
+    reservedTokens: 0,
+    overQuotaBypass: false,
+    reservation: null,
+    skippedReason: "quota exhausted"
+  };
+  args.db.transaction(() => {
+    ensureSessionMetaRow(args.db, args.sessionId);
+    let meta3 = loadProtectedTailMeta(args.db, args.sessionId);
+    if (now - meta3.protectedTailDrainWindowStartedAt > DRAIN_WINDOW_MS) {
+      args.db.prepare(`UPDATE session_meta
+                     SET protected_tail_drain_window_started_at = ?, protected_tail_drain_tokens = 0
+                     WHERE session_id = ?`).run(now, args.sessionId);
+      meta3 = loadProtectedTailMeta(args.db, args.sessionId);
+    }
+    const exitThreshold = emergencyDrainExitThreshold(args.executeThresholdPercentage);
+    let latchActiveSince = meta3.emergencyDrainActive;
+    const { forceMaterializationPercentage } = escalationBands(args.executeThresholdPercentage);
+    if (args.usagePercentage >= forceMaterializationPercentage) {
+      if (latchActiveSince <= 0)
+        latchActiveSince = now;
+    } else if (latchActiveSince > 0) {
+      const expired = now - latchActiveSince > EMERGENCY_DRAIN_MAX_LATCH_MS;
+      if (args.usagePercentage < exitThreshold || expired)
+        latchActiveSince = 0;
+    }
+    if (latchActiveSince !== meta3.emergencyDrainActive) {
+      args.db.prepare("UPDATE session_meta SET emergency_drain_active = ? WHERE session_id = ?").run(latchActiveSince, args.sessionId);
+    }
+    const latchActive = latchActiveSince > 0;
+    const budget = protectedTailWindowBudget(args.usagePercentage, args.usable, args.perRunCap);
+    const remaining = Math.max(0, budget - meta3.protectedTailDrainTokens);
+    let reserved = Math.min(requested, args.perRunCap, remaining);
+    let bypass = false;
+    const inFailureBackoff = meta3.historianDrainFailureAt > 0 && now - meta3.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
+    if (reserved <= 0 && latchActive && !inFailureBackoff) {
+      reserved = Math.min(requested, args.perRunCap);
+      bypass = true;
+    }
+    if (reserved <= 0)
+      return;
+    args.db.prepare(`UPDATE session_meta
+                 SET protected_tail_drain_window_started_at = CASE WHEN protected_tail_drain_window_started_at = 0 THEN ? ELSE protected_tail_drain_window_started_at END,
+                     protected_tail_drain_tokens = COALESCE(protected_tail_drain_tokens, 0) + ?
+                 WHERE session_id = ?`).run(now, reserved, args.sessionId);
+    result = {
+      ok: true,
+      reservedTokens: reserved,
+      overQuotaBypass: bypass,
+      reservation: { sessionId: args.sessionId, runId: args.runId, tokens: reserved }
+    };
+  })();
+  return result;
+}
+function clearEmergencyDrainLatch(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET emergency_drain_active = 0 WHERE session_id = ?").run(sessionId);
+  })();
+}
+function recordHistorianDrainFailure(db, sessionId, now) {
+  const ts = now ?? Date.now();
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET historian_drain_failure_at = ? WHERE session_id = ?").run(ts, sessionId);
+  })();
+}
+function clearHistorianDrainFailure(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET historian_drain_failure_at = 0 WHERE session_id = ?").run(sessionId);
+  })();
+}
+function rollbackProtectedTailDrainReservation(db, reservation) {
+  if (!reservation || reservation.tokens <= 0)
+    return;
+  db.transaction(() => {
+    ensureSessionMetaRow(db, reservation.sessionId);
+    db.prepare(`UPDATE session_meta
+             SET protected_tail_drain_tokens = MAX(0, COALESCE(protected_tail_drain_tokens, 0) - ?)
+             WHERE session_id = ?`).run(reservation.tokens, reservation.sessionId);
+  })();
+}
+function setPersistedNoteNudgeTrigger(db, sessionId, triggerMessageId = "") {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET note_nudge_trigger_pending = 1, note_nudge_trigger_message_id = ? WHERE session_id = ?").run(triggerMessageId, sessionId);
+  })();
+}
 function getAutoSearchHintDecisions(db, sessionId) {
   const row = db.prepare("SELECT auto_search_hint_decisions FROM session_meta WHERE session_id = ?").get(sessionId);
   return parseJsonArray(row?.auto_search_hint_decisions, isValidAutoSearchHintDecision);
@@ -23579,6 +26079,35 @@ function setNoteLastReadAt(db, sessionId, at = Date.now()) {
     db.prepare("UPDATE session_meta SET note_last_read_at = ? WHERE session_id = ?").run(at, sessionId);
   })();
 }
+function getHistorianFailureState(db, sessionId) {
+  const result = db.prepare("SELECT historian_failure_count, historian_last_error, historian_last_failure_at FROM session_meta WHERE session_id = ?").get(sessionId);
+  if (!isPersistedHistorianFailureRow(result)) {
+    return getDefaultHistorianFailureState();
+  }
+  return {
+    failureCount: result.historian_failure_count,
+    lastError: typeof result.historian_last_error === "string" && result.historian_last_error.length > 0 ? result.historian_last_error : null,
+    lastFailureAt: typeof result.historian_last_failure_at === "number" ? result.historian_last_failure_at : null
+  };
+}
+function incrementHistorianFailure(db, sessionId, error51) {
+  let nextCount = 1;
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    const current = getHistorianFailureState(db, sessionId);
+    nextCount = current.failureCount + 1;
+    db.prepare("UPDATE session_meta SET historian_failure_count = ?, historian_last_error = ?, historian_last_failure_at = ? WHERE session_id = ?").run(nextCount, error51, Date.now(), sessionId);
+    const reason = error51.replace(/\s+/g, " ").trim().slice(0, 300);
+    sessionLog(sessionId, `historian failure recorded: count=${nextCount} reason="${reason}"`);
+  })();
+  return nextCount;
+}
+function clearHistorianFailureState(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET historian_failure_count = 0, historian_last_error = NULL, historian_last_failure_at = NULL WHERE session_id = ?").run(sessionId);
+  })();
+}
 function normalizeDetectedLimitModelKey(modelKey) {
   return typeof modelKey === "string" && modelKey.length > 0 ? modelKey : null;
 }
@@ -23611,6 +26140,68 @@ function getOverflowState(db, sessionId, modelKey) {
     needsEmergencyRecovery: needs,
     emergencyRecoveryOrigin: recoveryOrigin
   };
+}
+function clearEmergencyRecovery(db, sessionId) {
+  db.transaction(() => {
+    ensureSessionMetaRow(db, sessionId);
+    try {
+      db.prepare("UPDATE session_meta SET needs_emergency_recovery = 0, emergency_recovery_origin = '', recovery_no_eligible_head_count = 0 WHERE session_id = ?").run(sessionId);
+    } catch {
+      db.prepare("UPDATE session_meta SET needs_emergency_recovery = 0, emergency_recovery_origin = '' WHERE session_id = ?").run(sessionId);
+    }
+  })();
+  emergencyRecoveryArmedSessions.delete(sessionId);
+  emergencyRecoveryArmedAtBySession.delete(sessionId);
+  providerOverflowReconfirmedSessions.delete(sessionId);
+}
+function getPersistedCompactionMarkerState(db, sessionId) {
+  const row = db.prepare("SELECT compaction_marker_state, compaction_marker_target_end_message_id FROM session_meta WHERE session_id = ?").get(sessionId);
+  const raw = row?.compaction_marker_state;
+  if (!raw || raw.length === 0)
+    return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.boundaryMessageId === "string" && typeof parsed.summaryMessageId === "string" && typeof parsed.compactionPartId === "string" && typeof parsed.summaryPartId === "string" && typeof parsed.boundaryOrdinal === "number") {
+      const targetEndMessageId = typeof row?.compaction_marker_target_end_message_id === "string" && row.compaction_marker_target_end_message_id.length > 0 ? row.compaction_marker_target_end_message_id : typeof parsed.targetEndMessageId === "string" && parsed.targetEndMessageId.length > 0 ? parsed.targetEndMessageId : null;
+      return {
+        ...parsed,
+        targetEndMessageId
+      };
+    }
+  } catch {}
+  return null;
+}
+function setPersistedCompactionMarkerState(db, sessionId, state) {
+  ensureSessionMetaRow(db, sessionId);
+  const json2 = state ? JSON.stringify(state) : "";
+  db.prepare("UPDATE session_meta SET compaction_marker_state = ?, compaction_marker_target_end_message_id = ? WHERE session_id = ?").run(json2, state?.targetEndMessageId ?? null, sessionId);
+}
+function isPendingCompactionMarker(value) {
+  return typeof value === "object" && value !== null && typeof value.ordinal === "number" && typeof value.endMessageId === "string" && typeof value.publishedAt === "number";
+}
+function getPendingCompactionMarkerState(db, sessionId) {
+  const row = db.prepare("SELECT pending_compaction_marker_state FROM session_meta WHERE session_id = ?").get(sessionId);
+  const raw = row?.pending_compaction_marker_state;
+  if (raw === null || raw === undefined || raw === "")
+    return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (isPendingCompactionMarker(parsed)) {
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+function setPendingCompactionMarkerState(db, sessionId, state) {
+  ensureSessionMetaRow(db, sessionId);
+  const blob = state ? stableStringify(state) : null;
+  db.prepare("UPDATE session_meta SET pending_compaction_marker_state = ? WHERE session_id = ?").run(blob, sessionId);
+}
+function clearPendingCompactionMarkerStateIf(db, sessionId, expected) {
+  const expectedBlob = stableStringify(expected);
+  const result = db.prepare(`UPDATE session_meta SET pending_compaction_marker_state = NULL
+             WHERE session_id = ? AND pending_compaction_marker_state = ?`).run(sessionId, expectedBlob);
+  return result.changes > 0;
 }
 // ../plugin/src/features/magic-context/storage-meta-session.ts
 import { Buffer as Buffer4 } from "node:buffer";
@@ -23800,9 +26391,45 @@ function getProjectState(db, projectPath) {
   const row = statement.get(projectPath);
   return row ? toProjectState(row) : null;
 }
+function bumpProjectUserProfileVersion(db, projectPath = GLOBAL_USER_PROFILE_PROJECT_PATH, now = Date.now()) {
+  db.prepare(`INSERT INTO project_state
+            (project_path, project_memory_epoch, project_user_profile_version, updated_at)
+         VALUES (?, 0, 1, ?)
+         ON CONFLICT(project_path) DO UPDATE SET
+            project_user_profile_version = project_user_profile_version + 1,
+            updated_at = excluded.updated_at`).run(projectPath, now);
+  const state = getProjectState(db, projectPath);
+  if (!state) {
+    throw new Error(`Failed to bump project user profile version for ${projectPath}`);
+  }
+  return state;
+}
 // ../plugin/src/features/magic-context/storage-source.ts
 function saveSourceContent(db, sessionId, tagId, content) {
   db.prepare("INSERT OR IGNORE INTO source_contents (tag_id, session_id, content, created_at, harness) VALUES (?, ?, ?, ?, ?)").run(tagId, sessionId, content, Date.now(), getHarness());
+}
+// ../plugin/src/features/magic-context/storage-subagent-invocations.ts
+function clampToken(value) {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+function recordSubagentInvocation(db, input) {
+  const result = db.prepare(`INSERT INTO subagent_invocations (
+                session_id, harness, subagent, task, provider_id, model_id,
+                started_at, ended_at, status,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                error, parent_invocation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.sessionId, input.harness, input.subagent, input.task ?? null, input.providerId ?? null, input.modelId ?? null, input.startedAt, input.endedAt, input.status, clampToken(input.inputTokens), clampToken(input.outputTokens), clampToken(input.cacheReadTokens), clampToken(input.cacheWriteTokens), input.error ?? null, input.parentInvocationId ?? null);
+  return Number(result.lastInsertRowid);
+}
+function getLatestHistorianInvocationId(db, sessionId) {
+  try {
+    const row = db.prepare(`SELECT id FROM subagent_invocations
+                 WHERE session_id = ? AND subagent = 'historian'
+                 ORDER BY id DESC LIMIT 1`).get(sessionId);
+    return typeof row?.id === "number" ? row.id : null;
+  } catch {
+    return null;
+  }
 }
 // ../plugin/src/features/magic-context/storage-tags.ts
 var insertTagStatements = new WeakMap;
@@ -23859,6 +26486,13 @@ function getUpdateTagInputByteSizeStatement(db) {
 function updateTagByteSize(db, sessionId, tagNumber, newByteSize) {
   getUpdateTagByteSizeStatement(db).run(newByteSize, sessionId, tagNumber);
 }
+var CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
+function ownerMessageIdForTagRow(row) {
+  if (row.type === "tool") {
+    return row.tool_owner_message_id ?? row.message_id;
+  }
+  return row.message_id.replace(CONTENT_ID_SUFFIX, "");
+}
 var RECLAIM_HINT_EXCLUDED_TOOLS = ["todowrite"];
 var RECLAIM_HINT_EXCLUDED_LIST = RECLAIM_HINT_EXCLUDED_TOOLS.map((name) => `'${name.replace(/'/g, "''")}'`).join(", ");
 var getActiveToolTagsForAgeReclaimStatements = new WeakMap;
@@ -23885,6 +26519,30 @@ function getUpdateTagInputTokenCountStatement(db) {
 }
 function updateTagTokenCount(db, sessionId, tagNumber, newTokenCount) {
   getUpdateTagTokenCountStatement(db).run(newTokenCount, sessionId, tagNumber);
+}
+function getAllStatusTagTokenTotalsFlat(db, sessionId, floor = 0) {
+  const rows = floor > 0 ? db.prepare(`SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
+                       FROM tags
+                       WHERE session_id = ? AND tag_number >= ?`).all(sessionId, floor) : db.prepare(`SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
+                       FROM tags
+                       WHERE session_id = ?`).all(sessionId);
+  const totals = new Map;
+  const nullMessageIds = new Set;
+  for (const row of rows) {
+    if (row.type === "tool" && row.tool_owner_message_id === null)
+      continue;
+    const owner = ownerMessageIdForTagRow(row);
+    if (row.token_count === null) {
+      nullMessageIds.add(owner);
+      totals.delete(owner);
+      continue;
+    }
+    if (nullMessageIds.has(owner))
+      continue;
+    const weight = (row.token_count ?? 0) + (row.input_token_count ?? 0) + (row.reasoning_token_count ?? 0);
+    totals.set(owner, (totals.get(owner) ?? 0) + weight);
+  }
+  return { totals, nullMessageIds };
 }
 function updateTagInputTokenCount(db, sessionId, tagNumber, newInputTokenCount) {
   getUpdateTagInputTokenCountStatement(db).run(newInputTokenCount, sessionId, tagNumber);
@@ -24047,14 +26705,14 @@ var ERROR_CLASSES = new Set([
 import { Buffer as Buffer5 } from "node:buffer";
 
 // ../plugin/src/features/magic-context/mural/render-trigger.ts
-import { createHash as createHash7 } from "node:crypto";
+import { createHash as createHash9 } from "node:crypto";
 
 // ../plugin/src/shared/harness-provider-map.ts
 var PI_TO_CANONICAL_PROVIDER = {
   "openai-codex": "openai",
   "google-antigravity": "google"
 };
-function remapProviderPrefix(ref, map2) {
+function remapProviderPrefix2(ref, map2) {
   if (typeof ref !== "string")
     return ref;
   const slash = ref.indexOf("/");
@@ -24066,7 +26724,7 @@ function remapProviderPrefix(ref, map2) {
   return `${map2[provider2]}${ref.slice(slash)}`;
 }
 function piModelRefToCanonical(ref) {
-  return remapProviderPrefix(ref, PI_TO_CANONICAL_PROVIDER);
+  return remapProviderPrefix2(ref, PI_TO_CANONICAL_PROVIDER);
 }
 
 // ../plugin/src/shared/models-dev-cache.ts
@@ -24794,7 +27452,7 @@ function ensureMuralRendered(db, projectIdentity, budgetTokens = DEFAULT_MURAL_M
     return { hasMural: false, rerendered: false };
   }
   const rendered = renderMural(entries);
-  const textHash = createHash7("sha256").update(rendered.sha256Input).digest("hex");
+  const textHash = createHash9("sha256").update(rendered.sha256Input).digest("hex");
   const existing = getMural(db, projectIdentity);
   if (existing && existing.contentHash === textHash && existing.width === rendered.width && existing.height === rendered.height) {
     return {
@@ -24851,6 +27509,17 @@ function resolveMuralWire(db, projectIdentity, modelKey, enabled, budgetTokens =
 
 // ../plugin/src/features/magic-context/user-memory/storage-user-memory.ts
 var USER_MEMORY_CANDIDATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+function insertUserMemoryCandidates(db, candidates) {
+  if (candidates.length === 0)
+    return;
+  const now = Date.now();
+  const stmt = db.prepare("INSERT INTO user_memory_candidates (content, session_id, source_compartment_start, source_compartment_end, created_at) VALUES (?, ?, ?, ?, ?)");
+  db.transaction(() => {
+    for (const c of candidates) {
+      stmt.run(c.content, c.sessionId, c.sourceCompartmentStart ?? null, c.sourceCompartmentEnd ?? null, now);
+    }
+  })();
+}
 function getUserMemoryCandidates(db) {
   const rows = db.prepare("SELECT id, content, session_id, source_compartment_start, source_compartment_end, created_at FROM user_memory_candidates ORDER BY created_at ASC").all();
   return rows.map((r) => ({
@@ -24862,9 +27531,62 @@ function getUserMemoryCandidates(db) {
     createdAt: r.created_at
   }));
 }
+function deleteUserMemoryCandidates(db, ids) {
+  if (ids.length === 0)
+    return;
+  const placeholders3 = ids.map(() => "?").join(",");
+  db.prepare(`DELETE FROM user_memory_candidates WHERE id IN (${placeholders3})`).run(...ids);
+}
+function pruneExpiredUserMemoryCandidates(db, ttlMs, now = Date.now()) {
+  const cutoff = now - ttlMs;
+  const result = db.prepare("DELETE FROM user_memory_candidates WHERE created_at < ?").run(cutoff);
+  return Number(result.changes ?? 0);
+}
+function loadUserMemorySourceProvenance(db, candidateIds) {
+  const ids = [...new Set(candidateIds)].sort((a, b) => a - b);
+  if (ids.length === 0)
+    return [];
+  const placeholders3 = ids.map(() => "?").join(",");
+  const rows = db.prepare(`SELECT id, session_id, source_compartment_start, source_compartment_end
+               FROM user_memory_candidates
+              WHERE id IN (${placeholders3})
+              ORDER BY id ASC`).all(...ids);
+  return rows.map((row) => ({
+    candidateId: row.id,
+    sessionId: row.session_id,
+    sourceCompartmentStart: row.source_compartment_start,
+    sourceCompartmentEnd: row.source_compartment_end
+  }));
+}
+function serializeUserMemorySourceProvenance(provenance, sourceCandidateIds) {
+  if (provenance.length === 0 && sourceCandidateIds.length > 0)
+    return null;
+  return JSON.stringify(provenance.map((source) => ({
+    candidate_id: source.candidateId,
+    session_id: source.sessionId,
+    source_compartment_start: source.sourceCompartmentStart,
+    source_compartment_end: source.sourceCompartmentEnd
+  })));
+}
+function insertUserMemory(db, content, sourceCandidateIds) {
+  return db.transaction(() => {
+    const now = Date.now();
+    const sourceProvenance = loadUserMemorySourceProvenance(db, sourceCandidateIds);
+    const result = db.prepare(`INSERT INTO user_memories
+                    (content, status, promoted_at, source_candidate_ids, source_candidate_provenance, created_at, updated_at)
+                 VALUES (?, 'active', ?, ?, ?, ?, ?)`).run(content, now, JSON.stringify(sourceCandidateIds), serializeUserMemorySourceProvenance(sourceProvenance, sourceCandidateIds), now, now);
+    return Number(result.lastInsertRowid);
+  })();
+}
 function getActiveUserMemories(db) {
   const rows = db.prepare("SELECT id, content, status, promoted_at, source_candidate_ids, source_candidate_provenance, created_at, updated_at FROM user_memories WHERE status = 'active' ORDER BY promoted_at ASC, id ASC").all();
   return rows.map(parseUserMemoryRow);
+}
+function updateUserMemoryContent(db, id, content) {
+  db.prepare("UPDATE user_memories SET content = ?, updated_at = ? WHERE id = ?").run(content, Date.now(), id);
+}
+function dismissUserMemory(db, id) {
+  db.prepare("UPDATE user_memories SET status = 'dismissed', updated_at = ? WHERE id = ?").run(Date.now(), id);
 }
 function parseCandidateIds2(raw) {
   try {
@@ -24960,8 +27682,351 @@ class BoundedSessionMap {
 }
 
 // ../plugin/src/features/magic-context/compaction-marker.ts
+import { createHash as createHash10 } from "node:crypto";
+import { existsSync as existsSync3 } from "node:fs";
+import { join as join4 } from "node:path";
+var BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 var ID_PREFIX_HEX_LENGTH = 12;
+var ID_SUFFIX_LENGTH = 14;
 var ID_PREFIX_MASK = (1n << BigInt(ID_PREFIX_HEX_LENGTH * 4)) - 1n;
+function deterministicBase62(seed, length) {
+  let value = BigInt(`0x${createHash10("sha256").update(seed).digest("hex")}`);
+  const chars = Array(length);
+  for (let index = length - 1;index >= 0; index -= 1) {
+    chars[index] = BASE62_CHARS[Number(value % 62n)];
+    value /= 62n;
+  }
+  return chars.join("");
+}
+function generateId(prefix, timestampMs, counter, identity) {
+  const encoded = BigInt(Math.max(0, Math.floor(timestampMs))) * 0x1000n + counter & ID_PREFIX_MASK;
+  const hex3 = encoded.toString(16).padStart(ID_PREFIX_HEX_LENGTH, "0");
+  return `${prefix}_${hex3}${deterministicBase62(`${prefix}\x00${identity}`, ID_SUFFIX_LENGTH)}`;
+}
+function generateMessageId(timestampMs, counter = 0n, identity = "") {
+  return generateId("msg", timestampMs, counter, identity);
+}
+function generatePartId(timestampMs, counter = 0n, identity = "") {
+  return generateId("prt", timestampMs, counter, identity);
+}
+function getOpenCodeDbPath2() {
+  return join4(getDataDir(), "opencode", "opencode.db");
+}
+var cachedWriteDb = null;
+var REQUIRED_MESSAGE_COLUMNS = ["id", "session_id", "time_created", "time_updated", "data"];
+var REQUIRED_PART_COLUMNS = [
+  "id",
+  "message_id",
+  "session_id",
+  "time_created",
+  "time_updated",
+  "data"
+];
+var cachedSchemaCompatible = null;
+function isOpenCodeSchemaCompatible(db, dbPath) {
+  if (cachedSchemaCompatible?.path === dbPath) {
+    return cachedSchemaCompatible.compatible;
+  }
+  try {
+    const messageCols = new Set(db.prepare("PRAGMA table_info(message)").all().map((r) => r.name ?? "").filter((n) => n.length > 0));
+    const partCols = new Set(db.prepare("PRAGMA table_info(part)").all().map((r) => r.name ?? "").filter((n) => n.length > 0));
+    const missingMessage = REQUIRED_MESSAGE_COLUMNS.filter((c) => !messageCols.has(c));
+    const missingPart = REQUIRED_PART_COLUMNS.filter((c) => !partCols.has(c));
+    if (missingMessage.length > 0 || missingPart.length > 0) {
+      log(`[magic-context] compaction-marker: OpenCode DB schema missing required columns ` + `(message: [${missingMessage.join(", ")}], part: [${missingPart.join(", ")}]). ` + `Marker injection disabled for this process. ` + `This usually means OpenCode was updated and magic-context is out of date.`);
+      cachedSchemaCompatible = { path: dbPath, compatible: false };
+      return false;
+    }
+    cachedSchemaCompatible = { path: dbPath, compatible: true };
+    return true;
+  } catch (error51) {
+    log(`[magic-context] compaction-marker: schema probe failed: ${error51 instanceof Error ? error51.message : String(error51)}. ` + `Marker injection disabled until next process restart.`);
+    cachedSchemaCompatible = { path: dbPath, compatible: false };
+    return false;
+  }
+}
+function getWritableOpenCodeDb() {
+  const dbPath = getOpenCodeDbPath2();
+  if (cachedWriteDb?.path === dbPath) {
+    return cachedWriteDb.db;
+  }
+  if (cachedWriteDb) {
+    try {
+      closeQuietly(cachedWriteDb.db);
+    } catch {}
+  }
+  if (!existsSync3(dbPath)) {
+    throw new Error(`OpenCode database not found at ${dbPath} (is OpenCode installed?)`);
+  }
+  const db = new Database(dbPath);
+  db.exec("PRAGMA busy_timeout=5000");
+  db.exec("PRAGMA journal_mode=WAL");
+  cachedWriteDb = { path: dbPath, db };
+  return db;
+}
+function getNonSummaryMessageSortKey(sessionId, messageId) {
+  const db = getWritableOpenCodeDb();
+  const row = db.prepare(`SELECT time_created, id
+             FROM message
+             WHERE session_id = ?
+               AND id = ?
+               AND NOT (COALESCE(json_extract(data, '$.summary'), 0) = 1
+                        AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')
+             LIMIT 1`).get(sessionId, messageId);
+  if (typeof row?.time_created !== "number" || typeof row.id !== "string") {
+    return null;
+  }
+  return { id: row.id, timeCreated: row.time_created };
+}
+function findBoundaryUserMessage(sessionId, endMessageId) {
+  const db = getWritableOpenCodeDb();
+  const target = getNonSummaryMessageSortKey(sessionId, endMessageId);
+  if (!target)
+    return null;
+  const boundary = db.prepare(`SELECT id, time_created, data
+             FROM message
+             WHERE session_id = ?
+               AND NOT (COALESCE(json_extract(data, '$.summary'), 0) = 1
+                        AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')
+               AND COALESCE(json_extract(data, '$.role'), '') = 'user'
+               AND (time_created < ? OR (time_created = ? AND id <= ?))
+             ORDER BY time_created DESC, id DESC
+             LIMIT 1`).get(sessionId, target.timeCreated, target.timeCreated, target.id);
+  if (typeof boundary?.id !== "string" || typeof boundary.time_created !== "number") {
+    return null;
+  }
+  return { id: boundary.id, timeCreated: boundary.time_created };
+}
+function compareOpenCodeMessagesByCanonicalOrder(sessionId, leftMessageId, rightMessageId) {
+  const left = getNonSummaryMessageSortKey(sessionId, leftMessageId);
+  const right = getNonSummaryMessageSortKey(sessionId, rightMessageId);
+  if (!left || !right)
+    return null;
+  if (left.timeCreated < right.timeCreated)
+    return -1;
+  if (left.timeCreated > right.timeCreated)
+    return 1;
+  if (left.id < right.id)
+    return -1;
+  if (left.id > right.id)
+    return 1;
+  return 0;
+}
+function removeLegacyMarkerLineageRows(db, args) {
+  const legacySummaries = db.prepare(`SELECT m.id
+             FROM message m
+             WHERE m.session_id = ?
+               AND m.id <> ?
+               AND COALESCE(json_extract(m.data, '$.summary'), 0) = 1
+               AND COALESCE(json_extract(m.data, '$.finish'), '') = 'stop'
+               AND COALESCE(json_extract(m.data, '$.parentID'), '') = ?
+               AND EXISTS (
+                   SELECT 1
+                   FROM part p
+                   WHERE p.session_id = m.session_id
+                     AND p.message_id = m.id
+                     AND COALESCE(json_extract(p.data, '$.type'), '') = 'text'
+                     AND COALESCE(json_extract(p.data, '$.text'), '') = ?
+               )`).all(args.sessionId, args.summaryMessageId, args.boundaryMessageId, args.summaryText);
+  const legacySummaryIds = legacySummaries.flatMap((row) => typeof row.id === "string" ? [row.id] : []);
+  if (legacySummaryIds.length === 0)
+    return;
+  const deleteSummaryParts = db.prepare("DELETE FROM part WHERE session_id = ? AND message_id = ?");
+  const deleteSummary = db.prepare("DELETE FROM message WHERE session_id = ? AND id = ?");
+  for (const summaryMessageId of legacySummaryIds) {
+    deleteSummaryParts.run(args.sessionId, summaryMessageId);
+    deleteSummary.run(args.sessionId, summaryMessageId);
+  }
+  db.prepare(`DELETE FROM part
+         WHERE session_id = ?
+           AND message_id = ?
+           AND id <> ?
+           AND COALESCE(json_extract(data, '$.type'), '') = 'compaction'
+           AND COALESCE(json_extract(data, '$.auto'), 0) = 1`).run(args.sessionId, args.boundaryMessageId, args.compactionPartId);
+}
+function injectCompactionMarker(args) {
+  const db = getWritableOpenCodeDb();
+  if (!isOpenCodeSchemaCompatible(db, getOpenCodeDbPath2())) {
+    return null;
+  }
+  const boundary = args.resolvedBoundary ?? findBoundaryUserMessage(args.sessionId, args.endMessageId);
+  if (!boundary) {
+    log(`[magic-context] compaction-marker: no user message found at or before endMessageId ${args.endMessageId} (ordinal ${args.endOrdinal})`);
+    return null;
+  }
+  const boundaryTime = boundary.timeCreated;
+  const markerIdentity = `${args.sessionId}\x00${args.endMessageId}`;
+  const summaryMsgId = generateMessageId(boundaryTime + 1, 1n, `${markerIdentity}\x00summary-message`);
+  const compactionPartId = generatePartId(boundaryTime, 1n, `${markerIdentity}\x00compaction-part`);
+  const summaryPartId = generatePartId(boundaryTime + 1, 2n, `${markerIdentity}\x00summary-part`);
+  const summaryMsgData = JSON.stringify({
+    role: "assistant",
+    parentID: boundary.id,
+    summary: true,
+    finish: "stop",
+    mode: "compaction",
+    agent: "compaction",
+    path: { cwd: args.directory, root: args.directory },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: "magic-context",
+    providerID: "magic-context",
+    time: { created: boundaryTime + 1 }
+  });
+  try {
+    db.transaction(() => {
+      removeLegacyMarkerLineageRows(db, {
+        sessionId: args.sessionId,
+        boundaryMessageId: boundary.id,
+        summaryText: args.summaryText,
+        summaryMessageId: summaryMsgId,
+        compactionPartId
+      });
+      db.prepare(`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     message_id = excluded.message_id,
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`).run(compactionPartId, boundary.id, args.sessionId, boundaryTime, boundaryTime, '{"type":"compaction","auto":true}');
+      db.prepare(`INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`).run(summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, summaryMsgData);
+      db.prepare(`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     message_id = excluded.message_id,
+                     session_id = excluded.session_id,
+                     time_created = excluded.time_created,
+                     time_updated = excluded.time_updated,
+                     data = excluded.data`).run(summaryPartId, summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, JSON.stringify({ type: "text", text: args.summaryText }));
+    })();
+    log(`[magic-context] compaction-marker: injected boundary at user msg ${boundary.id} (ordinal ~${args.endOrdinal}), summary msg ${summaryMsgId}`);
+    return {
+      boundaryMessageId: boundary.id,
+      summaryMessageId: summaryMsgId,
+      compactionPartId,
+      summaryPartId
+    };
+  } catch (error51) {
+    log(`[magic-context] compaction-marker: injection failed: ${error51 instanceof Error ? error51.message : String(error51)}`);
+    return null;
+  }
+}
+function removeCompactionMarker(state) {
+  try {
+    const db = getWritableOpenCodeDb();
+    db.transaction(() => {
+      db.prepare("DELETE FROM part WHERE id = ?").run(state.summaryPartId);
+      db.prepare("DELETE FROM message WHERE id = ?").run(state.summaryMessageId);
+      db.prepare("DELETE FROM part WHERE id = ?").run(state.compactionPartId);
+    })();
+    return true;
+  } catch (error51) {
+    log(`[magic-context] compaction-marker: removal failed: ${error51 instanceof Error ? error51.message : String(error51)}`);
+    return false;
+  }
+}
+
+// ../plugin/src/hooks/magic-context/compaction-marker-manager.ts
+var MARKER_SUMMARY_TEXT = "[Compacted by magic-context — session history is managed by the plugin]";
+function dropMarkerSummaryTag(db, sessionId, summaryMessageId) {
+  const tagNumber = getTagNumberByMessageId(db, sessionId, `${summaryMessageId}:p0`);
+  if (tagNumber !== null)
+    updateTagStatus(db, sessionId, tagNumber, "dropped");
+}
+function persistMarkerStateAndDropReplacedTag(db, sessionId, state, replacedSummaryMessageId) {
+  db.transaction(() => {
+    setPersistedCompactionMarkerState(db, sessionId, state);
+    if (replacedSummaryMessageId !== null) {
+      dropMarkerSummaryTag(db, sessionId, replacedSummaryMessageId);
+    }
+  })();
+}
+function getCompartmentEndMessageIdForOrdinal(db, sessionId, endOrdinal) {
+  const row = db.prepare(`SELECT end_message_id
+             FROM compartments
+             WHERE session_id = ? AND end_message = ?
+             ORDER BY sequence DESC
+             LIMIT 1`).get(sessionId, endOrdinal);
+  return typeof row?.end_message_id === "string" && row.end_message_id.length > 0 ? row.end_message_id : null;
+}
+function existingMarkerAlreadyCoversTarget(sessionId, existing, targetOrdinal, targetEndMessageId) {
+  if (existing.boundaryOrdinal < targetOrdinal) {
+    return false;
+  }
+  if (existing.boundaryOrdinal === targetOrdinal) {
+    const boundaryCompare = compareOpenCodeMessagesByCanonicalOrder(sessionId, existing.boundaryMessageId, targetEndMessageId);
+    if (boundaryCompare === null || boundaryCompare > 0) {
+      return false;
+    }
+    if (existing.targetEndMessageId !== null && existing.targetEndMessageId !== targetEndMessageId) {
+      return false;
+    }
+    return true;
+  }
+  if (existing.targetEndMessageId !== null) {
+    const targetCompare = compareOpenCodeMessagesByCanonicalOrder(sessionId, existing.targetEndMessageId, targetEndMessageId);
+    if (targetCompare !== null && targetCompare <= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+function updateCompactionMarkerAfterPublication(db, sessionId, lastCompartmentEnd, directory) {
+  if (getHarness() !== "opencode") {
+    return true;
+  }
+  const targetEndMessageId = getCompartmentEndMessageIdForOrdinal(db, sessionId, lastCompartmentEnd);
+  if (!targetEndMessageId) {
+    sessionLog(sessionId, `compaction-marker: no compartment endMessageId for ordinal ${lastCompartmentEnd}; preserving existing marker`);
+    return false;
+  }
+  const existing = getPersistedCompactionMarkerState(db, sessionId);
+  const removedSummaryMessageId = existing?.summaryMessageId ?? null;
+  if (existing) {
+    if (existingMarkerAlreadyCoversTarget(sessionId, existing, lastCompartmentEnd, targetEndMessageId)) {
+      return true;
+    }
+  }
+  const boundary = findBoundaryUserMessage(sessionId, targetEndMessageId);
+  if (!boundary) {
+    sessionLog(sessionId, `compaction-marker: no user boundary found at or before endMessageId ${targetEndMessageId} (ordinal ${lastCompartmentEnd}); preserving existing marker`);
+    return false;
+  }
+  if (existing) {
+    const removed = removeCompactionMarker(existing);
+    if (!removed) {
+      sessionLog(sessionId, `compaction-marker: failed to remove old boundary at ordinal ${existing.boundaryOrdinal}; preserving persisted state for retry (not injecting new marker this pass)`);
+      return false;
+    }
+    persistMarkerStateAndDropReplacedTag(db, sessionId, null, removedSummaryMessageId);
+    sessionLog(sessionId, `compaction-marker: removed old boundary at ordinal ${existing.boundaryOrdinal}, moving to ${lastCompartmentEnd}`);
+  }
+  const result = injectCompactionMarker({
+    sessionId,
+    endOrdinal: lastCompartmentEnd,
+    endMessageId: targetEndMessageId,
+    summaryText: MARKER_SUMMARY_TEXT,
+    directory: directory ?? process.cwd(),
+    resolvedBoundary: boundary
+  });
+  if (result) {
+    persistMarkerStateAndDropReplacedTag(db, sessionId, {
+      ...result,
+      boundaryOrdinal: lastCompartmentEnd,
+      targetEndMessageId
+    }, removedSummaryMessageId);
+    sessionLog(sessionId, `compaction-marker: injected at ordinal ${lastCompartmentEnd}, boundary user msg ${result.boundaryMessageId}`);
+    return true;
+  }
+  return false;
+}
 
 // ../plugin/src/hooks/magic-context/compartment-render-epoch.ts
 var COMPARTMENT_RENDER_EPOCH = "cre2";
@@ -25284,8 +28349,16 @@ function temporalMarkerPrefix(seconds) {
 // ../plugin/src/hooks/magic-context/inject-compartments.ts
 var INJECTION_CACHE_MAX = 100;
 var injectionCache = new BoundedSessionMap(INJECTION_CACHE_MAX);
+function clearInjectionCache(sessionId) {
+  injectionCache.delete(sessionId);
+  resetDegradedReanchorState(sessionId);
+}
 var degradedRebuildCountBySession = new BoundedSessionMap(INJECTION_CACHE_MAX);
 var reAnchorLoggedBySession = new BoundedSessionMap(INJECTION_CACHE_MAX);
+function resetDegradedReanchorState(sessionId) {
+  degradedRebuildCountBySession.delete(sessionId);
+  reAnchorLoggedBySession.delete(sessionId);
+}
 function getVisibleMemoryIds(db, sessionId) {
   try {
     const row = db.prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?").get(sessionId);
@@ -25304,6 +28377,9 @@ function getVisibleMemoryIds(db, sessionId) {
   } catch {
     return null;
   }
+}
+function renderMemoryBlock(memories) {
+  return renderMemoryBlockV2(memories) || null;
 }
 var EMPTY_HARD_SIGNALS = {
   systemHash: "",
@@ -26649,11 +29725,2002 @@ import {
 function textBlock(text) {
   return { type: "text", text };
 }
-function magicUserMessage(content, source) {
+function magicUserMessage(content, source, extraBlocks = []) {
   return createUserMessage({
-    content: [textBlock(content)],
+    content: [textBlock(content), ...extraBlocks],
     source
   });
+}
+
+// src/agent/transcript.ts
+import { createHash as createHash12, randomUUID as randomUUID2 } from "node:crypto";
+
+// ../plugin/src/hooks/magic-context/apply-operations.ts
+var RECENT_TOOL_SKELETON_WINDOW = 20;
+function buildReplacementContent(tagId) {
+  return `[dropped §${tagId}§]`;
+}
+function applyPendingOperations(sessionId, db, targets, protectedTags = 0, preloadedTags, preloadedPendingOps, syntheticPendingOps = [], editMarkerTagIds = new Set) {
+  let didMutateMessage = false;
+  db.transaction(() => {
+    const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+    const tagStatusById = new Map(tags.map((tag) => [tag.tagNumber, tag.status]));
+    const tagTypeById = new Map(tags.map((tag) => [tag.tagNumber, tag.type]));
+    const protectedTagIds = protectedTags > 0 ? new Set(tags.filter((tag) => tag.status === "active").map((tag) => tag.tagNumber).sort((left, right) => right - left).slice(0, protectedTags)) : new Set;
+    const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
+    const opsToApply = [
+      ...pendingOps.map((op) => ({ op, synthetic: false })),
+      ...syntheticPendingOps.map((op) => ({ op, synthetic: true }))
+    ];
+    const skeletonWindow = new Set(tags.filter((tag) => tag.type === "tool").map((tag) => tag.tagNumber).sort((left, right) => right - left).slice(0, RECENT_TOOL_SKELETON_WINDOW));
+    for (const { op: pendingOp, synthetic } of opsToApply) {
+      const tagStatus = tagStatusById.get(pendingOp.tagId);
+      if (tagStatus === "compacted" || tagStatus === "dropped") {
+        if (!synthetic)
+          removePendingOp(db, sessionId, pendingOp.tagId);
+        continue;
+      }
+      if (protectedTagIds.has(pendingOp.tagId)) {
+        continue;
+      }
+      const target = targets.get(pendingOp.tagId);
+      const isToolTag = tagTypeById.get(pendingOp.tagId) === "tool";
+      if (synthetic) {
+        if (!isToolTag || target?.canDrop?.() !== true)
+          continue;
+      }
+      let shouldPersistDrop = false;
+      if (isToolTag) {
+        if (editMarkerTagIds.has(pendingOp.tagId)) {
+          const markResult = target?.editMarker?.() ?? "absent";
+          if (markResult === "incomplete" || markResult === "absent") {
+            continue;
+          }
+          didMutateMessage = true;
+          updateTagDropMode(db, sessionId, pendingOp.tagId, "edit_marker");
+          shouldPersistDrop = true;
+        } else if (skeletonWindow.has(pendingOp.tagId)) {
+          const truncResult = target?.truncate?.() ?? "absent";
+          if (truncResult === "incomplete" || synthetic && truncResult !== "truncated") {
+            continue;
+          }
+          if (truncResult === "truncated") {
+            didMutateMessage = true;
+          }
+          updateTagDropMode(db, sessionId, pendingOp.tagId, "truncated");
+          shouldPersistDrop = true;
+        } else {
+          const dropResult = target?.drop?.() ?? "absent";
+          if (dropResult === "incomplete" || synthetic && dropResult !== "removed") {
+            continue;
+          }
+          if (dropResult === "removed") {
+            didMutateMessage = true;
+          }
+          updateTagDropMode(db, sessionId, pendingOp.tagId, "full");
+          shouldPersistDrop = true;
+        }
+      } else if (target) {
+        const changed = target.setContent(buildReplacementContent(pendingOp.tagId));
+        if (changed)
+          didMutateMessage = true;
+        shouldPersistDrop = true;
+      } else if (!synthetic) {
+        shouldPersistDrop = true;
+      }
+      if (!shouldPersistDrop)
+        continue;
+      updateTagStatus(db, sessionId, pendingOp.tagId, "dropped");
+      if (!synthetic)
+        removePendingOp(db, sessionId, pendingOp.tagId);
+    }
+  })();
+  return didMutateMessage;
+}
+function applyFlushedStatuses(sessionId, db, targets, preloadedTags) {
+  let didMutateMessage = false;
+  const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+  for (const tag of tags) {
+    if (tag.status === "dropped") {
+      const target = targets.get(tag.tagNumber);
+      if (tag.type === "tool") {
+        if (tag.dropMode === "edit_marker") {
+          const markResult = target?.editMarker?.() ?? "absent";
+          if (markResult === "truncated") {
+            didMutateMessage = true;
+          }
+        } else if (tag.dropMode === "truncated") {
+          const truncResult = target?.truncate?.() ?? "absent";
+          if (truncResult === "truncated") {
+            didMutateMessage = true;
+          }
+        } else {
+          const dropResult = target?.drop?.() ?? "absent";
+          if (dropResult === "removed") {
+            didMutateMessage = true;
+          }
+        }
+      } else if (target) {
+        const changed = target.setContent(buildReplacementContent(tag.tagNumber));
+        if (changed)
+          didMutateMessage = true;
+      }
+    }
+  }
+  return didMutateMessage;
+}
+
+// ../plugin/src/features/magic-context/tagger.ts
+var TOOL_COMPOSITE_KEY_SEP = "\x00";
+function makeToolCompositeKey(ownerMsgId, callId) {
+  return `${ownerMsgId}${TOOL_COMPOSITE_KEY_SEP}${callId}`;
+}
+var GET_COUNTER_SQL = `SELECT counter FROM session_meta WHERE session_id = ?`;
+var GET_ASSIGNMENTS_SQL = "SELECT message_id, tag_number, type, tool_owner_message_id, byte_size, token_count, input_byte_size, input_token_count FROM tags WHERE session_id = ? ORDER BY tag_number ASC";
+var GET_ASSIGNMENTS_SCOPED_SQL = "SELECT message_id, tag_number, type, tool_owner_message_id, byte_size, token_count, input_byte_size, input_token_count FROM tags WHERE session_id = ? AND tag_number >= ? ORDER BY tag_number ASC";
+var PROBE_DATA_VERSION_SQL = "PRAGMA main.data_version";
+var probeDataVersionStatements = new WeakMap;
+function getProbeDataVersionStatement(db) {
+  let stmt = probeDataVersionStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(PROBE_DATA_VERSION_SQL);
+    probeDataVersionStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function isAssignmentRow(row) {
+  if (row === null || typeof row !== "object") {
+    return false;
+  }
+  const candidate = row;
+  if (typeof candidate.message_id !== "string")
+    return false;
+  if (typeof candidate.tag_number !== "number")
+    return false;
+  if (candidate.type !== "message" && candidate.type !== "tool" && candidate.type !== "file")
+    return false;
+  if (candidate.tool_owner_message_id !== null && typeof candidate.tool_owner_message_id !== "string")
+    return false;
+  if (typeof candidate.byte_size !== "number")
+    return false;
+  if (candidate.token_count !== null && typeof candidate.token_count !== "number")
+    return false;
+  if (typeof candidate.input_byte_size !== "number")
+    return false;
+  if (candidate.input_token_count !== null && typeof candidate.input_token_count !== "number")
+    return false;
+  return true;
+}
+var UPSERT_COUNTER_SQL = `
+  INSERT INTO session_meta (session_id, counter, harness)
+  VALUES (?, ?, ?)
+  ON CONFLICT(session_id) DO UPDATE SET counter = MAX(session_meta.counter, excluded.counter)
+`;
+var upsertCounterStatements = new WeakMap;
+function getUpsertCounterStatement(db) {
+  let stmt = upsertCounterStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(UPSERT_COUNTER_SQL);
+    upsertCounterStatements.set(db, stmt);
+  }
+  return stmt;
+}
+var RESET_COUNTER_SQL = `
+  INSERT INTO session_meta (session_id, counter, harness)
+  VALUES (?, 0, ?)
+  ON CONFLICT(session_id) DO UPDATE SET counter = 0
+`;
+var resetCounterStatements = new WeakMap;
+function getResetCounterStatement(db) {
+  let stmt = resetCounterStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare(RESET_COUNTER_SQL);
+    resetCounterStatements.set(db, stmt);
+  }
+  return stmt;
+}
+var MAX_TAG_ALLOC_RETRIES = 5;
+function createTagger() {
+  const counters = new Map;
+  const assignments = new Map;
+  const toolAccountingBySession = new Map;
+  const loadSignatures = new Map;
+  function getSessionAssignments(sessionId) {
+    let map2 = assignments.get(sessionId);
+    if (!map2) {
+      map2 = new Map;
+      assignments.set(sessionId, map2);
+    }
+    return map2;
+  }
+  function getSessionToolAccounting(sessionId) {
+    let map2 = toolAccountingBySession.get(sessionId);
+    if (!map2) {
+      map2 = new Map;
+      toolAccountingBySession.set(sessionId, map2);
+    }
+    return map2;
+  }
+  function isUniqueConstraintError(error51) {
+    return error51 instanceof Error && "code" in error51 && error51.code === "SQLITE_CONSTRAINT_UNIQUE";
+  }
+  function syncCounterAtLeast(sessionId, db, value) {
+    if (value <= 0)
+      return;
+    const next = Math.max(counters.get(sessionId) ?? 0, value);
+    counters.set(sessionId, next);
+    getUpsertCounterStatement(db).run(sessionId, next, getHarness());
+  }
+  function allocateTag(sessionId, messageId, type, byteSize2, db, reasoningByteSize, toolName, inputByteSize, toolOwnerMessageId, mapKey, dbExistingLookup, entryFingerprint = null, tokenThunk) {
+    const sessionAssignments = getSessionAssignments(sessionId);
+    const existing = sessionAssignments.get(mapKey);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const dbExisting = dbExistingLookup();
+    if (dbExisting !== null) {
+      sessionAssignments.set(mapKey, dbExisting);
+      syncCounterAtLeast(sessionId, db, dbExisting);
+      if (tokenThunk && tagTokenCountIsNull(db, sessionId, dbExisting)) {
+        try {
+          backfillTagTokenCounts(db, sessionId, dbExisting, tokenThunk());
+        } catch {}
+      }
+      return dbExisting;
+    }
+    const tokenCounts = tokenThunk?.() ?? null;
+    for (let attempt = 0;attempt < MAX_TAG_ALLOC_RETRIES; attempt += 1) {
+      const memCounter = counters.get(sessionId) ?? 0;
+      const dbMax = getMaxTagNumberBySession(db, sessionId);
+      const next = Math.max(memCounter, dbMax) + 1;
+      try {
+        db.transaction(() => {
+          insertTag(db, sessionId, messageId, type, byteSize2, next, reasoningByteSize, toolName, inputByteSize, toolOwnerMessageId, entryFingerprint, tokenCounts);
+          getUpsertCounterStatement(db).run(sessionId, next, getHarness());
+        })();
+      } catch (error51) {
+        if (!isUniqueConstraintError(error51)) {
+          throw error51;
+        }
+        const racedRow = dbExistingLookup();
+        if (racedRow !== null) {
+          sessionAssignments.set(mapKey, racedRow);
+          syncCounterAtLeast(sessionId, db, racedRow);
+          return racedRow;
+        }
+        const advancedDbMax = getMaxTagNumberBySession(db, sessionId);
+        counters.set(sessionId, Math.max(memCounter, advancedDbMax));
+        continue;
+      }
+      counters.set(sessionId, next);
+      sessionAssignments.set(mapKey, next);
+      if (type === "tool") {
+        getSessionToolAccounting(sessionId).set(next, {
+          byteSize: byteSize2,
+          tokenCount: tokenCounts?.tokenCount ?? null,
+          inputByteSize,
+          inputTokenCount: tokenCounts?.inputTokenCount ?? null
+        });
+      }
+      return next;
+    }
+    throw new Error(`tagger.allocateTag: failed to allocate tag for session=${sessionId} key=${mapKey} after ${MAX_TAG_ALLOC_RETRIES} retries`);
+  }
+  function assignTag(sessionId, messageId, type, byteSize2, db, reasoningByteSize = 0, toolName = null, inputByteSize = 0, entryFingerprint = null, tokenThunk) {
+    if (type === "tool") {
+      throw new Error("tagger.assignTag: type='tool' is forbidden — use assignToolTag(sessionId, callId, ownerMsgId, ...)");
+    }
+    return allocateTag(sessionId, messageId, type, byteSize2, db, reasoningByteSize, toolName, inputByteSize, null, messageId, () => getTagNumberByMessageId(db, sessionId, messageId), entryFingerprint, tokenThunk);
+  }
+  function backfillToolTokensIfNull(db, sessionId, tagNumber, tokenThunk) {
+    if (!tokenThunk)
+      return;
+    try {
+      if (tagTokenCountIsNull(db, sessionId, tagNumber)) {
+        backfillTagTokenCounts(db, sessionId, tagNumber, tokenThunk());
+      }
+    } catch {}
+  }
+  function assignToolTag(sessionId, callId, ownerMsgId, byteSize2, db, reasoningByteSize = 0, toolName = null, inputByteSize = 0, tokenThunk) {
+    const compositeKey = makeToolCompositeKey(ownerMsgId, callId);
+    const sessionAssignments = getSessionAssignments(sessionId);
+    const existing = sessionAssignments.get(compositeKey);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const dbHit = getToolTagNumberByOwner(db, sessionId, callId, ownerMsgId);
+    if (dbHit !== null) {
+      sessionAssignments.set(compositeKey, dbHit);
+      syncCounterAtLeast(sessionId, db, dbHit);
+      backfillToolTokensIfNull(db, sessionId, dbHit, tokenThunk);
+      return dbHit;
+    }
+    for (let attempt = 0;attempt < MAX_TAG_ALLOC_RETRIES; attempt += 1) {
+      const orphan = getNullOwnerToolTag(db, sessionId, callId);
+      if (orphan === null)
+        break;
+      const claimed = adoptNullOwnerToolTag(db, orphan.id, ownerMsgId);
+      if (claimed) {
+        sessionAssignments.set(compositeKey, orphan.tagNumber);
+        syncCounterAtLeast(sessionId, db, orphan.tagNumber);
+        backfillToolTokensIfNull(db, sessionId, orphan.tagNumber, tokenThunk);
+        return orphan.tagNumber;
+      }
+      const recheck = getToolTagNumberByOwner(db, sessionId, callId, ownerMsgId);
+      if (recheck !== null) {
+        sessionAssignments.set(compositeKey, recheck);
+        syncCounterAtLeast(sessionId, db, recheck);
+        backfillToolTokensIfNull(db, sessionId, recheck, tokenThunk);
+        return recheck;
+      }
+    }
+    return allocateTag(sessionId, callId, "tool", byteSize2, db, reasoningByteSize, toolName, inputByteSize, ownerMsgId, compositeKey, () => getToolTagNumberByOwner(db, sessionId, callId, ownerMsgId), null, tokenThunk);
+  }
+  function getTag(sessionId, messageId, _type) {
+    return assignments.get(sessionId)?.get(messageId);
+  }
+  function getToolTag(sessionId, callId, ownerMsgId) {
+    return assignments.get(sessionId)?.get(makeToolCompositeKey(ownerMsgId, callId));
+  }
+  function getToolTagAccounting(sessionId, callId, ownerMsgId) {
+    const tagNumber = getToolTag(sessionId, callId, ownerMsgId);
+    return tagNumber === undefined ? undefined : toolAccountingBySession.get(sessionId)?.get(tagNumber);
+  }
+  function setToolTagAccounting(sessionId, tagNumber, accounting) {
+    getSessionToolAccounting(sessionId).set(tagNumber, accounting);
+  }
+  function bindTag(sessionId, messageId, tagNumber) {
+    getSessionAssignments(sessionId).set(messageId, tagNumber);
+  }
+  function unbindTag(sessionId, messageId) {
+    getSessionAssignments(sessionId).delete(messageId);
+  }
+  function bindToolTag(sessionId, callId, ownerMsgId, tagNumber) {
+    getSessionAssignments(sessionId).set(makeToolCompositeKey(ownerMsgId, callId), tagNumber);
+  }
+  function unbindToolTag(sessionId, ownerMsgId, callId) {
+    getSessionAssignments(sessionId).delete(makeToolCompositeKey(ownerMsgId, callId));
+  }
+  function getAssignments(sessionId) {
+    return getSessionAssignments(sessionId);
+  }
+  function resetCounter(sessionId, db) {
+    counters.set(sessionId, 0);
+    assignments.delete(sessionId);
+    toolAccountingBySession.delete(sessionId);
+    loadSignatures.delete(sessionId);
+    getResetCounterStatement(db).run(sessionId, getHarness());
+  }
+  function getCounter(sessionId) {
+    return counters.get(sessionId) ?? 0;
+  }
+  function probeSignature(db) {
+    const dvRow = getProbeDataVersionStatement(db).get();
+    return {
+      dataVersion: dvRow?.data_version ?? 0
+    };
+  }
+  function initFromDb(sessionId, db, floor = 0) {
+    const probe = probeSignature(db);
+    const cached2 = loadSignatures.get(sessionId);
+    if (cached2 !== undefined && cached2.db === db && cached2.dataVersion === probe.dataVersion && cached2.floor === floor) {
+      return;
+    }
+    const row = db.prepare(GET_COUNTER_SQL).get(sessionId);
+    const assignmentRows = (floor > 0 ? db.prepare(GET_ASSIGNMENTS_SCOPED_SQL).all(sessionId, floor) : db.prepare(GET_ASSIGNMENTS_SQL).all(sessionId)).filter(isAssignmentRow);
+    const sessionAssignments = getSessionAssignments(sessionId);
+    sessionAssignments.clear();
+    const sessionToolAccounting = getSessionToolAccounting(sessionId);
+    sessionToolAccounting.clear();
+    let maxTagNumber = 0;
+    for (const assignment of assignmentRows) {
+      if (assignment.type === "tool") {
+        if (assignment.tool_owner_message_id !== null) {
+          sessionAssignments.set(makeToolCompositeKey(assignment.tool_owner_message_id, assignment.message_id), assignment.tag_number);
+          sessionToolAccounting.set(assignment.tag_number, {
+            byteSize: assignment.byte_size,
+            tokenCount: assignment.token_count,
+            inputByteSize: assignment.input_byte_size,
+            inputTokenCount: assignment.input_token_count
+          });
+        }
+      } else {
+        sessionAssignments.set(assignment.message_id, assignment.tag_number);
+      }
+      if (assignment.tag_number > maxTagNumber) {
+        maxTagNumber = assignment.tag_number;
+      }
+    }
+    const counter = Math.max(row?.counter ?? 0, maxTagNumber, counters.get(sessionId) ?? 0);
+    counters.set(sessionId, counter);
+    loadSignatures.set(sessionId, {
+      db,
+      dataVersion: probe.dataVersion,
+      floor
+    });
+  }
+  function cleanup(sessionId) {
+    counters.delete(sessionId);
+    assignments.delete(sessionId);
+    toolAccountingBySession.delete(sessionId);
+    loadSignatures.delete(sessionId);
+  }
+  return {
+    assignTag,
+    assignToolTag,
+    getTag,
+    getToolTag,
+    getToolTagAccounting,
+    setToolTagAccounting,
+    bindTag,
+    unbindTag,
+    bindToolTag,
+    unbindToolTag,
+    getAssignments,
+    resetCounter,
+    getCounter,
+    initFromDb,
+    cleanup
+  };
+}
+
+// ../plugin/src/shared/tag-transcript.ts
+import { createHash as createHash11 } from "node:crypto";
+
+// ../plugin/src/hooks/magic-context/image-token-estimate.ts
+var IMAGE_TOKEN_DIVISOR = 750;
+var IMAGE_FALLBACK_TOKENS = 1200;
+var IMAGE_TOKEN_CAP = 4500;
+function estimateImageTokensFromDataUrl(url2) {
+  const comma = url2.indexOf(",");
+  if (comma < 0)
+    return IMAGE_FALLBACK_TOKENS;
+  const header = url2.slice(0, comma);
+  const payload = url2.slice(comma + 1);
+  const sliceLen = Math.min(512, payload.length);
+  const preview = payload.slice(0, sliceLen);
+  let bytes;
+  try {
+    bytes = base64Decode(preview);
+  } catch {
+    return IMAGE_FALLBACK_TOKENS;
+  }
+  if (header.includes("image/png")) {
+    const dims = parsePngDimensions(bytes);
+    if (dims)
+      return clampImageTokens(Math.ceil(dims.w * dims.h / IMAGE_TOKEN_DIVISOR));
+  } else if (header.includes("image/jpeg") || header.includes("image/jpg")) {
+    const dims = parseJpegDimensions(bytes);
+    if (dims)
+      return clampImageTokens(Math.ceil(dims.w * dims.h / IMAGE_TOKEN_DIVISOR));
+  } else if (header.includes("image/webp")) {
+    const dims = parseWebpDimensions(bytes);
+    if (dims)
+      return clampImageTokens(Math.ceil(dims.w * dims.h / IMAGE_TOKEN_DIVISOR));
+  } else if (header.includes("image/gif")) {
+    const dims = parseGifDimensions(bytes);
+    if (dims)
+      return clampImageTokens(Math.ceil(dims.w * dims.h / IMAGE_TOKEN_DIVISOR));
+  }
+  return IMAGE_FALLBACK_TOKENS;
+}
+function clampImageTokens(n) {
+  if (n < 1)
+    return 1;
+  if (n > IMAGE_TOKEN_CAP)
+    return IMAGE_TOKEN_CAP;
+  return n;
+}
+function base64Decode(b64) {
+  const pad = b64.length % 4;
+  const padded = pad === 0 ? b64 : b64 + "=".repeat(4 - pad);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0;i < binary.length; i++)
+    out[i] = binary.charCodeAt(i);
+  return out;
+}
+function parsePngDimensions(b) {
+  if (b.length < 24)
+    return null;
+  if (b[0] !== 137 || b[1] !== 80 || b[2] !== 78 || b[3] !== 71 || b[4] !== 13 || b[5] !== 10 || b[6] !== 26 || b[7] !== 10)
+    return null;
+  const w = readUint32BE(b, 16);
+  const h = readUint32BE(b, 20);
+  if (!w || !h)
+    return null;
+  return { w, h };
+}
+function parseJpegDimensions(b) {
+  if (b.length < 4 || b[0] !== 255 || b[1] !== 216)
+    return null;
+  let i = 2;
+  while (i < b.length - 8) {
+    if (b[i] !== 255) {
+      i++;
+      continue;
+    }
+    const marker = b[i + 1];
+    if (marker === undefined)
+      break;
+    if (isSofMarker(marker)) {
+      const h = b[i + 5] << 8 | b[i + 6];
+      const w = b[i + 7] << 8 | b[i + 8];
+      if (w && h)
+        return { w, h };
+      return null;
+    }
+    if (marker === 216 || marker === 217 || marker === 1) {
+      i += 2;
+      continue;
+    }
+    const segLen = b[i + 2] << 8 | b[i + 3];
+    if (segLen < 2)
+      return null;
+    i += 2 + segLen;
+  }
+  return null;
+}
+function isSofMarker(m) {
+  if (m >= 192 && m <= 195)
+    return true;
+  if (m >= 197 && m <= 199)
+    return true;
+  if (m >= 201 && m <= 203)
+    return true;
+  if (m >= 205 && m <= 207)
+    return true;
+  return false;
+}
+function parseWebpDimensions(b) {
+  if (b.length < 30)
+    return null;
+  if (b[0] !== 82 || b[1] !== 73 || b[2] !== 70 || b[3] !== 70)
+    return null;
+  if (b[8] !== 87 || b[9] !== 69 || b[10] !== 66 || b[11] !== 80)
+    return null;
+  const variant = String.fromCharCode(b[12], b[13], b[14], b[15]);
+  if (variant === "VP8 ") {
+    const w = (b[26] | b[27] << 8) & 16383;
+    const h = (b[28] | b[29] << 8) & 16383;
+    if (w && h)
+      return { w, h };
+  } else if (variant === "VP8L") {
+    const b0 = b[21];
+    const b1 = b[22];
+    const b2 = b[23];
+    const b3 = b[24];
+    const w = 1 + ((b0 | b1 << 8) & 16383);
+    const h = 1 + ((b1 >> 6 | b2 << 2 | b3 << 10) & 16383);
+    if (w && h)
+      return { w, h };
+  } else if (variant === "VP8X") {
+    const w = 1 + (b[24] | b[25] << 8 | b[26] << 16);
+    const h = 1 + (b[27] | b[28] << 8 | b[29] << 16);
+    if (w && h)
+      return { w, h };
+  }
+  return null;
+}
+function parseGifDimensions(b) {
+  if (b.length < 10)
+    return null;
+  if (b[0] !== 71 || b[1] !== 73 || b[2] !== 70)
+    return null;
+  const w = b[6] | b[7] << 8;
+  const h = b[8] | b[9] << 8;
+  if (!w || !h)
+    return null;
+  return { w, h };
+}
+function readUint32BE(b, offset) {
+  return (b[offset] << 24 | b[offset + 1] << 16 | b[offset + 2] << 8 | b[offset + 3]) >>> 0;
+}
+
+// ../plugin/src/shared/tag-transcript.ts
+var TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
+function textIdentityDigest(value) {
+  return createHash11("sha256").update(value).digest("hex");
+}
+function buildContentDerivedTextIds(messageId, parts) {
+  const sources = parts.filter((part) => part.kind === "text").map((part) => stripTagPrefix(part.getText() ?? ""));
+  const vectorFingerprint = textIdentityDigest(JSON.stringify(sources));
+  const occurrences = new Map;
+  return sources.map((source) => {
+    const contentFingerprint = textIdentityDigest(source);
+    const occurrence = occurrences.get(contentFingerprint) ?? 0;
+    occurrences.set(contentFingerprint, occurrence + 1);
+    return `${messageId}${TEXT_TAG_IDENTITY_MARKER}${vectorFingerprint}:${contentFingerprint}:o${occurrence}`;
+  });
+}
+function tagTranscript(sessionId, transcript, tagger, db, options = {}) {
+  const skipPrefixInjection = options.skipPrefixInjection === true;
+  const targets = new Map;
+  const timing = options.onTiming ? { identity: 0, prefix: 0, targets: 0, tokenCounting: 0 } : undefined;
+  const toolAggregates = new Map;
+  const openToolAggregateKeysByCallId = new Map;
+  let activeToolResultRun;
+  for (let msgIndex = 0;msgIndex < transcript.messages.length; msgIndex += 1) {
+    const message = transcript.messages[msgIndex];
+    if (message === undefined)
+      continue;
+    activeToolResultRun = undefined;
+    const messageId = message.info.id;
+    const reuseIdentity = messageId !== undefined && options.reuseMessageIds?.has(messageId) === true;
+    let textOrdinal = 0;
+    let toolResultOrdinal = 0;
+    const parts = message.parts;
+    const contentDerivedTextIds = messageId !== undefined && options.textIdentityDriftMessageIds?.has(messageId) === true ? buildContentDerivedTextIds(messageId, parts) : undefined;
+    for (let partIndex = 0;partIndex < parts.length; partIndex += 1) {
+      const part = parts[partIndex];
+      if (part === undefined)
+        continue;
+      const resultBlockOrdinal = part.kind === "tool_result" ? toolResultOrdinal++ : undefined;
+      if (part.kind !== "tool_result") {
+        activeToolResultRun = undefined;
+      }
+      if (part.kind === "text") {
+        if (messageId === undefined) {
+          textOrdinal += 1;
+          continue;
+        }
+        tagTextPart({
+          sessionId,
+          message,
+          messageId,
+          contentId: contentDerivedTextIds?.[textOrdinal] ?? `${messageId}:p${textOrdinal}`,
+          msgIndex,
+          textOrdinal,
+          part,
+          tagger,
+          db,
+          targets,
+          skipPrefixInjection,
+          entryFingerprint: options.entryFingerprintByMessageId?.get(messageId) ?? null,
+          reuseIdentity: reuseIdentity || contentDerivedTextIds !== undefined,
+          timing,
+          textIdentitySourceCache: options.textIdentitySourceCache,
+          textTokenCache: options.textTokenCache
+        });
+        textOrdinal += 1;
+        continue;
+      }
+      if (part.kind === "tool_use" || part.kind === "tool_result") {
+        if (messageId === undefined) {
+          activeToolResultRun = undefined;
+          continue;
+        }
+        const identityStart = timing ? performance.now() : 0;
+        const callId = part.id;
+        if (typeof callId !== "string" || callId.length === 0) {
+          activeToolResultRun = undefined;
+          tagToolPart({
+            sessionId,
+            message,
+            messageId,
+            msgIndex,
+            partIndex,
+            part,
+            tagger,
+            db,
+            targets,
+            skipPrefixInjection,
+            reuseIdentity,
+            timing
+          });
+          continue;
+        }
+        const pendingKeys = openToolAggregateKeysByCallId.get(callId) ?? [];
+        let existingKey;
+        if (part.kind === "tool_result") {
+          if (activeToolResultRun !== undefined && activeToolResultRun.callId === callId) {
+            existingKey = activeToolResultRun.aggregateKey;
+          } else {
+            existingKey = findLastUnresolvedToolAggregateKey(pendingKeys, toolAggregates);
+          }
+        }
+        const aggregateKey = existingKey ?? makeToolCompositeKey(messageId, callId);
+        const tokenCacheKey = resultBlockOrdinal === undefined ? aggregateKey : `${aggregateKey}\x00result-part:${messageId}:${resultBlockOrdinal}`;
+        const existing = toolAggregates.get(aggregateKey);
+        if (existing) {
+          existing.occurrences.push({ message, part, kind: part.kind });
+          const canReuseIdentity = reuseIdentity && existing.identityReusable;
+          let text2 = "";
+          if (canReuseIdentity) {
+            if (part.kind === "tool_result") {
+              text2 = part.getText() ?? "";
+              applyGrownToolResultAccounting({
+                db,
+                sessionId,
+                tagger,
+                aggregate: existing,
+                byteSize: getToolPartByteSize(part, text2),
+                part,
+                text: text2,
+                timing,
+                tokenCache: options.toolTokenCache,
+                tokenCacheKey
+              });
+            }
+            if (timing)
+              timing.identity += performance.now() - identityStart;
+          } else {
+            const accounting = readAggregateToolAccounting(part, timing, options.toolTokenCache, tokenCacheKey);
+            text2 = accounting.text;
+            if (part.kind === "tool_result") {
+              applyGrownToolResultAccounting({
+                db,
+                sessionId,
+                tagger,
+                aggregate: existing,
+                byteSize: accounting.byteSize,
+                part,
+                text: text2,
+                timing,
+                knownTokenCount: accounting.tokenCount
+              });
+            }
+            if (existing.toolName === null && accounting.toolName) {
+              existing.toolName = accounting.toolName;
+            }
+            if (existing.inputByteSize === 0 && part.kind === "tool_use" && accounting.inputByteSize > 0) {
+              existing.inputByteSize = accounting.inputByteSize;
+              updateTagInputByteSize(db, sessionId, existing.tagId, accounting.inputByteSize);
+            }
+            if (existing.inputTokenCount === null && part.kind === "tool_use" && accounting.inputTokenCount > 0) {
+              existing.inputTokenCount = accounting.inputTokenCount;
+              updateTagInputTokenCount(db, sessionId, existing.tagId, accounting.inputTokenCount);
+            }
+            syncToolAggregateAccounting(tagger, sessionId, existing);
+            if (timing)
+              timing.identity += performance.now() - identityStart;
+          }
+          existing.identityReusable &&= reuseIdentity;
+          applyToolPrefixAndTarget({
+            skipPrefixInjection,
+            part,
+            text: text2,
+            tagId: existing.tagId,
+            aggregate: existing,
+            targets,
+            timing
+          });
+          if (part.kind === "tool_result") {
+            markToolAggregateResolved(callId, aggregateKey, openToolAggregateKeysByCallId);
+            activeToolResultRun = { callId, aggregateKey };
+          }
+          continue;
+        }
+        const reusableTagId = reuseIdentity ? tagger.getToolTag(sessionId, callId, messageId) : undefined;
+        const reusableAccounting = reuseIdentity ? tagger.getToolTagAccounting(sessionId, callId, messageId) : undefined;
+        let aggregate;
+        let text = "";
+        if (reusableTagId !== undefined && reusableAccounting !== undefined) {
+          aggregate = {
+            callId,
+            tagId: reusableTagId,
+            identityReusable: true,
+            occurrences: [{ message, part, kind: part.kind }],
+            maxByteSize: reusableAccounting.byteSize,
+            maxTokenCount: reusableAccounting.tokenCount ?? 0,
+            toolName: null,
+            inputByteSize: reusableAccounting.inputByteSize,
+            inputTokenCount: reusableAccounting.inputTokenCount
+          };
+          if (part.kind === "tool_result") {
+            text = part.getText() ?? "";
+            applyGrownToolResultAccounting({
+              db,
+              sessionId,
+              tagger,
+              aggregate,
+              byteSize: getToolPartByteSize(part, text),
+              part,
+              text,
+              timing,
+              tokenCache: options.toolTokenCache,
+              tokenCacheKey
+            });
+          }
+          if (timing)
+            timing.identity += performance.now() - identityStart;
+        } else {
+          const accounting = readAggregateToolAccounting(part, timing, options.toolTokenCache, tokenCacheKey);
+          text = accounting.text;
+          const outputByteSize = part.kind === "tool_result" ? accounting.byteSize : 0;
+          const outputTokenCount = part.kind === "tool_result" ? accounting.tokenCount : 0;
+          const firstInputTokenCount = part.kind === "tool_use" ? accounting.inputTokenCount : 0;
+          const tagId = tagger.assignToolTag(sessionId, callId, messageId, outputByteSize, db, 0, accounting.toolName, accounting.inputByteSize, () => ({
+            tokenCount: outputTokenCount,
+            inputTokenCount: firstInputTokenCount,
+            reasoningTokenCount: null
+          }));
+          const persistedAccounting = tagger.getToolTagAccounting(sessionId, callId, messageId);
+          aggregate = {
+            callId,
+            tagId,
+            identityReusable: false,
+            occurrences: [{ message, part, kind: part.kind }],
+            maxByteSize: persistedAccounting?.byteSize ?? outputByteSize,
+            maxTokenCount: persistedAccounting?.tokenCount ?? outputTokenCount,
+            toolName: accounting.toolName,
+            inputByteSize: persistedAccounting?.inputByteSize ?? (part.kind === "tool_use" ? accounting.inputByteSize : 0),
+            inputTokenCount: persistedAccounting?.inputTokenCount ?? (part.kind === "tool_use" ? firstInputTokenCount : null)
+          };
+          if (part.kind === "tool_result") {
+            applyGrownToolResultAccounting({
+              db,
+              sessionId,
+              tagger,
+              aggregate,
+              byteSize: accounting.byteSize,
+              part,
+              text,
+              timing,
+              knownTokenCount: accounting.tokenCount
+            });
+          }
+          syncToolAggregateAccounting(tagger, sessionId, aggregate);
+          if (timing)
+            timing.identity += performance.now() - identityStart;
+        }
+        toolAggregates.set(aggregateKey, aggregate);
+        if (part.kind === "tool_use") {
+          openToolAggregateKeysByCallId.set(callId, [...pendingKeys, aggregateKey]);
+        }
+        applyToolPrefixAndTarget({
+          skipPrefixInjection,
+          part,
+          text,
+          tagId: aggregate.tagId,
+          aggregate,
+          targets,
+          timing
+        });
+        if (part.kind === "tool_result") {
+          markToolAggregateResolved(callId, aggregateKey, openToolAggregateKeysByCallId);
+          activeToolResultRun = { callId, aggregateKey };
+        }
+      }
+    }
+  }
+  if (timing && options.onTiming) {
+    options.onTiming("identity", timing.identity);
+    options.onTiming("prefix", timing.prefix);
+    options.onTiming("targets", timing.targets);
+    options.onTiming("tokenCounting", timing.tokenCounting);
+  }
+  return { targets };
+}
+function syncToolAggregateAccounting(tagger, sessionId, aggregate) {
+  tagger.setToolTagAccounting(sessionId, aggregate.tagId, {
+    byteSize: aggregate.maxByteSize,
+    tokenCount: aggregate.maxTokenCount,
+    inputByteSize: aggregate.inputByteSize,
+    inputTokenCount: aggregate.inputTokenCount
+  });
+}
+function applyGrownToolResultAccounting(args) {
+  if (args.byteSize <= args.aggregate.maxByteSize)
+    return;
+  let tokenCount = args.knownTokenCount;
+  if (tokenCount !== undefined && args.tokenCacheKey) {
+    args.tokenCache?.set(args.tokenCacheKey, { text: args.text, tokenCount });
+  }
+  if (tokenCount === undefined) {
+    const tokenStart = args.timing ? performance.now() : 0;
+    tokenCount = getCachedToolPartTokenCount(args.part, args.text, args.tokenCache, args.tokenCacheKey);
+    if (args.timing)
+      args.timing.tokenCounting += performance.now() - tokenStart;
+  }
+  args.aggregate.maxByteSize = args.byteSize;
+  args.aggregate.maxTokenCount = tokenCount;
+  updateTagByteSize(args.db, args.sessionId, args.aggregate.tagId, args.byteSize);
+  updateTagTokenCount(args.db, args.sessionId, args.aggregate.tagId, tokenCount);
+  syncToolAggregateAccounting(args.tagger, args.sessionId, args.aggregate);
+}
+function readAggregateToolAccounting(part, timing, tokenCache, tokenCacheKey) {
+  const text = part.getText() ?? "";
+  const byteSize2 = getToolPartByteSize(part, text);
+  const metadata = part.getToolMetadata();
+  let tokenCount = 0;
+  if (part.kind === "tool_result") {
+    const tokenStart = timing ? performance.now() : 0;
+    tokenCount = getCachedToolPartTokenCount(part, text, tokenCache, tokenCacheKey);
+    if (timing)
+      timing.tokenCounting += performance.now() - tokenStart;
+  }
+  return {
+    text,
+    byteSize: byteSize2,
+    tokenCount,
+    toolName: metadata.toolName ?? null,
+    inputByteSize: metadata.inputByteSize,
+    inputTokenCount: metadata.inputTokenCount
+  };
+}
+function applyToolPrefixAndTarget(args) {
+  if (!args.skipPrefixInjection && args.part.kind === "tool_result") {
+    const prefixStart = args.timing ? performance.now() : 0;
+    args.part.setText(prependTag(args.tagId, args.text));
+    if (args.timing)
+      args.timing.prefix += performance.now() - prefixStart;
+  }
+  const targetStart = args.timing ? performance.now() : 0;
+  args.targets.set(args.tagId, buildAggregateTarget(args.tagId, args.aggregate.occurrences));
+  if (args.timing)
+    args.timing.targets += performance.now() - targetStart;
+}
+function findLastUnresolvedToolAggregateKey(pendingKeys, toolAggregates) {
+  for (let i = pendingKeys.length - 1;i >= 0; i -= 1) {
+    const key = pendingKeys[i];
+    if (key === undefined)
+      continue;
+    const aggregate = toolAggregates.get(key);
+    if (aggregate === undefined)
+      continue;
+    if (!aggregate.occurrences.some((occ) => occ.kind === "tool_result")) {
+      return key;
+    }
+  }
+  return;
+}
+function markToolAggregateResolved(callId, aggregateKey, openToolAggregateKeysByCallId) {
+  const pendingKeys = openToolAggregateKeysByCallId.get(callId);
+  if (pendingKeys === undefined)
+    return;
+  const nextPendingKeys = pendingKeys.filter((key) => key !== aggregateKey);
+  if (nextPendingKeys.length === 0) {
+    openToolAggregateKeysByCallId.delete(callId);
+    return;
+  }
+  openToolAggregateKeysByCallId.set(callId, nextPendingKeys);
+}
+function estimateTagTextTokens(text) {
+  if (!text)
+    return 0;
+  if (text.startsWith("data:image/"))
+    return estimateImageTokensFromDataUrl(text);
+  return estimateTokens(text);
+}
+function getToolPartByteSize(part, text) {
+  const textByteSize = byteSize(text);
+  if (textByteSize > 0 || part.kind !== "tool_result")
+    return textByteSize;
+  return getNonTextToolResultByteSize(part);
+}
+function getToolPartTokenCount(part, text) {
+  if (text.length > 0 || part.kind !== "tool_result")
+    return estimateTokens(text);
+  const raw = part.rawByteSize?.();
+  if (typeof raw === "number" && raw > 0) {
+    const record2 = isRecord3(part) ? part : undefined;
+    const content = record2?.content ?? record2?.rawContent ?? record2?.rawPart ?? record2?.part ?? record2?.data ?? record2?.image ?? record2?.source;
+    const serialized = safeJsonStringify(content ?? part);
+    return serialized === undefined ? 0 : estimateTokens(serialized);
+  }
+  return 0;
+}
+function getCachedToolPartTokenCount(part, text, cache, cacheKey2) {
+  const cached2 = cacheKey2 ? cache?.get(cacheKey2) : undefined;
+  if (cached2?.text === text)
+    return cached2.tokenCount;
+  const tokenCount = getToolPartTokenCount(part, text);
+  if (cacheKey2)
+    cache?.set(cacheKey2, { text, tokenCount });
+  return tokenCount;
+}
+function getNonTextToolResultByteSize(part) {
+  const raw = part.rawByteSize?.();
+  if (typeof raw === "number" && raw > 0)
+    return raw;
+  const record2 = isRecord3(part) ? part : undefined;
+  const content = record2?.content ?? record2?.rawContent ?? record2?.rawPart ?? record2?.part ?? record2?.data ?? record2?.image ?? record2?.source;
+  const serialized = safeJsonStringify(content ?? part);
+  return serialized === undefined ? 0 : byteSize(serialized);
+}
+function safeJsonStringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return;
+  }
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null;
+}
+function tagTextPart(args) {
+  const identityStart = args.timing ? performance.now() : 0;
+  const text = args.part.getText() ?? "";
+  const contentId = args.contentId;
+  const reusableTagId = args.reuseIdentity ? args.tagger.getTag(args.sessionId, contentId, "message") : undefined;
+  if (reusableTagId !== undefined) {
+    if (args.timing)
+      args.timing.identity += performance.now() - identityStart;
+    applyTextPrefixAndTarget(args, reusableTagId, text);
+    return;
+  }
+  const tagId = args.tagger.assignTag(args.sessionId, contentId, "message", byteSize(text), args.db, 0, null, 0, args.entryFingerprint, () => {
+    const tokenStart = args.timing ? performance.now() : 0;
+    const cached2 = args.textTokenCache?.get(contentId);
+    const tokenCount = cached2?.text === text ? cached2.tokenCount : estimateTagTextTokens(stripTagPrefix(text));
+    if (cached2?.text !== text) {
+      args.textTokenCache?.set(contentId, { text, tokenCount });
+    }
+    const counts = {
+      tokenCount,
+      inputTokenCount: null,
+      reasoningTokenCount: null
+    };
+    if (args.timing)
+      args.timing.tokenCounting += performance.now() - tokenStart;
+    return counts;
+  });
+  const sourceContent = stripTagPrefix(text);
+  if (sourceContent.trim().length > 0) {
+    saveSourceContent(args.db, args.sessionId, tagId, sourceContent);
+    args.textIdentitySourceCache?.set(tagId, sourceContent);
+  }
+  if (args.timing)
+    args.timing.identity += performance.now() - identityStart;
+  applyTextPrefixAndTarget(args, tagId, text);
+}
+function applyTextPrefixAndTarget(args, tagId, text) {
+  if (!args.skipPrefixInjection) {
+    const prefixStart = args.timing ? performance.now() : 0;
+    args.part.setText(prependTag(tagId, text));
+    if (args.timing)
+      args.timing.prefix += performance.now() - prefixStart;
+  }
+  const targetStart = args.timing ? performance.now() : 0;
+  args.targets.set(tagId, buildTextTarget(args.part, args.message));
+  if (args.timing)
+    args.timing.targets += performance.now() - targetStart;
+}
+function tagToolPart(args) {
+  const identityStart = args.timing ? performance.now() : 0;
+  const stableId = args.part.id;
+  const contentId = stableId ?? `${args.messageId}:t${args.partIndex}`;
+  const reusableTagId = args.reuseIdentity ? args.tagger.getToolTag(args.sessionId, contentId, contentId) : undefined;
+  if (reusableTagId !== undefined) {
+    const text2 = args.part.kind === "tool_result" ? args.part.getText() ?? "" : "";
+    if (args.timing)
+      args.timing.identity += performance.now() - identityStart;
+    applySingleToolPrefixAndTarget(args, reusableTagId, text2);
+    return;
+  }
+  const text = args.part.getText() ?? "";
+  const toolByteSize = getToolPartByteSize(args.part, text);
+  const meta3 = args.part.getToolMetadata();
+  const tokenStart = args.timing ? performance.now() : 0;
+  const toolTokenCount = getToolPartTokenCount(args.part, text);
+  if (args.timing)
+    args.timing.tokenCounting += performance.now() - tokenStart;
+  const tagId = args.tagger.assignToolTag(args.sessionId, contentId, contentId, toolByteSize, args.db, 0, meta3.toolName ?? null, meta3.inputByteSize, () => {
+    const tokenStart2 = args.timing ? performance.now() : 0;
+    const counts = {
+      tokenCount: toolTokenCount,
+      inputTokenCount: meta3.inputTokenCount,
+      reasoningTokenCount: null
+    };
+    if (args.timing)
+      args.timing.tokenCounting += performance.now() - tokenStart2;
+    return counts;
+  });
+  if (args.timing)
+    args.timing.identity += performance.now() - identityStart;
+  applySingleToolPrefixAndTarget(args, tagId, text);
+}
+function applySingleToolPrefixAndTarget(args, tagId, text) {
+  if (!args.skipPrefixInjection && args.part.kind === "tool_result") {
+    const prefixStart = args.timing ? performance.now() : 0;
+    args.part.setText(prependTag(tagId, text));
+    if (args.timing)
+      args.timing.prefix += performance.now() - prefixStart;
+  }
+  const targetStart = args.timing ? performance.now() : 0;
+  args.targets.set(tagId, buildToolTarget(args.part, args.message, tagId));
+  if (args.timing)
+    args.timing.targets += performance.now() - targetStart;
+}
+function setToolContentOrText(part, content) {
+  try {
+    if (part.setToolOutput(content))
+      return true;
+  } catch {}
+  return part.setText(content);
+}
+function buildAggregateTarget(tagId, occurrences) {
+  const role = occurrences[0]?.message.info.role ?? "user";
+  const messageId = occurrences[0]?.message.info.id;
+  return {
+    setContent(content) {
+      let changed = false;
+      for (const occ of occurrences) {
+        if (setToolContentOrText(occ.part, content)) {
+          changed = true;
+        }
+      }
+      return changed;
+    },
+    getContent() {
+      for (const occ of occurrences) {
+        if (occ.kind === "tool_result") {
+          return occ.part.getText() ?? null;
+        }
+      }
+      return occurrences[0]?.part.getText() ?? null;
+    },
+    drop() {
+      const sentinel = `[dropped §${tagId}§]`;
+      let any2 = false;
+      for (const occ of occurrences) {
+        if (occ.part.replaceWithSentinel(sentinel))
+          any2 = true;
+      }
+      return any2 ? "removed" : "absent";
+    },
+    truncate() {
+      const sentinel = `[dropped §${tagId}§]`;
+      let any2 = false;
+      for (const occ of occurrences) {
+        if (setToolContentOrText(occ.part, sentinel)) {
+          any2 = true;
+        }
+      }
+      return any2 ? "truncated" : "absent";
+    },
+    editMarker() {
+      const sentinel = `[dropped §${tagId}§]`;
+      let any2 = false;
+      for (const occ of occurrences) {
+        if (occ.kind === "tool_use") {
+          const input = occ.part.getToolInput?.();
+          if (input) {
+            const next = { ...input };
+            applyEditMarkerToInput(next);
+            if (occ.part.setToolInput?.(next))
+              any2 = true;
+          }
+        } else if (setToolContentOrText(occ.part, sentinel)) {
+          any2 = true;
+        }
+      }
+      return any2 ? "truncated" : "absent";
+    },
+    canDrop() {
+      return occurrences.length > 0;
+    },
+    readInput() {
+      for (const occ of occurrences) {
+        const input = occ.part.getToolInput?.();
+        if (input)
+          return input;
+      }
+      return null;
+    },
+    message: {
+      info: { id: messageId, role },
+      parts: []
+    }
+  };
+}
+function buildTextTarget(part, message) {
+  return {
+    setContent(content) {
+      return part.setText(content);
+    },
+    getContent() {
+      return part.getText() ?? null;
+    },
+    message: {
+      info: { id: message.info.id, role: message.info.role },
+      parts: []
+    }
+  };
+}
+function buildToolTarget(part, message, tagId) {
+  return {
+    setContent(content) {
+      return setToolContentOrText(part, content);
+    },
+    getContent() {
+      return part.getText() ?? null;
+    },
+    drop() {
+      const replaced = part.replaceWithSentinel(`[dropped §${tagId}§]`);
+      return replaced ? "removed" : "absent";
+    },
+    truncate() {
+      const ok = setToolContentOrText(part, `[dropped §${tagId}§]`);
+      return ok ? "truncated" : "absent";
+    },
+    message: {
+      info: { id: message.info.id, role: message.info.role },
+      parts: []
+    }
+  };
+}
+
+// src/agent/transcript.ts
+function isRecord4(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function asEvent(value) {
+  return isRecord4(value) ? value : null;
+}
+function seqOf(event) {
+  return typeof event.seq === "number" ? event.seq : -1;
+}
+function timeOf(event) {
+  return typeof event.time === "number" ? event.time : undefined;
+}
+function dataOf(event) {
+  return isRecord4(event.data) ? event.data : null;
+}
+function sha256Hex(value) {
+  return createHash12("sha256").update(value, "utf8").digest("hex");
+}
+var SYNTH_USER_ID_PREFIX = "synth-user-";
+function isSyntheticUserMessage(message) {
+  return typeof message.id === "string" && message.id.startsWith(SYNTH_USER_ID_PREFIX);
+}
+function isKnowledgeMessage(message) {
+  const source = isRecord4(message.source) ? message.source : null;
+  return source !== null && source.kind === "plugin" && source.plugin === "magic-context";
+}
+function isSkillCatalogMessage(message) {
+  const source = isRecord4(message.source) ? message.source : null;
+  return source !== null && source.kind === "skill-catalog";
+}
+function parseToolArguments(raw) {
+  if (typeof raw !== "string" || raw.length === 0)
+    return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return isRecord4(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function userTextParts(content) {
+  if (!Array.isArray(content))
+    return [];
+  const parts = [];
+  for (const block of content) {
+    if (!isRecord4(block) || block.type !== "text" || typeof block.text !== "string")
+      continue;
+    parts.push({ type: "text", text: block.text });
+  }
+  return parts;
+}
+function assistantParts(message, keepReasoning, toolNameByCallId) {
+  const content = message.content;
+  if (!Array.isArray(content))
+    return [];
+  const parts = [];
+  for (const block of content) {
+    if (!isRecord4(block))
+      continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      parts.push({ type: "text", text: block.text });
+    } else if (block.type === "tool-call" && typeof block.id === "string") {
+      const name = typeof block.name === "string" ? block.name : "unknown";
+      if (typeof block.name === "string" && block.name.length > 0) {
+        toolNameByCallId.set(block.id, block.name);
+      }
+      parts.push({
+        type: "tool",
+        tool: name,
+        callID: block.id,
+        state: { input: parseToolArguments(block.arguments) }
+      });
+    } else if (keepReasoning && (block.type === "reasoning" || block.type === "thinking") && typeof block.text === "string") {
+      parts.push({ type: "reasoning", text: block.text });
+    }
+  }
+  return parts;
+}
+function toolResultParts(message, toolNameByCallId) {
+  const content = Array.isArray(message.content) ? message.content : [];
+  let callId;
+  const source = isRecord4(message.source) ? message.source : null;
+  if (source && typeof source.callId === "string" && source.callId.length > 0) {
+    callId = source.callId;
+  }
+  if (!callId) {
+    for (const block of content) {
+      if (isRecord4(block) && block.type === "tool-result" && typeof block.toolCallId === "string" && block.toolCallId.length > 0) {
+        callId = block.toolCallId;
+        break;
+      }
+    }
+  }
+  if (!callId)
+    return [];
+  const fragments = [];
+  for (const block of content) {
+    if (!isRecord4(block) || block.type !== "tool-result")
+      continue;
+    const inner = block.content;
+    if (!Array.isArray(inner))
+      continue;
+    for (const fragment of inner) {
+      if (isRecord4(fragment) && fragment.type === "text" && typeof fragment.text === "string") {
+        fragments.push(fragment.text);
+      }
+    }
+  }
+  return [
+    {
+      type: "tool",
+      tool: toolNameByCallId.get(callId) ?? "unknown",
+      callID: callId,
+      state: { output: fragments.join(`
+`) }
+    }
+  ];
+}
+var DSH_MESSAGE_SPAN_KEY = "__dshMessageNodeSpan";
+var DSH_KNOWLEDGE_KEY = "__dshKnowledgeBaseline";
+var DSH_SKILL_CATALOG_KEY = "__dshSkillCatalog";
+function messageNodeSpan(message) {
+  const span = message[DSH_MESSAGE_SPAN_KEY];
+  return span !== null && typeof span === "object" ? span : null;
+}
+function isKnowledgeBaselineMessage(message) {
+  return message[DSH_KNOWLEDGE_KEY] === true;
+}
+function isSkillCatalogBaselineMessage(message) {
+  return message[DSH_SKILL_CATALOG_KEY] === true;
+}
+function walkDshLog(events, surfaceNodes) {
+  const eventBySeq = new Map;
+  const toolNameByCallId = new Map;
+  for (const raw of events) {
+    const event = asEvent(raw);
+    if (!event)
+      continue;
+    const seq = seqOf(event);
+    if (seq >= 0 && !eventBySeq.has(seq))
+      eventBySeq.set(seq, event);
+    const data = dataOf(event);
+    if (event.type === "tool/call" && data) {
+      const callId = data.callId;
+      const name = data.name;
+      if (typeof callId === "string" && callId.length > 0 && typeof name === "string") {
+        toolNameByCallId.set(callId, name);
+      }
+    }
+  }
+  const ordered = surfaceNodes !== null ? surfaceNodes.map((seq) => eventBySeq.get(seq)).filter((event) => event !== undefined) : events.map(asEvent).filter((event) => event !== null);
+  const messages = [];
+  const spans = [];
+  const knowledgeOrdinals = new Set;
+  const skillCatalogOrdinals = new Set;
+  const ordinalToSeq = new Map;
+  const seqToOrdinal = new Map;
+  let pendingParts = [];
+  let pendingSeqs = [];
+  let pendingStartIndex = null;
+  let pendingFirstId = null;
+  let pendingFirstSeq = -1;
+  let pendingFirstTime = undefined;
+  let pendingAssistant = null;
+  const resetPending = () => {
+    pendingParts = [];
+    pendingSeqs = [];
+    pendingStartIndex = null;
+    pendingFirstId = null;
+    pendingFirstSeq = -1;
+    pendingFirstTime = undefined;
+    pendingAssistant = null;
+  };
+  const pushAssistant = (item) => {
+    const ordinal = messages.length + 1;
+    messages.push({
+      ordinal,
+      id: item.id,
+      role: "assistant",
+      parts: item.parts,
+      createdAt: item.createdAt,
+      version: item.seq >= 0 ? item.seq : null
+    });
+    spans.push(surfaceNodes !== null ? { nodeStart: item.nodeIndex, nodeEnd: item.nodeIndex + 1, seqs: [item.seq] } : null);
+    ordinalToSeq.set(ordinal, item.seq);
+    if (item.seq >= 0)
+      seqToOrdinal.set(item.seq, ordinal);
+  };
+  const flushSynthetic = () => {
+    if (pendingParts.length === 0 && pendingAssistant === null)
+      return;
+    const ordinal = messages.length + 1;
+    const seqs = [
+      ...pendingAssistant === null ? [] : [pendingAssistant.seq],
+      ...pendingSeqs
+    ];
+    const start = Math.min(pendingStartIndex ?? Number.POSITIVE_INFINITY, pendingAssistant?.nodeIndex ?? Number.POSITIVE_INFINITY);
+    if (!Number.isFinite(start))
+      throw new Error("fold flush without any covered node");
+    messages.push({
+      ordinal,
+      id: `${SYNTH_USER_ID_PREFIX}${pendingFirstId ?? "tail"}`,
+      role: "user",
+      parts: [...pendingAssistant?.parts ?? [], ...pendingParts],
+      createdAt: pendingFirstTime ?? null,
+      version: pendingFirstSeq >= 0 ? pendingFirstSeq : null
+    });
+    spans.push(surfaceNodes !== null ? { nodeStart: start, nodeEnd: start + seqs.length, seqs: [...seqs] } : null);
+    if (pendingFirstSeq >= 0)
+      ordinalToSeq.set(ordinal, pendingFirstSeq);
+    for (const s of seqs)
+      seqToOrdinal.set(s, ordinal);
+    resetPending();
+  };
+  for (let nodeIndex = 0;nodeIndex < ordered.length; nodeIndex += 1) {
+    const event = ordered[nodeIndex];
+    const type = event.type;
+    if (type !== "user/message" && type !== "assistant/message" && type !== "tool/result") {
+      continue;
+    }
+    const message = deriveEventMessage(event);
+    if (!message)
+      continue;
+    const record2 = message;
+    const seq = seqOf(event);
+    if (type === "assistant/message") {
+      if (pendingParts.length > 0)
+        flushSynthetic();
+      const parts = assistantParts(record2, surfaceNodes !== null, toolNameByCallId);
+      const hasToolCalls = parts.some((part) => isRecord4(part) && part.type === "tool" && typeof part.callID === "string");
+      if (hasToolCalls) {
+        pendingAssistant = {
+          nodeIndex,
+          seq,
+          parts,
+          createdAt: timeOf(event) ?? null,
+          id: String(message.id)
+        };
+        continue;
+      }
+      if (pendingAssistant !== null) {
+        pushAssistant(pendingAssistant);
+        pendingAssistant = null;
+      }
+      pushAssistant({ nodeIndex, seq, parts, createdAt: timeOf(event) ?? null, id: String(message.id) });
+      continue;
+    }
+    if (type === "user/message") {
+      if (pendingAssistant !== null && pendingParts.length === 0) {
+        pushAssistant(pendingAssistant);
+        pendingAssistant = null;
+      }
+      const ordinal = messages.length + 1;
+      const start = surfaceNodes !== null ? Math.min(pendingStartIndex ?? Number.POSITIVE_INFINITY, pendingAssistant?.nodeIndex ?? Number.POSITIVE_INFINITY, nodeIndex) : nodeIndex;
+      const knowledge = isKnowledgeMessage(record2);
+      const skillCatalog = isSkillCatalogMessage(record2);
+      messages.push({
+        ordinal,
+        id: String(message.id),
+        role: "user",
+        parts: [
+          ...pendingAssistant?.parts ?? [],
+          ...pendingParts,
+          ...userTextParts(record2.content)
+        ],
+        createdAt: timeOf(event) ?? null,
+        version: seq >= 0 ? seq : null
+      });
+      spans.push(surfaceNodes !== null ? {
+        nodeStart: start,
+        nodeEnd: nodeIndex + 1,
+        seqs: [...pendingAssistant === null ? [] : [pendingAssistant.seq], ...pendingSeqs, seq]
+      } : null);
+      ordinalToSeq.set(ordinal, seq);
+      for (const s of [...pendingAssistant === null ? [] : [pendingAssistant.seq], ...pendingSeqs, seq]) {
+        seqToOrdinal.set(s, ordinal);
+      }
+      if (knowledge)
+        knowledgeOrdinals.add(ordinal);
+      if (skillCatalog)
+        skillCatalogOrdinals.add(ordinal);
+      resetPending();
+      continue;
+    }
+    pendingParts.push(...toolResultParts(record2, toolNameByCallId));
+    pendingSeqs.push(seq);
+    if (pendingStartIndex === null)
+      pendingStartIndex = nodeIndex;
+    if (pendingFirstId === null)
+      pendingFirstId = String(message.id);
+    if (pendingFirstSeq < 0)
+      pendingFirstSeq = seq;
+    if (pendingFirstTime === undefined)
+      pendingFirstTime = timeOf(event);
+  }
+  if (pendingAssistant !== null && pendingParts.length === 0) {
+    pushAssistant(pendingAssistant);
+    pendingAssistant = null;
+  }
+  if (pendingParts.length > 0 || pendingAssistant !== null)
+    flushSynthetic();
+  return { messages, spans, knowledgeOrdinals, skillCatalogOrdinals, ordinalToSeq, seqToOrdinal };
+}
+function convertDshEventsToRawMessages(events) {
+  return walkDshLog(events, null).messages;
+}
+function readDshTranscript(input) {
+  const events = Array.isArray(input.session.events) ? input.session.events : [];
+  const nodes = Array.isArray(input.session.surface?.nodes) ? [...input.session.surface.nodes] : [];
+  const walk = walkDshLog(events, nodes);
+  for (let i = 0;i < walk.messages.length; i += 1) {
+    const message = walk.messages[i];
+    const span = walk.spans[i];
+    if (span !== null) {
+      Object.defineProperty(message, DSH_MESSAGE_SPAN_KEY, {
+        value: span,
+        enumerable: false,
+        configurable: true
+      });
+    }
+    if (walk.knowledgeOrdinals.has(message.ordinal)) {
+      Object.defineProperty(message, DSH_KNOWLEDGE_KEY, {
+        value: true,
+        enumerable: false,
+        configurable: true
+      });
+    }
+    if (walk.skillCatalogOrdinals.has(message.ordinal)) {
+      Object.defineProperty(message, DSH_SKILL_CATALOG_KEY, {
+        value: true,
+        enumerable: false,
+        configurable: true
+      });
+    }
+  }
+  return {
+    sessionId: input.canonicalSessionId,
+    sourceWatermark: maxEventSeq(events),
+    inputDigest: sha256Hex(JSON.stringify(walk.messages)).slice(0, 16),
+    generation: typeof input.session.surface?.replaceGeneration === "number" ? input.session.surface.replaceGeneration : 0,
+    messages: walk.messages,
+    surfaceNodes: nodes
+  };
+}
+function maxEventSeq(events) {
+  let max = 0;
+  for (const raw of events) {
+    const event = asEvent(raw);
+    if (!event)
+      continue;
+    const seq = seqOf(event);
+    if (seq > max)
+      max = seq;
+  }
+  return max;
+}
+var DROPPED_SENTINEL_PATTERN = /^\[dropped\s+\u00a7\d+\u00a7\]$/;
+function classifyRecordingPart(raw) {
+  switch (raw.type) {
+    case "text":
+      return "text";
+    case "reasoning":
+    case "thinking":
+      return "thinking";
+    case "tool": {
+      const state = isRecord4(raw.state) ? raw.state : null;
+      return state !== null && state.output !== undefined ? "tool_result" : "tool_use";
+    }
+    case "image":
+      return "image";
+    default:
+      return "unknown";
+  }
+}
+
+class RecordingPart {
+  kind;
+  id;
+  partIndex;
+  owner;
+  raw;
+  toolName;
+  callId;
+  payload;
+  input;
+  constructor(owner, partIndex, raw) {
+    this.owner = owner;
+    this.partIndex = partIndex;
+    this.raw = isRecord4(raw) ? raw : {};
+    this.kind = classifyRecordingPart(this.raw);
+    this.callId = typeof this.raw.callID === "string" ? this.raw.callID : undefined;
+    this.toolName = typeof this.raw.tool === "string" ? this.raw.tool : undefined;
+    this.id = this.callId;
+    this.input = this.readInputState();
+    this.payload = this.initPayload();
+  }
+  readInputState() {
+    if (this.kind !== "tool_use" && this.kind !== "tool_result")
+      return null;
+    const state = isRecord4(this.raw.state) ? this.raw.state : null;
+    return state !== null && isRecord4(state.input) ? state.input : null;
+  }
+  initPayload() {
+    if (this.kind === "text")
+      return typeof this.raw.text === "string" ? this.raw.text : "";
+    if (this.kind === "thinking") {
+      const text = typeof this.raw.text === "string" ? this.raw.text : undefined;
+      return text ?? (typeof this.raw.thinking === "string" ? this.raw.thinking : "");
+    }
+    if (this.kind === "tool_use")
+      return JSON.stringify(this.input ?? {});
+    if (this.kind === "tool_result") {
+      const state = isRecord4(this.raw.state) ? this.raw.state : null;
+      const output = state !== null ? state.output : undefined;
+      if (typeof output === "string")
+        return output;
+      return output !== undefined ? JSON.stringify(output) : "";
+    }
+    return "";
+  }
+  record(field, from, to, tag) {
+    const record2 = {
+      partIndex: this.partIndex,
+      field,
+      from,
+      to,
+      ...tag !== undefined ? { tag } : {}
+    };
+    this.owner.mutations.push(record2);
+  }
+  getText() {
+    return this.payload;
+  }
+  setText(newText) {
+    if (newText === this.payload)
+      return false;
+    const from = this.payload ?? "";
+    this.payload = newText;
+    this.record("text", from, newText);
+    return true;
+  }
+  setToolOutput(newText) {
+    if (newText === this.payload)
+      return false;
+    const from = this.payload ?? "";
+    this.payload = newText;
+    this.record("output", from, newText);
+    return true;
+  }
+  getToolInput() {
+    return this.input;
+  }
+  setToolInput(input) {
+    if (input === this.input)
+      return false;
+    const from = JSON.stringify(this.input ?? {});
+    this.input = input;
+    this.record("input", from, JSON.stringify(input));
+    return true;
+  }
+  getToolMetadata() {
+    if (this.kind === "tool_use" || this.kind === "tool_result") {
+      return {
+        toolName: this.toolName,
+        inputByteSize: byteSize(JSON.stringify(this.input ?? {})),
+        inputTokenCount: 0
+      };
+    }
+    return { toolName: undefined, inputByteSize: 0, inputTokenCount: 0 };
+  }
+  replaceWithSentinel(sentinelText) {
+    if (this.payload === sentinelText)
+      return false;
+    const from = this.payload ?? "";
+    this.payload = sentinelText;
+    this.record("sentinel", from, sentinelText);
+    return true;
+  }
+  render() {
+    if (this.kind === "thinking" || this.kind === "image")
+      return null;
+    const payload = this.payload ?? "";
+    if (this.kind === "text" || this.kind === "unknown")
+      return payload.length > 0 ? payload : null;
+    if (DROPPED_SENTINEL_PATTERN.test(payload))
+      return payload.length > 0 ? payload : null;
+    const head = this.kind === "tool_use" ? "tool" : "tool result";
+    const lines = [
+      `[${head}: ${this.toolName ?? "tool"}${this.callId ? ` #${this.callId}` : ""}]`
+    ];
+    if (this.input)
+      lines.push(`input: ${JSON.stringify(this.input)}`);
+    if (this.kind === "tool_result" && payload.length > 0)
+      lines.push(`output:
+${payload}`);
+    return lines.join(`
+`);
+  }
+}
+
+class RecordingMessage {
+  info;
+  parts = [];
+  span;
+  mutations = [];
+  constructor(info, span) {
+    this.info = info;
+    this.span = span;
+  }
+  addPart(raw) {
+    const part = new RecordingPart(this, this.parts.length, raw);
+    this.parts.push(part);
+    return part;
+  }
+  isDirty() {
+    return this.mutations.length > 0;
+  }
+  opKind() {
+    if (this.mutations.some((record2) => record2.field === "sentinel" || record2.field === "output" || record2.field === "input" || DROPPED_SENTINEL_PATTERN.test(record2.to))) {
+      return "drops";
+    }
+    if (this.mutations.some((record2) => record2.field === "reasoning"))
+      return "reasoning";
+    return "tags";
+  }
+  reason() {
+    const parts = [];
+    for (const record2 of this.mutations) {
+      if (record2.field === "sentinel") {
+        parts.push(`drop → ${record2.to}`);
+      } else if (record2.field === "reasoning") {
+        parts.push(`reasoning cleared through tag §${record2.tag ?? "?"}§`);
+      } else if (/^\u00a7\d+\u00a7/.test(record2.to)) {
+        const space = record2.to.indexOf(" ");
+        parts.push(`tag prefix ${space > 0 ? record2.to.slice(0, space) : record2.to}`);
+      } else {
+        parts.push(`${record2.field} → ${record2.to}`);
+      }
+    }
+    return parts.join("; ");
+  }
+  render() {
+    return this.parts.map((part) => part.render()).filter((value) => value !== null && value.length > 0).join(`
+
+`);
+  }
+}
+
+class RecordingTranscript {
+  harness = "opencode";
+  messages;
+  constructor(messages) {
+    this.messages = messages;
+  }
+  commit() {}
+}
+
+class RecordingTagTarget {
+  tagId;
+  inner;
+  constructor(tagId, inner) {
+    this.tagId = tagId;
+    this.inner = inner;
+  }
+  setContent(content) {
+    return this.inner.setContent(content);
+  }
+  getContent() {
+    return this.inner.getContent?.() ?? null;
+  }
+  drop() {
+    return this.inner.drop?.() ?? "absent";
+  }
+  truncate() {
+    return this.inner.truncate?.() ?? "absent";
+  }
+  editMarker() {
+    return this.inner.editMarker?.() ?? "absent";
+  }
+  canDrop() {
+    return this.inner.canDrop?.() ?? false;
+  }
+  readInput() {
+    return this.inner.readInput?.() ?? null;
+  }
+  get message() {
+    return this.inner.message;
+  }
+}
+function buildRecordingTranscript(view) {
+  const messages = [];
+  const byMessageId = new Map;
+  for (const raw of view.messages) {
+    if (isKnowledgeBaselineMessage(raw))
+      continue;
+    if (isSkillCatalogBaselineMessage(raw))
+      continue;
+    const message = new RecordingMessage({ id: raw.id, role: raw.role, sessionId: view.sessionId }, messageNodeSpan(raw));
+    for (const part of raw.parts)
+      message.addPart(part);
+    messages.push(message);
+    if (typeof raw.id === "string")
+      byMessageId.set(raw.id, message);
+  }
+  return { transcript: new RecordingTranscript(messages), byMessageId };
+}
+function minimalCacheClassForOp(range, surfaceNodeCount, baselineNodeIndices = []) {
+  if (range.start >= surfaceNodeCount)
+    return "soft-plus";
+  for (let i = range.start;i < range.end; i += 1) {
+    if (baselineNodeIndices.includes(i))
+      return "hard";
+  }
+  return "soft";
+}
+function baselineNodeIndices(view) {
+  const out = [];
+  for (const message of view.messages) {
+    if (!isKnowledgeBaselineMessage(message))
+      continue;
+    const span = messageNodeSpan(message);
+    if (span !== null)
+      out.push(span.nodeStart);
+  }
+  return out;
+}
+function planTemporalMarkers(view) {
+  const ops = [];
+  const baseline = baselineNodeIndices(view);
+  let prev = null;
+  for (const message of view.messages) {
+    const isGapEligibleUser = message.role === "user" && !isKnowledgeBaselineMessage(message) && !isSkillCatalogBaselineMessage(message) && !isSyntheticUserMessage(message);
+    if (isGapEligibleUser && prev !== null) {
+      const prevTime = typeof prev.createdAt === "number" ? prev.createdAt : null;
+      const currTime = typeof message.createdAt === "number" ? message.createdAt : null;
+      if (prevTime !== null && currTime !== null) {
+        const gapSeconds = Math.floor((currTime - prevTime) / 1000);
+        const marker = temporalMarkerPrefix(gapSeconds);
+        if (marker !== null && !hasTemporalMarker(message) && !isTemporalMarkerMessage(prev)) {
+          const span = messageNodeSpan(message);
+          if (span !== null) {
+            ops.push({
+              kind: "temporal",
+              start: span.nodeStart,
+              end: span.nodeStart,
+              replacement: marker,
+              cacheClass: minimalCacheClassForOp({ start: span.nodeStart, end: span.nodeStart }, view.surfaceNodes.length, baseline),
+              reason: `temporal gap ${formatGap(gapSeconds) ?? "?"}`,
+              shadowedSeqs: []
+            });
+          }
+        }
+      }
+    }
+    if (!isKnowledgeBaselineMessage(message) && !isSkillCatalogBaselineMessage(message)) {
+      prev = message;
+    }
+  }
+  return ops;
+}
+function hasTemporalMarker(message) {
+  for (const part of message.parts) {
+    if (!isRecord4(part) || part.type !== "text" || typeof part.text !== "string")
+      continue;
+    return TEMPORAL_MARKER_PATTERN.test(peelLeadingMcTagNotation(part.text).body);
+  }
+  return false;
+}
+function isTemporalMarkerMessage(message) {
+  let sawMarker = false;
+  for (const part of message.parts) {
+    if (!isRecord4(part) || part.type !== "text")
+      continue;
+    const text = typeof part.text === "string" ? part.text : "";
+    if (text.trim().length === 0)
+      continue;
+    if (TEMPORAL_MARKER_PATTERN.test(peelLeadingMcTagNotation(text).body)) {
+      sawMarker = true;
+    } else {
+      return false;
+    }
+  }
+  return sawMarker;
+}
+function planReasoningReplay(view, byMessageId, targets, db) {
+  const meta3 = getOrCreateSessionMeta(db, view.sessionId);
+  const watermark = typeof meta3.clearedReasoningThroughTag === "number" ? meta3.clearedReasoningThroughTag : 0;
+  if (watermark <= 0)
+    return;
+  const maxTagById = new Map;
+  for (const [tagId, target] of targets) {
+    const id = target.message?.info?.id;
+    if (typeof id !== "string" || id.length === 0)
+      continue;
+    const prev = maxTagById.get(id) ?? 0;
+    if (tagId > prev)
+      maxTagById.set(id, tagId);
+  }
+  for (const message of view.messages) {
+    if (message.role !== "assistant" || typeof message.id !== "string")
+      continue;
+    const msgTag = maxTagById.get(message.id) ?? 0;
+    if (msgTag === 0 || msgTag > watermark)
+      continue;
+    const reasoningTexts = [];
+    for (const part of message.parts) {
+      if (!isRecord4(part))
+        continue;
+      const type = part.type;
+      if (type !== "reasoning" && type !== "thinking")
+        continue;
+      const text = typeof part.text === "string" ? part.text : typeof part.thinking === "string" ? part.thinking : "";
+      if (text.length > 0 && text !== "[cleared]")
+        reasoningTexts.push(text);
+    }
+    if (reasoningTexts.length === 0)
+      continue;
+    const recording = byMessageId.get(message.id);
+    if (!recording)
+      continue;
+    recording.mutations.push({
+      partIndex: -1,
+      field: "reasoning",
+      from: reasoningTexts.join(`
+`),
+      to: "[cleared]",
+      tag: msgTag
+    });
+  }
+}
+function deriveMutationPlan(view, ctx) {
+  const db = ctx.db;
+  const sessionId = view.sessionId;
+  const protectedTags = Math.max(0, Math.floor(ctx.protectedTags ?? 0));
+  const ops = [...planTemporalMarkers(view)];
+  const { transcript, byMessageId } = buildRecordingTranscript(view);
+  if (transcript.messages.length > 0) {
+    const tagger = createTagger();
+    tagger.initFromDb(sessionId, db);
+    const tagged = tagTranscript(sessionId, transcript, tagger, db);
+    const recordingTargets = new Map;
+    for (const [tagId, target] of tagged.targets) {
+      recordingTargets.set(tagId, new RecordingTagTarget(tagId, target));
+    }
+    const preloadedTags = getTagsBySession(db, sessionId);
+    const preloadedPendingOps = getPendingOps(db, sessionId);
+    applyPendingOperations(sessionId, db, recordingTargets, protectedTags, preloadedTags, preloadedPendingOps);
+    applyFlushedStatuses(sessionId, db, recordingTargets, preloadedTags);
+    planReasoningReplay(view, byMessageId, recordingTargets, db);
+    const baseline = baselineNodeIndices(view);
+    for (const message of transcript.messages) {
+      if (!message.isDirty())
+        continue;
+      const span = message.span;
+      if (span === null || span.seqs.length === 0)
+        continue;
+      ops.push({
+        kind: message.opKind(),
+        start: span.nodeStart,
+        end: span.nodeEnd,
+        replacement: message.render(),
+        cacheClass: minimalCacheClassForOp({ start: span.nodeStart, end: span.nodeEnd }, view.surfaceNodes.length, baseline),
+        reason: message.reason(),
+        shadowedSeqs: [...span.seqs]
+      });
+    }
+  }
+  if (ops.length === 0)
+    return null;
+  ops.sort((left, right) => left.start - right.start || left.end - right.end);
+  return {
+    opId: randomUUID2(),
+    sessionId: view.sessionId,
+    sourceWatermark: view.sourceWatermark,
+    inputDigest: view.inputDigest,
+    generation: view.generation,
+    ops
+  };
 }
 
 // src/agent/tools.ts
@@ -27511,13 +32578,7 @@ No session notes or smart notes.` };
   });
 }
 function readRawMessagesFromAgent(agent) {
-  const messages = agent.session.deriveMessages();
-  return messages.map((message, index) => ({
-    id: String(message.id),
-    role: message.role,
-    parts: message.content,
-    ordinal: index + 1
-  }));
+  return convertDshEventsToRawMessages(agent.session.events);
 }
 function createCtxExpandTool(ctx, opts) {
   const readRawMessages = opts.readRawMessages ?? readRawMessagesFromAgent;
@@ -27733,4 +32794,4 @@ function registerCtxTools(ctx, opts = {}) {
   };
 }
 
-export { setDshHarness, acquireCompartmentLease, releaseCompartmentLease, isCompartmentLeaseHeld, getCompartments, getLastCompartmentEndMessage, appendCompartments, getSessionFacts, buildCompartmentBlock, hasMuralCueColumns, hasMemoryClassifiedAtColumn, formatWindowDerivationLine, buildPrimaryLanguageDirective, DEFAULT_PROTECTED_TAGS, nextDueAtMs, resolveModelConfigOrDefault, DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, recordSessionProjectIdentity, getProjectEmbeddingSnapshot, embedTextForProject, getEmbeddingCoverageStatus, promoteSessionFactsDurable, completedToolArcCrossesBoundary, buildTrueRawTokenIndex, computeRawRangeFingerprint, byteSize, stripTagPrefix, peelLeadingMcTagNotation, prependTag, applyEditMarkerToInput, withRawMessageProvider, readRawSessionMessages, readRawSessionMessageOrdinalById, getRawSessionTagKeysThrough, getLegacyProtectedTailStartOrdinal, readSessionChunk, MAX_EXECUTE_THRESHOLD, escalationBands, recordProtectedTailPublicationFloor, getAutoSearchHintDecisions, appendAutoSearchHintDecision, getOverflowState, getOrCreateSessionMeta, getPendingSmartNotes, queuePendingOp, getPendingOps, removePendingOp, countPrimerCandidatesForProject, getActivePrimers, saveSourceContent, updateTagByteSize, updateTagInputByteSize, updateTagTokenCount, updateTagInputTokenCount, tagTokenCountIsNull, backfillTagTokenCounts, insertTag, updateTagStatus, updateTagDropMode, getMaxTagNumberBySession, getTagNumberByMessageId, getTagsBySession, getToolTagNumberByOwner, getNullOwnerToolTag, adoptNullOwnerToolTag, getUserMemoryCandidates, formatGap, TEMPORAL_MARKER_PATTERN, temporalMarkerPrefix, getVisibleMemoryIds, mustMaterialize, materializeWithRetry, renderM1, createUserMessage, deriveEventMessage, magicUserMessage, unifiedSearch, resolveDb, resolveCanonicalKey, cwdOf, resolveProjectIdentity2 as resolveProjectIdentity, registerCtxTools };
+export { DSH_HARNESS, setDshHarness, dshModelRefToCanonical, COMPARTMENT_LEASE_RENEWAL_MS, acquireCompartmentLease, renewCompartmentLease, releaseCompartmentLease, isCompartmentLeaseHeld, clearCompressionDepth, clearCompressionDepthRange, clearCachedM0M1, getCompartments, getLastCompartmentEndMessage, appendCompartments, getSessionFacts, buildCompartmentBlock, saveRecompStagingPass, getRecompStaging, clearRecompStaging, getRecompPartialRange, setRecompPartialRange, escapeXmlAttr, escapeXmlContent, computeCueContentHash, hasMuralCueColumns, getMuralCueState, memoryNeedsCue, setMuralCue, recordMuralCueRejection, invalidateMemory, computeNormalizedHash, hasMemoryShareableColumn, hasMemoryClassifiedAtColumn, getUnclassifiedMemoryIds, ModuleMemoryAuthorityError, insertMemory, getMemoryByHash, getMemoriesByProject, getAllActiveMemoriesForMigration, getMemoryById, setMemoryClassification, archiveMemory, deleteMemory, getMemoryCountsByStatus, formatWindowDerivationLine, modelSupportsVision, withContentLanguageDirective, withMigrationLanguageDirective, buildPrimaryLanguageDirective, DEFAULT_PROTECTED_TAGS, parseCron, nextOccurrence, nextDueAtMs, resolveModelConfigOrDefault, DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, DEFAULT_HISTORIAN_TIMEOUT_MS, DreamerConfigSchema, buildCanonicalChunkTextFromFts, buildCompartmentSummaryFallbackText, canonicalizeInMemoryChunkTextForEmbedding, chunkCanonicalText, chunkEmbeddingWindowsAreCurrent, replaceCompartmentChunkEmbeddings, cosineSimilarity, recordSessionProjectIdentity, contentSha256, enqueueShadowEmbeddingItems, getProjectEmbeddingSnapshot, getProjectChunkEmbeddingModelId, getProjectEmbeddingMaxInputTokens, embedTextForProject, embedBatchForProject, embedItemsForProject, embedSessionCompartmentChunks, getEmbeddingCoverageStatus, promoteSessionFactsDurable, embedPromotedFacts, recordMemoryMapping, recordMemoryVerifications, getUnmappedMemoryIds, clearMemoryVerifications, getMemoryVerifications, resolveGitTopLevel, readGitHead, readGitChangedFilesSince, readGitFileChangeTimesSince, verificationFileExists, normalizeVerificationFiles, isMidTurn, getMessageTimesFromOpenCodeDb, isRecord, completedToolArcCrossesBoundary, buildToolArcs, fenceBoundaryForToolArcs, buildTrueRawTokenIndex, computeRawRangeFingerprint, setRawMessageProvider, withRawMessageProvider, cleanUserText, withRawSessionMessageCache, readRawSessionMessages, getCachedAbsoluteMessageCount, readRawSessionMessageOrdinalById, getRawSessionMessageCount, getRawSessionTagKeysThrough, getLegacyProtectedTailStartOrdinal, readSessionChunk, queueM0Mutation, queueMemoryMutation, MAX_EXECUTE_THRESHOLD, escalationBands, loadProtectedTailMeta, markProtectedTailPolicyV3Seeded, recordProtectedTailPublicationFloor, recordProtectedTailNoEligibleHead, getWrapupInProgressState, isWrapupInProgress, acquireWrapupInProgress, updateWrapupInProgress, releaseWrapupInProgress, reserveProtectedTailDrainTokens, clearEmergencyDrainLatch, recordHistorianDrainFailure, clearHistorianDrainFailure, rollbackProtectedTailDrainReservation, setPersistedNoteNudgeTrigger, getAutoSearchHintDecisions, appendAutoSearchHintDecision, getHistorianFailureState, incrementHistorianFailure, clearHistorianFailureState, getOverflowState, clearEmergencyRecovery, getPendingCompactionMarkerState, setPendingCompactionMarkerState, clearPendingCompactionMarkerStateIf, getOrCreateSessionMeta, updateSessionMeta, getPendingSmartNotes, markNoteReady, markNoteChecked, queuePendingOp, getPendingOps, removePendingOp, PRIMER_CANDIDATE_TTL_MS, PRIMER_CANDIDATE_MAX_AGE_MS, primerOccurrenceKey, primerOccurrenceUtcDay, insertPrimerCandidates, updatePrimerCandidateEmbedding, getPrimerCandidatesByIds, getPrimerCandidatesForPromotion, countPrimerCandidatesForProject, getActivePrimers, createPrimer, updatePrimerSupport, updatePrimerAnswer, bumpProjectUserProfileVersion, recordSubagentInvocation, getLatestHistorianInvocationId, getAllStatusTagTokenTotalsFlat, updateTagStatus, getTagsBySession, USER_MEMORY_CANDIDATE_TTL_MS, insertUserMemoryCandidates, getUserMemoryCandidates, deleteUserMemoryCandidates, pruneExpiredUserMemoryCandidates, insertUserMemory, getActiveUserMemories, updateUserMemoryContent, dismissUserMemory, updateCompactionMarkerAfterPublication, clearInjectionCache, getVisibleMemoryIds, renderMemoryBlock, mustMaterialize, materializeWithRetry, renderM1, createUserMessage, deriveEventMessage, magicUserMessage, unifiedSearch, readDshTranscript, deriveMutationPlan, resolveDb, resolveCanonicalKey, cwdOf, resolveProjectIdentity2 as resolveProjectIdentity, registerCtxTools };

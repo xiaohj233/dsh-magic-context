@@ -20,6 +20,7 @@ import {
   dshSeqForOrdinal,
   findKnowledgeBaselineNodeIndices,
   isKnowledgeBaselineMessage,
+  isSkillCatalogBaselineMessage,
   readDshTranscript,
   type DshTranscriptView,
 } from "./transcript";
@@ -305,6 +306,44 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       expect(foldOp).toBeDefined();
       expect(foldOp!.start).toBeLessThanOrEqual(assistantIndex);
       expect(foldOp!.shadowedSeqs).toContain(assistantSeq);
+      db.close();
+    } finally {
+      await cleanupDir(dir);
+    }
+  });
+
+  it("keeps dsh skill-catalog messages out of the tag/drop pipeline (no ops, marked baseline)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-skillcat-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const session = Session.create(SessionId("sess-skillcat"));
+      // dsh-tool-skill's durable catalog reminder: source.kind === 'skill-catalog'.
+      const catalog = createUserMessage({
+        content: [
+          {
+            type: "text",
+            text: "<system-reminder>\nThe available skill catalog changed…\n</system-reminder>",
+          },
+        ],
+        source: {
+          kind: "skill-catalog",
+          form: "catalog",
+          update: true,
+          entries: [{ name: "test-skill", description: "A test skill." }],
+        } as never,
+      });
+      session.append("user/message", catalog, { surfaceOp: "append" });
+
+      const view = viewOf(session);
+      // The catalog message is marked as a protected baseline in the view…
+      const marked = view.messages.find((m) => isSkillCatalogBaselineMessage(m));
+      expect(marked).toBeDefined();
+      // …and deriveMutationPlan produces NO ops for it (before the fix the
+      // tagger would inject a §N§ prefix → a surface replace each round →
+      // the visible catalog digest disappears → dsh-tool-skill re-injects
+      // the reminder on every pre-step).
+      const plan = deriveMutationPlan(view, { db, protectedTags: 0 });
+      expect(plan).toBeNull();
       db.close();
     } finally {
       await cleanupDir(dir);

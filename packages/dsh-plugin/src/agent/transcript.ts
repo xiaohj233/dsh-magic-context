@@ -215,6 +215,20 @@ function isKnowledgeMessage(message: Record<string, unknown>): boolean {
   return source !== null && source.kind === "plugin" && source.plugin === "magic-context";
 }
 
+/**
+ * True for DSH skill-catalog user messages (dsh-tool-skill's durable catalog
+ * reminder: `source.kind === 'skill-catalog'` with `entries`). These must be
+ * treated like knowledge baselines — excluded from the tag/drop pipeline — or
+ * the §N§ prefix injection forces a surface replace each round, the catalog's
+ * original event seq leaves the visible surface, `catalogHistory` can no
+ * longer find a visible digest, and dsh-tool-skill re-injects the catalog on
+ * every subsequent pre-step (the per-round <system-reminder> loop).
+ */
+function isSkillCatalogMessage(message: Record<string, unknown>): boolean {
+  const source = isRecord(message.source) ? message.source : null;
+  return source !== null && source.kind === "skill-catalog";
+}
+
 function parseToolArguments(raw: unknown): Record<string, unknown> {
   if (typeof raw !== "string" || raw.length === 0) return {};
   try {
@@ -346,6 +360,8 @@ export interface DshMessageSpan {
 export const DSH_MESSAGE_SPAN_KEY = "__dshMessageNodeSpan";
 /** Non-enumerable knowledge-baseline marker attached to view messages. */
 export const DSH_KNOWLEDGE_KEY = "__dshKnowledgeBaseline";
+/** Non-enumerable skill-catalog marker attached to view messages. */
+export const DSH_SKILL_CATALOG_KEY = "__dshSkillCatalog";
 
 /** The surface span of a view message, or null for messages without one. */
 export function messageNodeSpan(message: RawMessage): DshMessageSpan | null {
@@ -358,10 +374,16 @@ export function isKnowledgeBaselineMessage(message: RawMessage): boolean {
   return (message as unknown as Record<string, unknown>)[DSH_KNOWLEDGE_KEY] === true;
 }
 
+/** True when the view message is a DSH skill-catalog reminder (dsh-tool-skill). */
+export function isSkillCatalogBaselineMessage(message: RawMessage): boolean {
+  return (message as unknown as Record<string, unknown>)[DSH_SKILL_CATALOG_KEY] === true;
+}
+
 interface DshWalkResult {
   readonly messages: RawMessage[];
   readonly spans: ReadonlyArray<DshMessageSpan | null>;
   readonly knowledgeOrdinals: ReadonlySet<number>;
+  readonly skillCatalogOrdinals: ReadonlySet<number>;
   readonly ordinalToSeq: Map<number, number>;
   readonly seqToOrdinal: Map<number, number>;
 }
@@ -402,6 +424,7 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
   const messages: RawMessage[] = [];
   const spans: Array<DshMessageSpan | null> = [];
   const knowledgeOrdinals = new Set<number>();
+  const skillCatalogOrdinals = new Set<number>();
   const ordinalToSeq = new Map<number, number>();
   const seqToOrdinal = new Map<number, number>();
 
@@ -541,6 +564,7 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
             )
           : nodeIndex;
       const knowledge = isKnowledgeMessage(record);
+      const skillCatalog = isSkillCatalogMessage(record);
       messages.push({
         ordinal,
         id: String(message.id),
@@ -567,6 +591,7 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
         seqToOrdinal.set(s, ordinal);
       }
       if (knowledge) knowledgeOrdinals.add(ordinal);
+      if (skillCatalog) skillCatalogOrdinals.add(ordinal);
       resetPending();
       continue;
     }
@@ -586,7 +611,7 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
     pendingAssistant = null;
   }
   if (pendingParts.length > 0 || pendingAssistant !== null) flushSynthetic();
-  return { messages, spans, knowledgeOrdinals, ordinalToSeq, seqToOrdinal };
+  return { messages, spans, knowledgeOrdinals, skillCatalogOrdinals, ordinalToSeq, seqToOrdinal };
 }
 
 /**
@@ -668,6 +693,13 @@ export function readDshTranscript(input: DshTranscriptInput): DshTranscriptView 
     }
     if (walk.knowledgeOrdinals.has(message.ordinal)) {
       Object.defineProperty(message, DSH_KNOWLEDGE_KEY, {
+        value: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    if (walk.skillCatalogOrdinals.has(message.ordinal)) {
+      Object.defineProperty(message, DSH_SKILL_CATALOG_KEY, {
         value: true,
         enumerable: false,
         configurable: true,
@@ -1012,7 +1044,15 @@ function buildRecordingTranscript(
     // pass, so tag numbers (and §N§ prefixes) would churn forever — the
     // replay invariant (design §3) would break. They remain in the view
     // (digest + cache classification) but never produce ops.
+    //
+    // Skill-catalog reminders (dsh-tool-skill) get the same protection: the
+    // catalog's digest must stay visible to the session surface unchanged or
+    // catalogHistory() cannot find the published digest and dsh-tool-skill
+    // re-injects the <system-reminder> on every pre-step. Tagging/prefixing
+    // them would force a surface replace each round (new seq), breaking the
+    // visible-digest invariant and causing the per-round catalog loop.
     if (isKnowledgeBaselineMessage(raw)) continue;
+    if (isSkillCatalogBaselineMessage(raw)) continue;
     const message = new RecordingMessage(
       { id: raw.id, role: raw.role, sessionId: view.sessionId },
       messageNodeSpan(raw),
@@ -1071,6 +1111,7 @@ function planTemporalMarkers(view: DshTranscriptView): MutationOp[] {
     const isGapEligibleUser =
       message.role === "user" &&
       !isKnowledgeBaselineMessage(message) &&
+      !isSkillCatalogBaselineMessage(message) &&
       !isSyntheticUserMessage(message);
     if (isGapEligibleUser && prev !== null) {
       const prevTime = typeof prev.createdAt === "number" ? prev.createdAt : null;
@@ -1098,7 +1139,9 @@ function planTemporalMarkers(view: DshTranscriptView): MutationOp[] {
         }
       }
     }
-    if (!isKnowledgeBaselineMessage(message)) prev = message;
+    if (!isKnowledgeBaselineMessage(message) && !isSkillCatalogBaselineMessage(message)) {
+      prev = message;
+    }
   }
   return ops;
 }
