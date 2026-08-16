@@ -9,7 +9,7 @@
 ![Magic Context](https://img.shields.io/badge/Magic%20Context-0.36.1-7C3AED.svg)
 ![Harness](https://img.shields.io/badge/harness-dsh-5391FE.svg)
 ![Community](https://img.shields.io/badge/community-port-0F766E.svg)
-![Tests](https://img.shields.io/badge/tests-177%2F177-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-194%2F194-brightgreen.svg)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen.svg)
 
 **社区移植**：将 [Magic Context](https://github.com/cortexkit/magic-context) 移植到
@@ -35,7 +35,13 @@ OpenCode/Pi 行为保持不变。
 - 在 DSH 中复用已有的 Magic Context 记忆（与 OpenCode/Pi 共享）。
 - 希望 DSH 会话获得 m0/m1 知识注入、§N§ 标签、historian 压缩、
   Dreamer 定时任务等能力。
-- 想要 /ctx-* 工具族（search/memory/note/expand/reduce/embed/recomp/wrapup）的 DSH 用户。
+- 想要 /ctx-* 工具族（search/memory/note/expand/reduce/embed/recomp/wrapup）
+  与 todowrite 的 DSH 用户。
+
+能力对齐：注入（m0/m1 双消息、首轮即见、§N§ 首轮打标）、压缩（低上下文
+窗口 chunk 预算、historian 独立模型路由、发布后 `<session-history>` 折叠）、
+nudge 双通道、heuristic cleanup、配置桥接——均与 Magic Context 0.36.1
+（Pi/OpenCode）语义对齐。
 
 ## 安装
 
