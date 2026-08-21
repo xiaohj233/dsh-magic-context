@@ -33,15 +33,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "dsh-magic-context-adapter": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/adapter-api",
-    "@deepseek-ai/cordis": "4.0.1",
-    "@deepseek-ai/cordis-plugin-include": "^1.0.6",
-    "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-compaction": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-compaction-basic": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-session": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-token-meter": "0.1.0-rc.6"
+    "dsh-magic-context-adapter": "github:xiaohj233/dsh-magic-context#v0.1.0&path:/packages/adapter-api"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
@@ -59,7 +51,14 @@
     "@deepseek-ai/dsh-client-ui-primitives": "0.1.0-rc.6",
     "@deepseek-ai/dsh-client-ui-slots": "0.1.0-rc.6",
     "@deepseek-ai/dsh-session": "0.1.0-rc.6",
-    "react": "^18.2.0"
+    "react": "^18.2.0",
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/cordis-plugin-include": "^1.0.6",
+    "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-compaction": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-compaction-basic": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-token-meter": "0.1.0-rc.6"
   },
   "dsh": {
     "bundle": {
