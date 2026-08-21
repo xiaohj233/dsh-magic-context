@@ -1,6 +1,6 @@
 {
   "name": "dsh-magic-context",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Magic Context — DeepSeek Harness adapter (Host / Agent / Client + profile bundle). Loads the shared Magic SQLite store and registers ctx_* tools, /ctx-* commands, knowledge injection, historian/dreamer scheduling, compaction policy, and the Typert Remote surface for the DSH client.",
   "main": "dist/index.js",
